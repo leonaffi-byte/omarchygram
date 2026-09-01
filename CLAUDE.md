@@ -8,6 +8,7 @@
 - Test: `cargo test`
 - Smoke check: `cargo run -- --smoke --probe` (opens themed window, auto-quits after 2s, exit 0 = pass)
 - `OMG_MOCK_AUTH=1 cargo run -- --smoke` walks the login screens offline (code `2fa` routes via the password screen)
+- HARD acceptance gate for any UI change (learned the hard way, 2026-09-02): `G_DEBUG=fatal-criticals ./target/debug/omarchygram --smoke --probe` ×6 + the `OMG_MOCK_AUTH=1` variant ×3 + `OMG_MOCK_LATENCY_MS=400` ×1 must all exit 0. A plain probe exits 0 even when GTK prints CRITICALs. `OMG_PROBE_TRACE=1` prints each traversal step (bisects crashes that have no Rust frame); `coredumpctl -1 debug` gives the backtrace.
 
 # Architecture (decided 2026-09-01, orchestrator; Rust rewrite same day at user's request — Python v2 lives in git history)
 - Rust + gtk4-rs (native GTK4 UI) + grammers 0.10 (MTProto) + tokio.
@@ -24,6 +25,10 @@
 - One typeface: "JetBrainsMono Nerd Font" everywhere. 8px spacing grid. No shadows, no rounded cards (4px max radius on bubbles), no gradients, no emoji in UI chrome.
 - Colors ONLY from theme tokens via the omg-* CSS classes in `src/theme/style.css` (bg/bg-dark/bg-darker/bg-lighter/fg/muted/accent/selection/red). Never hardcode a color in UI code.
 - Layout: left sidebar chat list (280px fixed), message pane, composer at bottom. One primary action per screen. Keyboard-first: Ctrl+K switcher, Alt+Up/Down chat nav, Enter send / Shift+Enter newline, Esc cancel/focus-composer.
+
+# GTK4 lessons (verified crashes, 2026-09-02)
+- Selectable `gtk::Label`s MUST stay keyboard-focusable: `set_can_focus(false)` on them makes `popover.popup()` on their row hit `gtk_widget_is_ancestor` on a dead widget (reproduced 6/6).
+- Never remove rows while keyboard focus or a parented popover is inside them: call `MessagesView::move_focus_before_removal` + `dismiss_row_popovers` first (both exist; reuse them). Popovers parented to rows are stored in one slot each and popdown+unparent before any teardown.
 
 # Known accepted limitations (decided 2026-09-01)
 - Backend command/event channels are unbounded and data commands spawn freely — accepted at personal-client scale; revisit only if memory growth is ever observed.
