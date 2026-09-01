@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Installs a desktop launcher for this checkout of Omarchygram.
+#
+# Builds the release binary if it is missing, then writes
+# ~/.local/share/applications/omarchygram.desktop with Exec pointing at the
+# binary's absolute path. Safe to run again at any time.
+
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+source_entry="$repo_root/packaging/omarchygram.desktop"
+binary="$repo_root/target/release/omarchygram"
+target_dir="$HOME/.local/share/applications"
+target_entry="$target_dir/omarchygram.desktop"
+
+# Quotes a program path for the desktop entry Exec key. A path holding any
+# reserved character (space above all) must be wrapped in double quotes, and
+# inside them ", ` , $ and \ take a backslash. The desktop file format
+# unescapes backslashes once more when it reads the value, so each of those
+# backslashes is written doubled (a literal backslash needs four). Paths
+# without reserved characters are left bare.
+quote_exec() {
+    local value=$1 escaped='' char i needs_quotes=0
+    for ((i = 0; i < ${#value}; i++)); do
+        char=${value:i:1}
+        case $char in
+        '"' | '`' | '$')
+            escaped+="\\\\$char"
+            needs_quotes=1
+            ;;
+        '\')
+            escaped+="\\\\\\\\"
+            needs_quotes=1
+            ;;
+        [[:space:]] | "'" | '>' | '<' | '~' | '|' | '&' | ';' | '*' | '?' | '#' | '(' | ')')
+            escaped+=$char
+            needs_quotes=1
+            ;;
+        *)
+            escaped+=$char
+            ;;
+        esac
+    done
+    if ((needs_quotes)); then
+        printf '"%s"' "$escaped"
+    else
+        printf '%s' "$escaped"
+    fi
+}
+
+if [[ ! -f "$source_entry" ]]; then
+    echo "install-desktop: missing $source_entry" >&2
+    exit 1
+fi
+
+if [[ ! -x "$binary" ]]; then
+    echo "install-desktop: building the release binary (this takes a while the first time)"
+    (cd "$repo_root" && cargo build --release)
+fi
+
+# The build may have put the binary elsewhere (CARGO_TARGET_DIR) or failed to
+# produce it at all; a launcher pointing at nothing is worse than no launcher.
+if [[ ! -x "$binary" ]]; then
+    echo "install-desktop: no executable binary at $binary" >&2
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        echo "install-desktop: CARGO_TARGET_DIR is set to '$CARGO_TARGET_DIR', so cargo built it under there instead." >&2
+        echo "install-desktop: re-run with CARGO_TARGET_DIR unset, or copy the binary to the path above." >&2
+    else
+        echo "install-desktop: run 'cargo build --release' in $repo_root and check why it did not produce that file." >&2
+    fi
+    exit 1
+fi
+
+mkdir -p "$target_dir"
+
+# The packaging entry, with Exec rewritten to this checkout's binary.
+exec_line="Exec=$(quote_exec "$binary")"
+tmp_entry="$target_entry.tmp.$$"
+trap 'rm -f "$tmp_entry"' EXIT
+while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == Exec=* ]]; then
+        printf '%s\n' "$exec_line"
+    else
+        printf '%s\n' "$line"
+    fi
+done <"$source_entry" >"$tmp_entry"
+mv -f "$tmp_entry" "$target_entry"
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$target_dir"
+fi
+
+echo "install-desktop: wrote $target_entry"

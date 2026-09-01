@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Omarchygram
+Comment=Telegram client themed by Omarchy
+Exec=omarchygram
+Terminal=false
+Type=Application
+Categories=Network;InstantMessaging;
