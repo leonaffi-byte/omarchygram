@@ -4,17 +4,20 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+use chrono::{DateTime, Local};
 use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
-use crate::tg::{AuthState, Event, MediaKind, Msg, SETUP_HELP, Tg};
+use crate::settings::{Settings, SettingsStore};
+use crate::tg::{AuthState, BackendFlags, Event, MediaKind, Msg, SETUP_HELP, Tg};
 
 use super::auth::{AuthAction, AuthView};
 use super::chatlist::{ChatList, UnreadUpdate};
 use super::messages::{MediaState, MessageAction, MessagesView};
+use super::settings_view::SettingsView;
 use super::switcher::Switcher;
 
 pub struct Shell {
@@ -39,6 +42,9 @@ struct ShellInner {
     chatlist: ChatList,
     messages: MessagesView,
     switcher: Switcher,
+    settings: Rc<SettingsStore>,
+    settings_view: SettingsView,
+    clock_source: RefCell<Option<glib::SourceId>>,
     dialogs_error_box: gtk::Box,
     dialogs_error: gtk::Label,
     epoch: Cell<u64>,
@@ -50,6 +56,8 @@ struct ShellInner {
     composer_operation: Cell<bool>,
     mark_reads: RefCell<HashMap<i64, ReadState>>,
     last_by_chat: RefCell<HashMap<i64, Msg>>,
+    flags_in_flight: Cell<bool>,
+    flags_pending: RefCell<Option<BackendFlags>>,
     typing_timeout: RefCell<Option<glib::SourceId>>,
     probe_started: Cell<bool>,
     auth_probe_started: Cell<bool>,
@@ -61,6 +69,8 @@ impl Shell {
         let chatlist = ChatList::new();
         let messages = MessagesView::new();
         let switcher = Switcher::new();
+        let settings = SettingsStore::new();
+        let settings_view = SettingsView::new(settings.clone());
 
         let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let dialogs_error_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -90,6 +100,7 @@ impl Shell {
         stack.set_transition_type(gtk::StackTransitionType::None);
         stack.add_named(&auth.widget, Some("auth"));
         stack.add_named(&main, Some("main"));
+        stack.add_named(&settings_view.widget, Some("settings"));
         stack.set_visible_child_name("auth");
 
         let overlay = gtk::Overlay::new();
@@ -112,6 +123,9 @@ impl Shell {
             chatlist,
             messages,
             switcher,
+            settings,
+            settings_view,
+            clock_source: RefCell::new(None),
             dialogs_error_box,
             dialogs_error,
             epoch: Cell::new(0),
@@ -123,6 +137,8 @@ impl Shell {
             composer_operation: Cell::new(false),
             mark_reads: RefCell::new(HashMap::new()),
             last_by_chat: RefCell::new(HashMap::new()),
+            flags_in_flight: Cell::new(false),
+            flags_pending: RefCell::new(None),
             typing_timeout: RefCell::new(None),
             probe_started: Cell::new(false),
             auth_probe_started: Cell::new(false),
@@ -178,6 +194,22 @@ impl ShellInner {
                 }
             });
         }
+        {
+            let weak = Rc::downgrade(this);
+            this.settings_view.set_on_close(Rc::new(move || {
+                if let Some(this) = weak.upgrade() {
+                    this.close_settings();
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.settings.on_change(move |settings| {
+                if let Some(this) = weak.upgrade() {
+                    this.apply_settings(settings);
+                }
+            });
+        }
 
         let keys = gtk::EventControllerKey::new();
         {
@@ -189,6 +221,12 @@ impl ShellInner {
                 if modifiers.contains(gdk::ModifierType::CONTROL_MASK) && key == gdk::Key::k {
                     if this.started.get() {
                         this.switcher.open(this.chatlist.ordered());
+                    }
+                    return glib::Propagation::Stop;
+                }
+                if modifiers.contains(gdk::ModifierType::CONTROL_MASK) && key == gdk::Key::comma {
+                    if this.started.get() {
+                        this.toggle_settings();
                     }
                     return glib::Propagation::Stop;
                 }
@@ -208,6 +246,8 @@ impl ShellInner {
                 if key == gdk::Key::Escape {
                     if this.switcher.is_open() {
                         this.switcher.close();
+                    } else if this.settings_open() {
+                        this.close_settings();
                     } else if !this.messages.cancel_mode() {
                         this.messages.focus_composer();
                     }
@@ -277,9 +317,86 @@ impl ShellInner {
         }
         self.stack.set_visible_child_name("main");
         self.install_window_hook();
+        self.apply_settings(&self.settings.get());
         self.spawn_event_loop();
         self.load_dialogs();
         self.start_probe();
+    }
+
+    /// Push settings into the UI and the backend (clock, ghost pill, message
+    /// time format, backend flags). Called on READY and on every change.
+    fn apply_settings(self: &Rc<Self>, settings: &Settings) {
+        self.messages.set_time_format(settings.time_format());
+        self.messages.set_ghost(settings.ghost_mode);
+        self.update_clock(settings.header_clock);
+        self.push_flags(BackendFlags {
+            ghost_mode: settings.ghost_mode,
+            anti_delete: settings.anti_delete,
+        });
+    }
+
+    /// Coalesced set_flags: at most one call in flight. While a call is in
+    /// flight, newer values replace the pending one; a completion sends the
+    /// latest pending value next, so the backend never ends up with a stale
+    /// (older-completing-later) flag state.
+    fn push_flags(self: &Rc<Self>, flags: BackendFlags) {
+        if self.flags_in_flight.get() {
+            *self.flags_pending.borrow_mut() = Some(flags);
+            return;
+        }
+        self.flags_in_flight.set(true);
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            if let Err(error) = tg.set_flags(flags).await {
+                eprintln!("set_flags: {error}");
+            }
+            let Some(this) = weak.upgrade() else { return };
+            this.flags_in_flight.set(false);
+            let pending = this.flags_pending.borrow_mut().take();
+            if let Some(flags) = pending {
+                this.push_flags(flags);
+            }
+        });
+    }
+
+    fn update_clock(self: &Rc<Self>, on: bool) {
+        if let Some(source) = self.clock_source.borrow_mut().take() {
+            source.remove();
+        }
+        if !on {
+            self.messages.set_clock(None);
+            return;
+        }
+        self.messages.set_clock(Some(&clock_text()));
+        let weak = Rc::downgrade(self);
+        let source = glib::timeout_add_local(Duration::from_secs(1), move || {
+            let Some(this) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            this.messages.set_clock(Some(&clock_text()));
+            glib::ControlFlow::Continue
+        });
+        *self.clock_source.borrow_mut() = Some(source);
+    }
+
+    fn settings_open(&self) -> bool {
+        self.stack.visible_child_name().as_deref() == Some("settings")
+    }
+
+    fn toggle_settings(&self) {
+        if self.settings_open() {
+            self.close_settings();
+        } else {
+            self.stack.set_visible_child_name("settings");
+        }
+    }
+
+    fn close_settings(&self) {
+        if self.settings_open() {
+            self.stack.set_visible_child_name("main");
+            self.messages.focus_composer();
+        }
     }
 
     fn spawn_event_loop(self: &Rc<Self>) {
@@ -525,6 +642,9 @@ impl ShellInner {
         if self.open_chat.get() == Some(chat_id) {
             return;
         }
+        // Opening a chat while the settings page is up swaps back to the main
+        // view so the opened chat is actually visible.
+        self.close_settings();
         let epoch = self.bump_epoch();
         self.open_chat.set(Some(chat_id));
         self.chatlist.select_chat(chat_id);
@@ -607,7 +727,105 @@ impl ShellInner {
             MessageAction::CancelMode => {
                 self.messages.cancel_mode();
             }
+            MessageAction::CopyMessageId(msg_id) => {
+                if let Some(message) = self.messages.message(msg_id) {
+                    self.widget
+                        .clipboard()
+                        .set_text(&format!("chat {} msg {}", message.chat_id, message.id));
+                }
+            }
+            MessageAction::CopyUserId(msg_id) => {
+                let sender_id = self
+                    .messages
+                    .message(msg_id)
+                    .and_then(|message| message.sender_id);
+                if let Some(sender_id) = sender_id {
+                    self.widget.clipboard().set_text(&sender_id.to_string());
+                }
+            }
+            MessageAction::JumpToDate(date) => self.jump_to_date(date),
+            MessageAction::JumpToLatest => self.jump_to_latest(),
         }
+    }
+
+    /// Jump-to-date: re-render the open chat around a historical day. The view
+    /// stays `detached` (▼ always visible) until the user reloads the latest
+    /// page; pagination upward from the jumped page keeps working (C3).
+    fn jump_to_date(self: Rc<Self>, date: DateTime<Local>) {
+        let Some(chat_id) = self.open_chat.get() else {
+            return;
+        };
+        let epoch = self.bump_epoch();
+        // History-only reset: same chat, so the composer draft, reply/edit
+        // mode, and busy sensitivity are preserved (C5/C13).
+        self.messages.reset_history(chat_id, epoch);
+        let this = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            match this.tg.get_history_at_date(chat_id, date).await {
+                Ok(messages) => {
+                    if !this.is_current(chat_id, epoch) {
+                        return;
+                    }
+                    let inserted = this.messages.finish_initial(messages);
+                    this.start_image_downloads(inserted);
+                    this.messages.set_detached(true);
+                }
+                Err(error) => {
+                    eprintln!("get_history_at_date({chat_id}): {error}");
+                    if this.is_current(chat_id, epoch) {
+                        this.messages.fail_initial(&error);
+                        // The store was reset for the jump: keep the view
+                        // detached so ▼ offers the way back to the latest page.
+                        this.messages.set_detached(true);
+                    }
+                }
+            }
+        });
+    }
+
+    /// ▼ while detached: reload the latest page like an initial load (C1/C4).
+    /// `detached` is cleared only after the latest page for the current epoch
+    /// has actually loaded; on error the omg-error line shows and ▼ stays
+    /// visible so the user can retry.
+    fn jump_to_latest(self: Rc<Self>) {
+        let Some(chat_id) = self.open_chat.get() else {
+            return;
+        };
+        let epoch = self.bump_epoch();
+        // History-only reset: same chat, so the composer draft, reply/edit
+        // mode, and busy sensitivity are preserved (C5/C13).
+        self.messages.reset_history(chat_id, epoch);
+        let this = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            match this.tg.get_history(chat_id, None).await {
+                Ok(messages) => {
+                    if !this.is_current(chat_id, epoch) {
+                        return;
+                    }
+                    if let Some(last) = messages.last() {
+                        this.remember_last(last);
+                    }
+                    let inserted = this.messages.finish_initial(messages);
+                    this.start_image_downloads(inserted);
+                    this.messages.set_detached(false);
+                    if this.window_is_active() {
+                        let latest = this
+                            .messages
+                            .last_message()
+                            .map(|message| message.id)
+                            .unwrap_or(0);
+                        this.queue_mark_read(chat_id, latest, epoch);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("get_history({chat_id}): {error}");
+                    if this.is_current(chat_id, epoch) {
+                        this.messages.fail_initial(&error);
+                        this.messages.set_detached(true);
+                    }
+                }
+            }
+        });
     }
 
     fn submit_composer(self: Rc<Self>) {
@@ -937,6 +1155,11 @@ impl ShellInner {
     }
 
     fn queue_mark_read(self: &Rc<Self>, chat_id: i64, latest: i32, epoch: u64) {
+        // Ghost mode suppresses read receipts; check the CURRENT snapshot so
+        // toggling it on takes effect immediately.
+        if self.settings.get().ghost_mode {
+            return;
+        }
         let (should_spawn, sent_through) = {
             let mut states = self.mark_reads.borrow_mut();
             let state = states.entry(chat_id).or_default();
@@ -1200,6 +1423,67 @@ impl ShellInner {
             probe_fail("delete message");
             return;
         }
+
+        // Settings panel (wave 1): open via the Ctrl+, path, toggle
+        // show_seconds on/off, assert the time labels re-render.
+        self.toggle_settings();
+        if !poll_until(1000, || self.settings_open()).await {
+            probe_fail("open settings");
+            return;
+        }
+        self.settings.update(|settings| settings.show_seconds = true);
+        if !poll_until(1000, || {
+            self.messages
+                .last_time_label()
+                .is_some_and(|text| time_has_seconds(&text))
+        })
+        .await
+        {
+            probe_fail("show seconds");
+            return;
+        }
+        self.settings.update(|settings| settings.show_seconds = false);
+        if !poll_until(1000, || {
+            self.messages
+                .last_time_label()
+                .is_some_and(|text| !time_has_seconds(&text))
+        })
+        .await
+        {
+            probe_fail("hide seconds");
+            return;
+        }
+        self.close_settings();
+        if !poll_until(1000, || !self.settings_open()).await {
+            probe_fail("close settings");
+            return;
+        }
+
+        // Jump to today's date (detached), then ▼ reloads the latest page.
+        self.clone().open_chat(marta);
+        let today_end = Local::now()
+            .date_naive()
+            .and_hms_opt(23, 59, 59)
+            .and_then(|naive| naive.and_local_timezone(Local).earliest())
+            .unwrap_or_else(Local::now);
+        self.clone().jump_to_date(today_end);
+        if !poll_until(3000, || {
+            self.messages.is_detached() && !self.messages.is_loading() && self.messages.len() > 0
+        })
+        .await
+        {
+            probe_fail("jump to date");
+            return;
+        }
+        self.messages.trigger_jump_to_latest();
+        if !poll_until(3000, || {
+            !self.messages.is_detached() && !self.messages.is_loading() && self.messages.len() > 0
+        })
+        .await
+        {
+            probe_fail("reload latest");
+            return;
+        }
         let Some(window) = self.window() else {
             probe_fail("find application window");
             return;
@@ -1210,6 +1494,30 @@ impl ShellInner {
         };
         application.quit();
     }
+}
+
+impl Drop for ShellInner {
+    fn drop(&mut self) {
+        if let Some(source) = self.clock_source.borrow_mut().take() {
+            source.remove();
+        }
+    }
+}
+
+fn clock_text() -> String {
+    Local::now().format("%H:%M:%S").to_string()
+}
+
+/// Matches `\d\d:\d\d:\d\d` (with an optional " edited" suffix).
+fn time_has_seconds(text: &str) -> bool {
+    let text = text.strip_suffix(" edited").unwrap_or(text);
+    let bytes = text.as_bytes();
+    bytes.len() == 8
+        && bytes[2] == b':'
+        && bytes[5] == b':'
+        && [0usize, 1, 3, 4, 6, 7]
+            .into_iter()
+            .all(|index| bytes[index].is_ascii_digit())
 }
 
 fn chat_title(message: &Msg) -> String {
