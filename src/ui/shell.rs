@@ -11,14 +11,21 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
+use crate::ai::prompts;
+use crate::ai::{ChatMessage, Prefs, Role};
+use crate::local::Local as LocalServices;
+use crate::os::{self, OsPolicy, Parsed};
 use crate::settings::{Settings, SettingsStore};
-use crate::tg::{AuthState, BackendFlags, Event, MediaKind, Msg, Tg, SETUP_HELP};
+use crate::tg::{AuthState, BackendFlags, Event, MediaKind, Msg, SETUP_HELP, Tg};
 
 use super::auth::{AuthAction, AuthView};
 use super::chatlist::{ChatList, UnreadUpdate};
 use super::messages::{MediaState, MessageAction, MessagesView};
 use super::settings_view::SettingsView;
 use super::switcher::Switcher;
+use super::virtual_chat::{
+    ASSISTANT_CHAT, AuxState, OMARCHY_CHAT, ReqState, VirtualStore, is_virtual, virtual_title,
+};
 
 pub struct Shell {
     pub widget: gtk::Box,
@@ -39,9 +46,41 @@ struct FlagsRequest {
     generation: u64,
 }
 
+struct PendingShellTicket {
+    ticket: Option<os::ShellTicket>,
+}
+
+impl PendingShellTicket {
+    fn new(ticket: os::ShellTicket) -> Self {
+        Self {
+            ticket: Some(ticket),
+        }
+    }
+
+    fn command(&self) -> &str {
+        self.ticket
+            .as_ref()
+            .expect("pending shell ticket must exist")
+            .command()
+    }
+
+    fn consume(mut self) -> os::ShellTicket {
+        self.ticket.take().expect("pending shell ticket must exist")
+    }
+}
+
+impl Drop for PendingShellTicket {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            os::cancel_shell(ticket);
+        }
+    }
+}
+
 struct ShellInner {
     widget: gtk::Box,
     tg: Tg,
+    local: LocalServices,
     probe: bool,
     stack: gtk::Stack,
     auth: AuthView,
@@ -64,7 +103,12 @@ struct ShellInner {
     mark_reads: RefCell<HashMap<i64, ReadState>>,
     last_by_chat: RefCell<HashMap<i64, Msg>>,
     settings_gen: Cell<u64>,
+    last_applied_settings: RefCell<Settings>,
     tombstones: RefCell<HashMap<i64, HashSet<i32>>>,
+    virtual_stores: RefCell<HashMap<i64, VirtualStore>>,
+    aux: RefCell<AuxState>,
+    transcription_active: RefCell<HashSet<(i64, i32)>>,
+    recent_real_chats: RefCell<Vec<i64>>,
     flags_initialized: Cell<bool>,
     desired_flags: Cell<BackendFlags>,
     anti_reload_pending: Cell<bool>,
@@ -73,6 +117,7 @@ struct ShellInner {
     typing_timeout: RefCell<Option<glib::SourceId>>,
     probe_started: Cell<bool>,
     auth_probe_started: Cell<bool>,
+    probe_answer: Cell<Option<usize>>,
 }
 
 impl Shell {
@@ -82,7 +127,9 @@ impl Shell {
         let messages = MessagesView::new();
         let switcher = Switcher::new();
         let settings = SettingsStore::new();
+        let last_applied_settings = settings.get();
         let settings_view = SettingsView::new(settings.clone());
+        let local = LocalServices::spawn();
 
         let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let dialogs_error_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -126,9 +173,13 @@ impl Shell {
         widget.set_vexpand(true);
         widget.append(&overlay);
 
+        let mut virtual_stores = HashMap::new();
+        virtual_stores.insert(ASSISTANT_CHAT, VirtualStore::default());
+        virtual_stores.insert(OMARCHY_CHAT, VirtualStore::default());
         let inner = Rc::new(ShellInner {
             widget: widget.clone(),
             tg,
+            local,
             probe,
             stack,
             auth,
@@ -151,7 +202,12 @@ impl Shell {
             mark_reads: RefCell::new(HashMap::new()),
             last_by_chat: RefCell::new(HashMap::new()),
             settings_gen: Cell::new(0),
+            last_applied_settings: RefCell::new(last_applied_settings),
             tombstones: RefCell::new(HashMap::new()),
+            virtual_stores: RefCell::new(virtual_stores),
+            aux: RefCell::new(AuxState::default()),
+            transcription_active: RefCell::new(HashSet::new()),
+            recent_real_chats: RefCell::new(Vec::new()),
             flags_initialized: Cell::new(false),
             desired_flags: Cell::new(BackendFlags::default()),
             anti_reload_pending: Cell::new(false),
@@ -160,6 +216,7 @@ impl Shell {
             typing_timeout: RefCell::new(None),
             probe_started: Cell::new(false),
             auth_probe_started: Cell::new(false),
+            probe_answer: Cell::new(None),
         });
         ShellInner::wire(&inner, dialogs_retry);
         Shell { widget, inner }
@@ -344,12 +401,32 @@ impl ShellInner {
     /// Push settings into the UI and the backend (clock, ghost pill, message
     /// time format, backend flags). Called on READY and on every change.
     fn apply_settings(self: &Rc<Self>, settings: &Settings) {
+        let transcribe_auto_just_enabled = {
+            let mut previous = self.last_applied_settings.borrow_mut();
+            let just_enabled = !previous.ai.transcribe_auto && settings.ai.transcribe_auto;
+            *previous = settings.clone();
+            just_enabled
+        };
         let generation = self.settings_gen.get().wrapping_add(1);
         self.settings_gen.set(generation);
         self.messages.set_time_format(settings.time_format());
         self.messages.set_ghost(settings.ghost_mode);
         self.messages.set_edit_history(settings.edit_history);
+        self.messages.set_ai_enabled(settings.ai.enabled);
         self.update_clock(settings.header_clock);
+        self.refresh_virtual_rows(settings);
+        let disabled_open = match self.open_chat.get() {
+            Some(ASSISTANT_CHAT) => !settings.ai.enabled,
+            Some(OMARCHY_CHAT) => !settings.os.enabled,
+            _ => false,
+        };
+        if disabled_open {
+            let epoch = self.bump_epoch();
+            self.open_chat.set(None);
+            self.messages.clear_selection(epoch);
+        } else if settings.ai.enabled && transcribe_auto_just_enabled {
+            self.arm_visible_transcriptions();
+        }
         let flags = BackendFlags {
             ghost_mode: settings.ghost_mode,
             anti_delete: settings.anti_delete,
@@ -366,6 +443,35 @@ impl ShellInner {
         // explicit, this guarantees a current-generation completion exists if
         // an unrelated setting changes while an anti-delete flip is in flight.
         self.push_flags(FlagsRequest { flags, generation });
+    }
+
+    fn refresh_virtual_rows(&self, settings: &Settings) {
+        let stores = self.virtual_stores.borrow();
+        let mut rows = Vec::new();
+        if settings.ai.enabled {
+            rows.push((
+                ASSISTANT_CHAT,
+                "Assistant".to_string(),
+                stores
+                    .get(&ASSISTANT_CHAT)
+                    .and_then(|store| store.msgs.last())
+                    .map(|message| last_line(&message.text))
+                    .unwrap_or_default(),
+            ));
+        }
+        if settings.os.enabled {
+            rows.push((
+                OMARCHY_CHAT,
+                "Omarchy".to_string(),
+                stores
+                    .get(&OMARCHY_CHAT)
+                    .and_then(|store| store.msgs.last())
+                    .map(|message| last_line(&message.text))
+                    .unwrap_or_default(),
+            ));
+        }
+        drop(stores);
+        self.chatlist.set_virtual(rows);
     }
 
     /// Coalesced set_flags: flags reach the backend before any anti-delete
@@ -550,6 +656,9 @@ impl ShellInner {
             let Some(chat_id) = this.open_chat.get() else {
                 return;
             };
+            if is_virtual(chat_id) {
+                return;
+            }
             if this.chatlist.unread(chat_id) > 0 {
                 let latest = this.messages.last_message().map(|msg| msg.id).unwrap_or(0);
                 let epoch = this.epoch.get();
@@ -566,7 +675,7 @@ impl ShellInner {
                 if self.open_chat.get() == Some(message.chat_id) {
                     let was_last = self.messages.is_last(message.id);
                     let inserted = self.messages.merge_event(message.clone());
-                    self.start_image_downloads(inserted);
+                    self.post_render(inserted);
                     if was_last && !message.deleted {
                         self.remember_last(&message);
                         self.chatlist.upsert(
@@ -697,7 +806,7 @@ impl ShellInner {
         }
         if is_open {
             let inserted = self.messages.merge_event(message.clone());
-            self.start_image_downloads(inserted);
+            self.post_render(inserted);
             if read_triggered && !own && !message.deleted {
                 self.queue_mark_read(message.chat_id, message.id, self.epoch.get());
             }
@@ -738,21 +847,78 @@ impl ShellInner {
         if self.open_chat.get() == Some(chat_id) {
             return;
         }
+        if is_virtual(chat_id) {
+            self.open_virtual_chat(chat_id);
+            return;
+        }
         // Opening a chat while the settings page is up swaps back to the main
         // view so the opened chat is actually visible.
         self.close_settings();
         let epoch = self.bump_epoch();
         self.open_chat.set(Some(chat_id));
         self.chatlist.select_chat(chat_id);
+        {
+            let mut recent = self.recent_real_chats.borrow_mut();
+            recent.retain(|id| *id != chat_id);
+            recent.insert(0, chat_id);
+        }
         let title = self.title_for(chat_id);
         self.messages.reset_chat(chat_id, &title, epoch);
         self.start_initial_load(chat_id, epoch);
+    }
+
+    fn open_virtual_chat(self: Rc<Self>, chat_id: i64) {
+        let settings = self.settings.get();
+        if (chat_id == ASSISTANT_CHAT && !settings.ai.enabled)
+            || (chat_id == OMARCHY_CHAT && !settings.os.enabled)
+        {
+            return;
+        }
+        self.close_settings();
+        if chat_id == OMARCHY_CHAT {
+            let should_seed = self
+                .virtual_stores
+                .borrow()
+                .get(&OMARCHY_CHAT)
+                .is_some_and(|store| store.msgs.is_empty());
+            if should_seed {
+                let actions = os::catalog(&settings.os.actions);
+                let help = os::help_text(&actions);
+                if let Some(store) = self.virtual_stores.borrow_mut().get_mut(&OMARCHY_CHAT) {
+                    store.append(OMARCHY_CHAT, help, false, false);
+                }
+            }
+        }
+        let epoch = self.bump_epoch();
+        self.open_chat.set(Some(chat_id));
+        self.chatlist.select_chat(chat_id);
+        self.messages
+            .reset_chat(chat_id, virtual_title(chat_id), epoch);
+        let (messages, mono_ids) = {
+            let stores = self.virtual_stores.borrow();
+            let Some(store) = stores.get(&chat_id) else {
+                return;
+            };
+            (store.msgs.clone(), store.mono_ids.clone())
+        };
+        let inserted = self.messages.finish_initial(messages);
+        for msg_id in inserted {
+            self.messages
+                .set_monospace(msg_id, mono_ids.contains(&msg_id));
+        }
+        self.update_virtual_status(chat_id);
+        self.refresh_virtual_rows(&settings);
     }
 
     /// Reload the current chat even when it is already open. This is the data
     /// half of the flags-before-data anti-delete transition (D2).
     fn force_reload(self: Rc<Self>, chat_id: i64) {
         if self.open_chat.get() != Some(chat_id) {
+            return;
+        }
+        if is_virtual(chat_id) {
+            self.open_chat.set(None);
+            self.open_virtual_chat(chat_id);
             return;
         }
         let epoch = self.bump_epoch();
@@ -777,7 +943,7 @@ impl ShellInner {
                         self.remember_last(last);
                     }
                     let inserted = self.messages.finish_initial(messages);
-                    self.start_image_downloads(inserted);
+                    self.post_render(inserted);
                     if self.window_is_active() {
                         let latest = self
                             .messages
@@ -801,6 +967,9 @@ impl ShellInner {
         let Some(chat_id) = self.open_chat.get() else {
             return;
         };
+        if is_virtual(chat_id) {
+            return;
+        }
         let Some(before_id) = self.messages.begin_page() else {
             return;
         };
@@ -813,7 +982,7 @@ impl ShellInner {
                     }
                     self.apply_tombstones(chat_id, &mut messages);
                     let inserted = self.messages.finish_page(messages);
-                    self.start_image_downloads(inserted);
+                    self.post_render(inserted);
                 }
                 Err(error) => {
                     eprintln!("get_history page ({chat_id}): {error}");
@@ -826,13 +995,27 @@ impl ShellInner {
     }
 
     fn handle_message_action(self: Rc<Self>, action: MessageAction) {
+        if self.open_chat.get().is_some_and(is_virtual)
+            && matches!(
+                &action,
+                MessageAction::Reply(_) | MessageAction::Edit(_) | MessageAction::Delete(_)
+            )
+        {
+            return;
+        }
         match action {
             MessageAction::Submit => self.submit_composer(),
             MessageAction::Attach => {
+                if self.open_chat.get().is_some_and(is_virtual) {
+                    return;
+                }
                 self.messages.prepare_attachment();
                 self.open_file_dialog();
             }
             MessageAction::DropFile(file) => {
+                if self.open_chat.get().is_some_and(is_virtual) {
+                    return;
+                }
                 self.messages.prepare_attachment();
                 self.send_file(file);
             }
@@ -863,6 +1046,10 @@ impl ShellInner {
             }
             MessageAction::JumpToDate(date) => self.jump_to_date(date),
             MessageAction::JumpToLatest => self.jump_to_latest(),
+            MessageAction::DraftReply(msg_id) => self.draft_reply(msg_id),
+            MessageAction::Translate(msg_id) => self.translate_message(msg_id),
+            MessageAction::Summarize(msg_id) => self.summarize_message(msg_id),
+            MessageAction::Transcribe(msg_id) => self.request_transcription(msg_id),
         }
     }
 
@@ -907,6 +1094,9 @@ impl ShellInner {
         let Some(chat_id) = self.open_chat.get() else {
             return;
         };
+        if is_virtual(chat_id) {
+            return;
+        }
         let epoch = self.bump_epoch();
         // History-only reset: same chat, so the composer draft, reply/edit
         // mode, and busy sensitivity are preserved (C5/C13).
@@ -920,7 +1110,7 @@ impl ShellInner {
                     }
                     this.apply_tombstones(chat_id, &mut messages);
                     let inserted = this.messages.finish_initial(messages);
-                    this.start_image_downloads(inserted);
+                    this.post_render(inserted);
                     this.messages.set_detached(true);
                 }
                 Err(error) => {
@@ -944,6 +1134,9 @@ impl ShellInner {
         let Some(chat_id) = self.open_chat.get() else {
             return;
         };
+        if is_virtual(chat_id) {
+            return;
+        }
         let epoch = self.bump_epoch();
         // History-only reset: same chat, so the composer draft, reply/edit
         // mode, and busy sensitivity are preserved (C5/C13).
@@ -960,7 +1153,7 @@ impl ShellInner {
                         this.remember_last(last);
                     }
                     let inserted = this.messages.finish_initial(messages);
-                    this.start_image_downloads(inserted);
+                    this.post_render(inserted);
                     this.messages.set_detached(false);
                     if this.window_is_active() {
                         let latest = this
@@ -982,11 +1175,437 @@ impl ShellInner {
         });
     }
 
+    fn append_virtual(&self, chat_id: i64, text: String, outgoing: bool, monospace: bool) -> i32 {
+        let message = {
+            let mut stores = self.virtual_stores.borrow_mut();
+            let store = stores.entry(chat_id).or_default();
+            store.append(chat_id, text, outgoing, monospace)
+        };
+        if self.open_chat.get() == Some(chat_id) {
+            self.messages.merge_event(message.clone());
+            self.messages.set_monospace(message.id, monospace);
+        }
+        self.refresh_virtual_rows(&self.settings.get());
+        self.update_virtual_status(chat_id);
+        message.id
+    }
+
+    fn begin_virtual_request(&self, chat_id: i64) {
+        if let Some(store) = self.virtual_stores.borrow_mut().get_mut(&chat_id) {
+            store.in_flight = store.in_flight.saturating_add(1);
+        }
+        self.update_virtual_status(chat_id);
+    }
+
+    fn end_virtual_request(&self, chat_id: i64) {
+        if let Some(store) = self.virtual_stores.borrow_mut().get_mut(&chat_id) {
+            store.in_flight = store.in_flight.saturating_sub(1);
+        }
+        self.update_virtual_status(chat_id);
+    }
+
+    fn finish_virtual(&self, chat_id: i64, result: Result<String, String>, monospace: bool) {
+        self.end_virtual_request(chat_id);
+        let text = match result {
+            Ok(text) => text,
+            Err(error) if chat_id == ASSISTANT_CHAT && error.contains("no chat provider") => {
+                format!(
+                    "{error}\nadd `anthropic_api_key = \"…\"` (or openai/groq/gemini) under `[ai]` in ~/.config/omarchygram/config.toml, or run `ollama serve`"
+                )
+            }
+            Err(error) => error,
+        };
+        self.append_virtual(chat_id, text, false, monospace);
+    }
+
+    fn update_virtual_status(&self, chat_id: i64) {
+        if self.open_chat.get() != Some(chat_id) {
+            return;
+        }
+        let in_flight = self
+            .virtual_stores
+            .borrow()
+            .get(&chat_id)
+            .is_some_and(|store| store.in_flight > 0);
+        self.messages.set_status(if in_flight {
+            Some(if chat_id == ASSISTANT_CHAT {
+                "thinking…"
+            } else {
+                "running…"
+            })
+        } else {
+            None
+        });
+    }
+
+    fn submit_virtual(self: Rc<Self>, chat_id: i64) {
+        let settings = self.settings.get();
+        if (chat_id == ASSISTANT_CHAT && !settings.ai.enabled)
+            || (chat_id == OMARCHY_CHAT && !settings.os.enabled)
+        {
+            return;
+        }
+        let text = self.messages.composer_text();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.append_virtual(chat_id, text.clone(), true, false);
+        if self.messages.composer_text() == text {
+            self.messages.set_composer_text("");
+            self.messages.cancel_all_modes();
+        }
+        if chat_id == ASSISTANT_CHAT {
+            self.dispatch_assistant(text);
+        } else {
+            let lines: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            for line in lines {
+                self.clone().dispatch_omarchy(line);
+            }
+        }
+    }
+
+    fn dispatch_assistant(self: Rc<Self>, line: String) {
+        if !self.settings.get().ai.enabled {
+            return;
+        }
+        self.begin_virtual_request(ASSISTANT_CHAT);
+        let trimmed = line.trim();
+        if trimmed == "/help" {
+            self.finish_virtual(
+                ASSISTANT_CHAT,
+                Ok("Assistant commands\n/help\n/status\n/catchup [chat title]\n/translate <lang> <text>\n/summarize <text>\n/search <question>".into()),
+                false,
+            );
+            return;
+        }
+        if trimmed == "/status" {
+            let prefs = ai_prefs(&self.settings.get());
+            glib::MainContext::default().spawn_local(async move {
+                let providers = self.local.detect(prefs).await;
+                let text = providers
+                    .into_iter()
+                    .map(|provider| {
+                        format!(
+                            "{} ({}): {} — {}",
+                            provider.id,
+                            provider.task.label(),
+                            if provider.available {
+                                "available"
+                            } else {
+                                "unavailable"
+                            },
+                            provider.detail
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.finish_virtual(ASSISTANT_CHAT, Ok(text), false);
+            });
+            return;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/catchup") {
+            let query = rest.trim().to_lowercase();
+            let target = if query.is_empty() {
+                self.recent_real_chats.borrow().first().copied()
+            } else {
+                self.chatlist
+                    .ordered()
+                    .into_iter()
+                    .filter(|(id, _)| !is_virtual(*id))
+                    .find_map(|(id, title)| title.to_lowercase().contains(&query).then_some(id))
+            };
+            let Some(chat_id) = target else {
+                self.finish_virtual(ASSISTANT_CHAT, Err("no matching real chat".into()), false);
+                return;
+            };
+            let title = self.title_for(chat_id);
+            let prefs = ai_prefs(&self.settings.get());
+            glib::MainContext::default().spawn_local(async move {
+                let result = match self.tg.get_history(chat_id, None).await {
+                    Ok(messages) => {
+                        let transcript = transcript(&messages, 50, false);
+                        let (system, user) = prompts::catch_up(&title, &transcript);
+                        self.local
+                            .chat(
+                                prefs,
+                                system,
+                                vec![ChatMessage {
+                                    role: Role::User,
+                                    content: user,
+                                }],
+                            )
+                            .await
+                            .map(|reply| reply.text)
+                    }
+                    Err(error) => Err(error),
+                };
+                self.finish_virtual(ASSISTANT_CHAT, result, false);
+            });
+            return;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/translate ") {
+            let Some((lang, text)) = rest.trim().split_once(char::is_whitespace) else {
+                self.finish_virtual(
+                    ASSISTANT_CHAT,
+                    Err("usage: /translate <lang> <text>".into()),
+                    false,
+                );
+                return;
+            };
+            let (system, user) = prompts::translate(text.trim(), lang);
+            self.spawn_assistant_chat(system, user);
+            return;
+        }
+        if let Some(text) = trimmed.strip_prefix("/summarize ") {
+            let (system, user) = prompts::summarize(text.trim());
+            self.spawn_assistant_chat(system, user);
+            return;
+        }
+        if let Some(question) = trimmed.strip_prefix("/search ") {
+            let targets: Vec<(i64, String)> = self
+                .chatlist
+                .ordered()
+                .into_iter()
+                .filter(|(id, _)| !is_virtual(*id))
+                .take(10)
+                .collect();
+            let prefs = ai_prefs(&self.settings.get());
+            let question = question.trim().to_string();
+            glib::MainContext::default().spawn_local(async move {
+                let mut handles = Vec::new();
+                for (chat_id, title) in targets {
+                    let tg = self.tg.clone();
+                    handles.push(
+                        glib::MainContext::default().spawn_local(async move {
+                            (title, tg.get_history(chat_id, None).await)
+                        }),
+                    );
+                }
+                let mut candidates = Vec::new();
+                for handle in handles {
+                    if let Ok((title, Ok(messages))) = handle.await {
+                        candidates.push(search_transcript(&title, &messages));
+                    }
+                }
+                let (system, user) = prompts::search(&question, &candidates.join("\n"));
+                let result = self
+                    .local
+                    .chat(
+                        prefs,
+                        system,
+                        vec![ChatMessage {
+                            role: Role::User,
+                            content: user,
+                        }],
+                    )
+                    .await
+                    .map(|reply| reply.text);
+                self.finish_virtual(ASSISTANT_CHAT, result, false);
+            });
+            return;
+        }
+
+        let messages = {
+            let stores = self.virtual_stores.borrow();
+            stores
+                .get(&ASSISTANT_CHAT)
+                .map(|store| {
+                    store
+                        .msgs
+                        .iter()
+                        .rev()
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .map(|message| ChatMessage {
+                            role: if message.outgoing {
+                                Role::User
+                            } else {
+                                Role::Assistant
+                            },
+                            content: message.text.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let prefs = ai_prefs(&self.settings.get());
+        glib::MainContext::default().spawn_local(async move {
+            let result = self
+                .local
+                .chat(prefs, prompts::ASSISTANT.to_string(), messages)
+                .await
+                .map(|reply| reply.text);
+            self.finish_virtual(ASSISTANT_CHAT, result, false);
+        });
+    }
+
+    fn spawn_assistant_chat(self: Rc<Self>, system: String, user: String) {
+        let prefs = ai_prefs(&self.settings.get());
+        glib::MainContext::default().spawn_local(async move {
+            let result = self
+                .local
+                .chat(
+                    prefs,
+                    system,
+                    vec![ChatMessage {
+                        role: Role::User,
+                        content: user,
+                    }],
+                )
+                .await
+                .map(|reply| reply.text);
+            self.finish_virtual(ASSISTANT_CHAT, result, false);
+        });
+    }
+
+    fn dispatch_omarchy(self: Rc<Self>, line: String) {
+        if !self.settings.get().os.enabled {
+            return;
+        }
+        self.begin_virtual_request(OMARCHY_CHAT);
+        match os::parse(&line) {
+            Parsed::Empty => self.end_virtual_request(OMARCHY_CHAT),
+            Parsed::Error(error) => {
+                self.finish_virtual(OMARCHY_CHAT, Ok(error), false);
+            }
+            Parsed::Help => {
+                let settings = self.settings.get();
+                let actions = os::catalog(&settings.os.actions);
+                self.finish_virtual(OMARCHY_CHAT, Ok(os::help_text(&actions)), false);
+            }
+            Parsed::List { filter } => {
+                let settings = self.settings.get();
+                let actions = os::catalog(&settings.os.actions);
+                self.finish_virtual(OMARCHY_CHAT, Ok(os::list_text(&actions, &filter)), false);
+            }
+            Parsed::Run { name, args } => {
+                let settings = self.settings.get();
+                if !settings.os.enabled {
+                    self.finish_virtual(
+                        OMARCHY_CHAT,
+                        Err("Omarchy actions are off — enable them in Settings".into()),
+                        false,
+                    );
+                    return;
+                }
+                let actions = os::catalog(&settings.os.actions);
+                let exact = actions.iter().find(|action| action.name == name).cloned();
+                let action = exact.or_else(|| {
+                    let lower = name.to_lowercase();
+                    let matches: Vec<_> = actions
+                        .iter()
+                        .filter(|action| action.name.to_lowercase().starts_with(&lower))
+                        .cloned()
+                        .collect();
+                    (matches.len() == 1).then(|| matches[0].clone())
+                });
+                let Some(action) = action else {
+                    self.finish_virtual(
+                        OMARCHY_CHAT,
+                        Ok(format!("unknown action `{name}` — try `list`")),
+                        false,
+                    );
+                    return;
+                };
+                let local = self.local.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let current = self.settings.get();
+                    if !current.os.enabled {
+                        self.finish_virtual(
+                            OMARCHY_CHAT,
+                            Err("Omarchy actions are off — enable them in Settings".into()),
+                            true,
+                        );
+                        return;
+                    }
+                    let policy = OsPolicy {
+                        enabled: current.os.enabled,
+                        shell: current.os.shell,
+                    };
+                    let result = local.os_run(action, args, policy).await;
+                    self.finish_virtual(OMARCHY_CHAT, result, true);
+                });
+            }
+            Parsed::Shell(command) => {
+                if !self.settings.get().os.shell {
+                    self.finish_virtual(
+                        OMARCHY_CHAT,
+                        Ok(
+                            "shell commands are off — enable 'Allow shell commands' in Settings"
+                                .into(),
+                        ),
+                        false,
+                    );
+                    return;
+                }
+                let ticket = match os::request_shell(&command) {
+                    Ok(ticket) => PendingShellTicket::new(ticket),
+                    Err(error) => {
+                        self.finish_virtual(OMARCHY_CHAT, Ok(error), false);
+                        return;
+                    }
+                };
+                glib::MainContext::default().spawn_local(async move {
+                    let answer = self.confirm_shell(ticket.command()).await;
+                    if answer == 1 {
+                        let current = self.settings.get();
+                        if current.os.enabled && current.os.shell {
+                            let ticket = ticket.consume();
+                            let result = self.local.os_shell_confirmed(ticket).await;
+                            self.finish_virtual(OMARCHY_CHAT, result, true);
+                        } else {
+                            self.finish_virtual(
+                                OMARCHY_CHAT,
+                                Ok("shell commands are off — enable 'Allow shell commands' in Settings".into()),
+                                false,
+                            );
+                        }
+                    } else {
+                        self.end_virtual_request(OMARCHY_CHAT);
+                    }
+                });
+            }
+        }
+    }
+
+    async fn confirm_shell(&self, command: &str) -> usize {
+        let dialog = gtk::AlertDialog::builder()
+            .message(command)
+            .buttons(["Cancel", "Run"])
+            .default_button(0)
+            .cancel_button(0)
+            .build();
+        if self.probe {
+            return self.probe_answer.take().unwrap_or(0);
+        }
+        let Some(window) = self.window() else {
+            return 0;
+        };
+        dialog
+            .choose_future(Some(&window))
+            .await
+            .ok()
+            .and_then(|answer| usize::try_from(answer).ok())
+            .unwrap_or(0)
+    }
+
     fn submit_composer(self: Rc<Self>) {
+        let kind = self.open_chat.get();
+        if let Some(chat_id) = kind.filter(|chat_id| is_virtual(*chat_id)) {
+            self.submit_virtual(chat_id);
+            return;
+        }
         if self.composer_operation.get() || self.messages.is_busy() {
             return;
         }
-        let Some(chat_id) = self.open_chat.get() else {
+        let Some(chat_id) = kind else {
             return;
         };
         let text = self.messages.composer_text();
@@ -1057,7 +1676,7 @@ impl ShellInner {
                     }
                     if self.is_current(chat_id, epoch) {
                         let inserted = self.messages.merge_event(message);
-                        self.start_image_downloads(inserted);
+                        self.post_render(inserted);
                     }
                     let epoch_is_current = self.is_current(chat_id, epoch);
                     self.messages
@@ -1165,7 +1784,7 @@ impl ShellInner {
                 }
                 if self.is_current(chat_id, epoch) {
                     let inserted = self.messages.merge_event(message);
-                    self.start_image_downloads(inserted);
+                    self.post_render(inserted);
                 }
                 let epoch_is_current = self.is_current(chat_id, epoch);
                 self.messages
@@ -1229,13 +1848,377 @@ impl ShellInner {
         });
     }
 
+    fn draft_reply(self: Rc<Self>, msg_id: i32) {
+        if !self.settings.get().ai.enabled {
+            return;
+        }
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        let Some(target) = self.messages.message(msg_id) else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        let composer_snapshot = self.messages.composer_text();
+        let token = {
+            let mut aux = self.aux.borrow_mut();
+            aux.draft_token = aux.draft_token.wrapping_add(1);
+            aux.draft_token
+        };
+        let title = self.title_for(chat_id);
+        let context = transcript(&self.messages.messages(), 20, false);
+        let target_text = message_content(&target);
+        let (system, user) =
+            prompts::draft_reply(&title, &context, &target_text, &composer_snapshot);
+        let prefs = ai_prefs(&self.settings.get());
+        glib::MainContext::default().spawn_local(async move {
+            let result = self
+                .local
+                .chat(
+                    prefs,
+                    system,
+                    vec![ChatMessage {
+                        role: Role::User,
+                        content: user,
+                    }],
+                )
+                .await;
+            let current_token = self.aux.borrow().draft_token;
+            if current_token != token
+                || !self.is_current(chat_id, epoch)
+                || !self.settings.get().ai.enabled
+                || self.messages.composer_text() != composer_snapshot
+                || !self.messages.contains(msg_id)
+            {
+                return;
+            }
+            match result {
+                Ok(reply) => self.messages.show_ai_draft(&reply.text),
+                Err(error) => {
+                    eprintln!("AI draft ({chat_id}, {msg_id}): {error}");
+                    self.messages.show_error(&error);
+                }
+            }
+        });
+    }
+
+    fn translate_message(self: Rc<Self>, msg_id: i32) {
+        if !self.settings.get().ai.enabled {
+            return;
+        }
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        let Some(message) = self.messages.message(msg_id) else {
+            return;
+        };
+        let key = (chat_id, msg_id);
+        {
+            let mut aux = self.aux.borrow_mut();
+            if matches!(
+                aux.translations.get(&key),
+                Some(ReqState::InFlight | ReqState::Done(_))
+            ) {
+                return;
+            }
+            aux.translations.insert(key, ReqState::InFlight);
+        }
+        self.messages.clear_aux(msg_id);
+        self.render_aux_for(msg_id);
+        let (system, user) = prompts::translate(&message.text, "English");
+        let prefs = ai_prefs(&self.settings.get());
+        glib::MainContext::default().spawn_local(async move {
+            let result = self
+                .local
+                .chat(
+                    prefs,
+                    system,
+                    vec![ChatMessage {
+                        role: Role::User,
+                        content: user,
+                    }],
+                )
+                .await
+                .map(|reply| reply.text);
+            match result {
+                Ok(text) => {
+                    self.aux
+                        .borrow_mut()
+                        .translations
+                        .insert(key, ReqState::Done(text));
+                    if self.open_chat.get() == Some(chat_id) {
+                        self.render_aux_for(msg_id);
+                    }
+                }
+                Err(error) => {
+                    self.aux
+                        .borrow_mut()
+                        .translations
+                        .insert(key, ReqState::Failed(error.clone()));
+                    if self.open_chat.get() == Some(chat_id) && self.messages.contains(msg_id) {
+                        self.messages.show_aux_error(msg_id, &error);
+                    }
+                }
+            }
+        });
+    }
+
+    fn summarize_message(self: Rc<Self>, msg_id: i32) {
+        if !self.settings.get().ai.enabled {
+            return;
+        }
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        let Some(message) = self.messages.message(msg_id) else {
+            return;
+        };
+        if message.text.chars().count() <= 300 {
+            return;
+        }
+        let key = (chat_id, msg_id);
+        {
+            let mut aux = self.aux.borrow_mut();
+            if matches!(
+                aux.summaries.get(&key),
+                Some(ReqState::InFlight | ReqState::Done(_))
+            ) {
+                return;
+            }
+            aux.summaries.insert(key, ReqState::InFlight);
+        }
+        self.messages.clear_aux(msg_id);
+        self.render_aux_for(msg_id);
+        let (system, user) = prompts::summarize(&message.text);
+        let prefs = ai_prefs(&self.settings.get());
+        glib::MainContext::default().spawn_local(async move {
+            let result = self
+                .local
+                .chat(
+                    prefs,
+                    system,
+                    vec![ChatMessage {
+                        role: Role::User,
+                        content: user,
+                    }],
+                )
+                .await
+                .map(|reply| reply.text);
+            match result {
+                Ok(text) => {
+                    self.aux
+                        .borrow_mut()
+                        .summaries
+                        .insert(key, ReqState::Done(text));
+                    if self.open_chat.get() == Some(chat_id) {
+                        self.render_aux_for(msg_id);
+                    }
+                }
+                Err(error) => {
+                    self.aux
+                        .borrow_mut()
+                        .summaries
+                        .insert(key, ReqState::Failed(error.clone()));
+                    if self.open_chat.get() == Some(chat_id) && self.messages.contains(msg_id) {
+                        self.messages.show_aux_error(msg_id, &error);
+                    }
+                }
+            }
+        });
+    }
+
+    fn post_render(self: &Rc<Self>, ids: Vec<i32>) {
+        self.start_image_downloads(ids.clone());
+        let settings = self.settings.get();
+        for msg_id in ids {
+            self.render_aux_for(msg_id);
+            if self.messages.media_kind(msg_id) != Some(MediaKind::Voice) || !settings.ai.enabled {
+                continue;
+            }
+            let state = self.open_chat.get().and_then(|chat_id| {
+                self.aux
+                    .borrow()
+                    .transcripts
+                    .get(&(chat_id, msg_id))
+                    .cloned()
+            });
+            match state {
+                Some(ReqState::InFlight) if !self.messages.has_media_continuation(msg_id) => {
+                    let key = (self.open_chat.get().unwrap_or_default(), msg_id);
+                    if !self.transcription_active.borrow().contains(&key) {
+                        self.clone().arm_transcription(msg_id);
+                    }
+                }
+                None if settings.ai.transcribe_auto => {
+                    self.clone().request_transcription(msg_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn render_aux_for(&self, msg_id: i32) {
+        let Some(chat_id) = self.open_chat.get() else {
+            return;
+        };
+        let key = (chat_id, msg_id);
+        let (transcript, translation, summary) = {
+            let aux = self.aux.borrow();
+            (
+                done_text(aux.transcripts.get(&key)),
+                done_text(aux.translations.get(&key)),
+                done_text(aux.summaries.get(&key)),
+            )
+        };
+        self.messages.render_aux(
+            msg_id,
+            transcript.as_deref(),
+            translation.as_deref(),
+            summary.as_deref(),
+        );
+    }
+
+    fn arm_visible_transcriptions(self: &Rc<Self>) {
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        let ids: Vec<i32> = self
+            .messages
+            .messages()
+            .into_iter()
+            .filter(|message| message.media == Some(MediaKind::Voice))
+            .map(|message| message.id)
+            .collect();
+        for msg_id in ids {
+            let key = (chat_id, msg_id);
+            let state = self.aux.borrow().transcripts.get(&key).cloned();
+            match state {
+                Some(ReqState::InFlight)
+                    if !self.messages.has_media_continuation(msg_id)
+                        && !self.transcription_active.borrow().contains(&key) =>
+                {
+                    self.clone().arm_transcription(msg_id);
+                }
+                None => self.clone().request_transcription(msg_id),
+                Some(ReqState::InFlight | ReqState::Done(_) | ReqState::Failed(_)) => {}
+            }
+        }
+    }
+
+    fn request_transcription(self: Rc<Self>, msg_id: i32) {
+        if !self.settings.get().ai.enabled {
+            return;
+        }
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        if self.messages.media_kind(msg_id) != Some(MediaKind::Voice) {
+            return;
+        }
+        let key = (chat_id, msg_id);
+        {
+            let mut aux = self.aux.borrow_mut();
+            if matches!(
+                aux.transcripts.get(&key),
+                Some(ReqState::InFlight | ReqState::Done(_))
+            ) {
+                return;
+            }
+            aux.transcripts.insert(key, ReqState::InFlight);
+        }
+        // Remove a prior transcript error while preserving any completed
+        // translation or summary already rendered for this message.
+        self.render_aux_for(msg_id);
+        self.arm_transcription(msg_id);
+    }
+
+    fn arm_transcription(self: Rc<Self>, msg_id: i32) {
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        if self.messages.has_media_continuation(msg_id) {
+            return;
+        }
+        let weak = Rc::downgrade(&self);
+        if !self.messages.on_media_ready(msg_id, move |path| {
+            if let Some(this) = weak.upgrade() {
+                this.start_transcription_path(chat_id, msg_id, path);
+            }
+        }) {
+            self.fail_transcription(chat_id, msg_id, "voice message is unavailable".into());
+            return;
+        }
+        if matches!(
+            self.messages.media_state(msg_id),
+            Some(MediaState::NotStarted | MediaState::Failed)
+        ) {
+            self.clone().start_media_download(msg_id, false);
+            if matches!(self.messages.media_state(msg_id), Some(MediaState::Failed)) {
+                self.messages.drop_media_continuations(msg_id);
+                self.fail_transcription(chat_id, msg_id, "voice message is unavailable".into());
+            }
+        }
+    }
+
+    fn start_transcription_path(self: Rc<Self>, chat_id: i64, msg_id: i32, path: PathBuf) {
+        if !matches!(
+            self.aux.borrow().transcripts.get(&(chat_id, msg_id)),
+            Some(ReqState::InFlight)
+        ) {
+            return;
+        }
+        if !self
+            .transcription_active
+            .borrow_mut()
+            .insert((chat_id, msg_id))
+        {
+            return;
+        }
+        let prefs = ai_prefs(&self.settings.get());
+        glib::MainContext::default().spawn_local(async move {
+            let result = self.local.transcribe(prefs, path).await;
+            self.transcription_active
+                .borrow_mut()
+                .remove(&(chat_id, msg_id));
+            match result {
+                Ok(transcript) => {
+                    self.aux
+                        .borrow_mut()
+                        .transcripts
+                        .insert((chat_id, msg_id), ReqState::Done(transcript.text));
+                    if self.open_chat.get() == Some(chat_id) {
+                        self.render_aux_for(msg_id);
+                    }
+                }
+                Err(error) => self.fail_transcription(chat_id, msg_id, error),
+            }
+        });
+    }
+
+    fn fail_transcription(&self, chat_id: i64, msg_id: i32, error: String) {
+        let key = (chat_id, msg_id);
+        if !matches!(
+            self.aux.borrow().transcripts.get(&key),
+            Some(ReqState::InFlight)
+        ) {
+            return;
+        }
+        self.aux
+            .borrow_mut()
+            .transcripts
+            .insert(key, ReqState::Failed(error.clone()));
+        if self.open_chat.get() == Some(chat_id) && self.messages.contains(msg_id) {
+            self.messages.show_aux_error(msg_id, &error);
+        }
+    }
+
     fn start_image_downloads(self: &Rc<Self>, ids: Vec<i32>) {
         for msg_id in ids {
             if matches!(
                 self.messages.media_kind(msg_id),
                 Some(MediaKind::Photo | MediaKind::Sticker)
             ) {
-                self.clone().start_media_download(msg_id);
+                self.clone().start_media_download(msg_id, false);
             }
         }
     }
@@ -1243,12 +2226,14 @@ impl ShellInner {
     fn media_action(self: Rc<Self>, msg_id: i32) {
         match self.messages.media_state(msg_id) {
             Some(MediaState::Done(path)) => self.launch_media(&path),
-            Some(MediaState::NotStarted | MediaState::Failed) => self.start_media_download(msg_id),
+            Some(MediaState::NotStarted | MediaState::Failed) => {
+                self.start_media_download(msg_id, true)
+            }
             Some(MediaState::InFlight) | None => {}
         }
     }
 
-    fn start_media_download(self: Rc<Self>, msg_id: i32) {
+    fn start_media_download(self: Rc<Self>, msg_id: i32, launch_on_ready: bool) {
         let Some(chat_id) = self.open_chat.get() else {
             return;
         };
@@ -1287,11 +2272,31 @@ impl ShellInner {
                         return;
                     }
                     self.messages.finish_media_path(msg_id, path.clone());
-                    self.launch_media(&path);
+                    if launch_on_ready {
+                        self.launch_media(&path);
+                    }
                 }
                 Ok(None) => {
                     if self.is_current(chat_id, epoch) && self.messages.contains(msg_id) {
+                        let transcription_requested = kind == MediaKind::Voice
+                            && matches!(
+                                self.aux.borrow().transcripts.get(&(chat_id, msg_id)),
+                                Some(ReqState::InFlight)
+                            );
                         self.messages.fail_media(msg_id, false);
+                        if transcription_requested && self.tg.is_mock {
+                            self.clone().start_transcription_path(
+                                chat_id,
+                                msg_id,
+                                PathBuf::from(format!("mock-voice-{chat_id}-{msg_id}.ogg")),
+                            );
+                        } else if transcription_requested {
+                            self.fail_transcription(
+                                chat_id,
+                                msg_id,
+                                "voice message is unavailable".into(),
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -1299,6 +2304,9 @@ impl ShellInner {
                     if self.is_current(chat_id, epoch) && self.messages.contains(msg_id) {
                         self.messages.fail_media(msg_id, true);
                         self.messages.show_error(&error);
+                        if kind == MediaKind::Voice {
+                            self.fail_transcription(chat_id, msg_id, error);
+                        }
                     }
                 }
             }
@@ -1316,6 +2324,9 @@ impl ShellInner {
     }
 
     fn queue_mark_read(self: &Rc<Self>, chat_id: i64, latest: i32, epoch: u64) {
+        if is_virtual(chat_id) {
+            return;
+        }
         // Ghost mode suppresses read receipts; check the CURRENT snapshot so
         // toggling it on takes effect immediately.
         if self.settings.get().ghost_mode {
@@ -1535,6 +2546,7 @@ impl ShellInner {
     }
 
     async fn run_probe(self: Rc<Self>) {
+        probe_step("load dialogs");
         if !poll_until(3000, || {
             self.dialogs_loaded.get() && !self.chatlist.ordered().is_empty()
         })
@@ -1544,11 +2556,34 @@ impl ShellInner {
             return;
         }
 
-        let Some((first_id, _)) = self.chatlist.ordered().first().cloned() else {
+        self.settings.update(|settings| {
+            settings.ai.enabled = true;
+            settings.os.enabled = true;
+            settings.ai.ollama_url = "http://127.0.0.1:1".into();
+        });
+        probe_step("first chat");
+        if !poll_until(1000, || {
+            let ordered = self.chatlist.ordered();
+            ordered.first().is_some_and(|(id, _)| *id == ASSISTANT_CHAT)
+                && ordered.get(1).is_some_and(|(id, _)| *id == OMARCHY_CHAT)
+        })
+        .await
+        {
+            probe_fail("virtual chat prefix");
+            return;
+        }
+
+        let Some((first_id, _)) = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find(|(id, _)| !is_virtual(*id))
+        else {
             probe_fail("first chat");
             return;
         };
         self.clone().open_chat(first_id);
+        probe_step("find Marta");
         if !poll_until(3000, || {
             self.open_chat.get() == Some(first_id)
                 && !self.messages.is_loading()
@@ -1570,6 +2605,7 @@ impl ShellInner {
             return;
         };
         self.clone().open_chat(marta);
+        probe_step("open Marta");
         if !poll_until(3000, || {
             self.open_chat.get() == Some(marta)
                 && !self.messages.is_loading()
@@ -1580,11 +2616,13 @@ impl ShellInner {
             probe_fail("open Marta");
             return;
         }
+        probe_step("pagination ready");
         if !poll_until(3000, || self.messages.pagination_ready()).await {
             probe_fail("pagination ready");
             return;
         }
         self.messages.trigger_pagination();
+        probe_step("pagination merge");
         if !poll_until(3000, || self.messages.contains(90)).await {
             probe_fail("pagination merge");
             return;
@@ -1592,6 +2630,7 @@ impl ShellInner {
 
         self.messages.set_composer_text("probe message");
         self.clone().submit_composer();
+        probe_step("send message");
         if !poll_until(3000, || {
             self.messages.find_outgoing_text("probe message").is_some()
         })
@@ -1605,6 +2644,7 @@ impl ShellInner {
             return;
         };
         let typing_generation = self.messages.typing_generation();
+        probe_step("typing event");
         if !poll_until(3000, || {
             self.messages.typing_generation() > typing_generation
         })
@@ -1613,6 +2653,7 @@ impl ShellInner {
             probe_fail("typing event");
             return;
         }
+        probe_step("mock reply");
         if !poll_until(3000, || self.messages.contains_text("(mock reply) got it")).await {
             probe_fail("mock reply");
             return;
@@ -1621,6 +2662,7 @@ impl ShellInner {
         self.messages.begin_edit(sent_id);
         self.messages.set_composer_text("probe edited");
         self.clone().submit_composer();
+        probe_step("edit message");
         if !poll_until(3000, || {
             self.messages
                 .message(sent_id)
@@ -1633,6 +2675,7 @@ impl ShellInner {
         }
 
         self.clone().delete_message(sent_id);
+        probe_step("delete message");
         if !poll_until(3000, || !self.messages.contains(sent_id)).await {
             probe_fail("delete message");
             return;
@@ -1641,12 +2684,14 @@ impl ShellInner {
         // Settings panel (wave 1): open via the Ctrl+, path, toggle
         // show_seconds on/off, assert the time labels re-render.
         self.toggle_settings();
+        probe_step("open settings");
         if !poll_until(1000, || self.settings_open()).await {
             probe_fail("open settings");
             return;
         }
         self.settings
             .update(|settings| settings.show_seconds = true);
+        probe_step("show seconds");
         if !poll_until(1000, || {
             self.messages
                 .last_time_label()
@@ -1659,6 +2704,7 @@ impl ShellInner {
         }
         self.settings
             .update(|settings| settings.show_seconds = false);
+        probe_step("hide seconds");
         if !poll_until(1000, || {
             self.messages
                 .last_time_label()
@@ -1670,6 +2716,7 @@ impl ShellInner {
             return;
         }
         self.close_settings();
+        probe_step("close settings");
         if !poll_until(1000, || !self.settings_open()).await {
             probe_fail("close settings");
             return;
@@ -1683,6 +2730,7 @@ impl ShellInner {
             .and_then(|naive| naive.and_local_timezone(Local).earliest())
             .unwrap_or_else(Local::now);
         self.clone().jump_to_date(today_end);
+        probe_step("jump to date");
         if !poll_until(3000, || {
             self.messages.is_detached() && !self.messages.is_loading() && self.messages.len() > 0
         })
@@ -1692,6 +2740,7 @@ impl ShellInner {
             return;
         }
         self.messages.trigger_jump_to_latest();
+        probe_step("reload latest");
         if !poll_until(3000, || {
             !self.messages.is_detached() && !self.messages.is_loading() && self.messages.len() > 0
         })
@@ -1703,6 +2752,7 @@ impl ShellInner {
 
         // Wave 2: anti-delete must reach the backend before the forced reload.
         self.settings.update(|settings| settings.anti_delete = true);
+        probe_step("find Deni");
         if !poll_until(3000, || self.flags_settled() && !self.messages.is_loading()).await {
             probe_fail("anti-delete flags before data");
             return;
@@ -1717,6 +2767,7 @@ impl ShellInner {
             return;
         };
         self.clone().open_chat(deni);
+        probe_step("archived deleted row");
         if !poll_until(3000, || {
             self.open_chat.get() == Some(deni)
                 && !self.messages.is_loading()
@@ -1736,6 +2787,7 @@ impl ShellInner {
             .unwrap_or(0);
         self.messages.set_composer_text("please delete this");
         self.clone().submit_composer();
+        probe_step("live deleted tombstone");
         if !poll_until(6000, || {
             self.messages
                 .find_incoming_text_after("(mock reply) got it", last_id)
@@ -1751,6 +2803,7 @@ impl ShellInner {
 
         self.settings
             .update(|settings| settings.anti_delete = false);
+        probe_step("disable anti-delete reload");
         if !poll_until(3500, || {
             self.flags_settled()
                 && !self.messages.is_loading()
@@ -1773,6 +2826,7 @@ impl ShellInner {
             .unwrap_or(0);
         self.messages.set_composer_text("edit this");
         self.clone().submit_composer();
+        probe_step("live edited reply");
         if !poll_until(6000, || {
             self.messages
                 .find_edited_incoming_after(previous_last_id)
@@ -1794,6 +2848,7 @@ impl ShellInner {
             .unwrap_or_default();
         self.messages.clear_history_probe();
         self.clone().open_edit_history(edited_reply);
+        probe_step("edit history popover");
         if !poll_until(3000, || {
             self.messages.history_version_count() >= 1
                 && self.messages.history_current_text().as_deref() == Some(edited_text.as_str())
@@ -1808,6 +2863,7 @@ impl ShellInner {
         let render_count = self.messages.initial_render_count();
         self.clone().force_reload(deni);
         self.clone().force_reload(deni);
+        probe_step("force reload race");
         if !poll_until(3500, || {
             !self.messages.is_loading()
                 && self.messages.initial_render_count() == render_count.wrapping_add(1)
@@ -1817,6 +2873,287 @@ impl ShellInner {
         .await
         {
             probe_fail("force reload race");
+            return;
+        }
+
+        // Wave 3: local Omarchy chat, including the ticketed shell gate.
+        self.clone().open_chat(OMARCHY_CHAT);
+        probe_step("Omarchy seed");
+        if !poll_until(1000, || {
+            self.open_chat.get() == Some(OMARCHY_CHAT)
+                && self
+                    .virtual_stores
+                    .borrow()
+                    .get(&OMARCHY_CHAT)
+                    .and_then(|store| store.msgs.last())
+                    .is_some_and(|message| message.text.contains("Omarchy control"))
+        })
+        .await
+        {
+            probe_fail("Omarchy seed");
+            return;
+        }
+
+        let before_help = virtual_last_id(&self.virtual_stores, OMARCHY_CHAT);
+        self.messages.set_composer_text("help");
+        self.clone().submit_composer();
+        probe_step("Omarchy help");
+        if !poll_until(1500, || {
+            self.virtual_stores
+                .borrow()
+                .get(&OMARCHY_CHAT)
+                .and_then(|store| store.msgs.last())
+                .is_some_and(|message| {
+                    message.id > before_help && message.text.contains("Omarchy control")
+                })
+        })
+        .await
+        {
+            probe_fail("Omarchy help");
+            return;
+        }
+
+        let before_shell_off = virtual_last_id(&self.virtual_stores, OMARCHY_CHAT);
+        self.messages.set_composer_text("run echo hi");
+        self.clone().submit_composer();
+        probe_step("shell disabled");
+        if !poll_until(1500, || {
+            self.virtual_stores
+                .borrow()
+                .get(&OMARCHY_CHAT)
+                .and_then(|store| store.msgs.last())
+                .is_some_and(|message| {
+                    message.id > before_shell_off && message.text.contains("shell commands are off")
+                })
+        })
+        .await
+        {
+            probe_fail("shell disabled");
+            return;
+        }
+
+        self.settings.update(|settings| settings.os.shell = true);
+        self.probe_answer.set(Some(0));
+        let mono_before = self
+            .virtual_stores
+            .borrow()
+            .get(&OMARCHY_CHAT)
+            .map(|store| store.mono_ids.len())
+            .unwrap_or(0);
+        self.messages.set_composer_text("run echo hi");
+        self.clone().submit_composer();
+        probe_step("shell ticket release");
+        if !poll_until(1500, || {
+            self.virtual_stores
+                .borrow()
+                .get(&OMARCHY_CHAT)
+                .is_some_and(|store| store.in_flight == 0)
+        })
+        .await
+            || self
+                .virtual_stores
+                .borrow()
+                .get(&OMARCHY_CHAT)
+                .is_none_or(|store| store.mono_ids.len() != mono_before)
+        {
+            probe_fail("shell cancel");
+            return;
+        }
+        let release = match os::request_shell("x") {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                probe_fail("shell ticket release");
+                return;
+            }
+        };
+        os::cancel_shell(release);
+
+        self.probe_answer.set(Some(1));
+        let before_run = virtual_last_id(&self.virtual_stores, OMARCHY_CHAT);
+        self.messages.set_composer_text("run echo hi");
+        self.clone().submit_composer();
+        probe_step("shell run");
+        if !poll_until(2000, || {
+            self.virtual_stores
+                .borrow()
+                .get(&OMARCHY_CHAT)
+                .and_then(|store| store.msgs.last())
+                .is_some_and(|message| {
+                    message.id > before_run
+                        && message.text == "hi"
+                        && self.messages.is_monospace(message.id)
+                })
+        })
+        .await
+        {
+            probe_fail("shell run");
+            return;
+        }
+
+        self.settings.update(|settings| settings.os.shell = true);
+        self.probe_answer.set(Some(1));
+        let before_recheck = virtual_last_id(&self.virtual_stores, OMARCHY_CHAT);
+        self.messages.set_composer_text("run echo no");
+        self.clone().submit_composer();
+        // The ticket exists now; turn the switch off before the scripted Run
+        // answer is consumed so the confirmation-time re-check is exercised.
+        self.settings.update(|settings| settings.os.shell = false);
+        probe_step("shell confirmation re-check");
+        if !poll_until(1500, || {
+            self.virtual_stores
+                .borrow()
+                .get(&OMARCHY_CHAT)
+                .and_then(|store| store.msgs.last())
+                .is_some_and(|message| {
+                    message.id > before_recheck && message.text.contains("shell commands are off")
+                })
+        })
+        .await
+        {
+            probe_fail("shell confirmation re-check");
+            return;
+        }
+
+        // Assistant commands use the offline AI provider in smoke mode.
+        self.clone().open_chat(ASSISTANT_CHAT);
+        let before_status = virtual_last_id(&self.virtual_stores, ASSISTANT_CHAT);
+        self.messages.set_composer_text("/status");
+        self.clone().submit_composer();
+        probe_step("Assistant status");
+        if !poll_until(2000, || {
+            self.virtual_stores
+                .borrow()
+                .get(&ASSISTANT_CHAT)
+                .and_then(|store| store.msgs.last())
+                .is_some_and(|message| {
+                    message.id > before_status && message.text.contains("mock (chat)")
+                })
+        })
+        .await
+        {
+            probe_fail("Assistant status");
+            return;
+        }
+
+        let before_hello = virtual_last_id(&self.virtual_stores, ASSISTANT_CHAT);
+        self.messages.set_composer_text("hello");
+        self.clone().submit_composer();
+        probe_step("Assistant chat");
+        if !poll_until(2500, || {
+            self.virtual_stores
+                .borrow()
+                .get(&ASSISTANT_CHAT)
+                .and_then(|store| store.msgs.last())
+                .is_some_and(|message| {
+                    message.id > before_hello && message.text.starts_with("(mock ai)")
+                })
+        })
+        .await
+        {
+            probe_fail("Assistant chat");
+            return;
+        }
+
+        let before_catchup = virtual_last_id(&self.virtual_stores, ASSISTANT_CHAT);
+        self.messages.set_composer_text("/catchup marta");
+        self.clone().submit_composer();
+        probe_step("Assistant catchup");
+        if !poll_until(3000, || {
+            self.virtual_stores
+                .borrow()
+                .get(&ASSISTANT_CHAT)
+                .and_then(|store| store.msgs.last())
+                .is_some_and(|message| {
+                    message.id > before_catchup && message.text.contains("Thursday")
+                })
+        })
+        .await
+        {
+            probe_fail("Assistant catchup");
+            return;
+        }
+
+        let mom = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find_map(|(id, title)| (title == "Mom").then_some(id));
+        let Some(mom) = mom else {
+            probe_fail("find Mom");
+            return;
+        };
+        self.clone().open_chat(mom);
+        probe_step("open Mom");
+        if !poll_until(2500, || {
+            self.open_chat.get() == Some(mom)
+                && !self.messages.is_loading()
+                && self.messages.contains(301)
+        })
+        .await
+        {
+            probe_fail("open Mom");
+            return;
+        }
+        self.clone().request_transcription(301);
+        probe_step("voice transcript");
+        if !poll_until(2500, || self.messages.aux_contains(301, "transcript:")).await {
+            probe_fail("voice transcript");
+            return;
+        }
+        let transcript_state = self.aux.borrow().transcripts.get(&(mom, 301)).cloned();
+        self.clone().request_transcription(301);
+        probe_step("voice transcript dedupe");
+        if self.aux.borrow().transcripts.get(&(mom, 301)).cloned() != transcript_state {
+            probe_fail("voice transcript dedupe");
+            return;
+        }
+
+        self.clone().open_chat(marta);
+        probe_step("draft target");
+        if !poll_until(2500, || {
+            self.open_chat.get() == Some(marta) && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("reopen Marta for draft");
+            return;
+        }
+        let Some(target) = self.messages.last_id() else {
+            probe_fail("draft target");
+            return;
+        };
+        self.clone().draft_reply(target);
+        probe_step("AI draft");
+        if !poll_until(2500, || {
+            self.messages.composer_text().contains("(mock ai)") && self.messages.ai_draft_visible()
+        })
+        .await
+        {
+            probe_fail("AI draft");
+            return;
+        }
+        self.messages.cancel_mode();
+        probe_step("discard AI draft");
+        if !self.messages.composer_text().is_empty() || self.messages.ai_draft_visible() {
+            probe_fail("discard AI draft");
+            return;
+        }
+
+        self.clone().open_chat(OMARCHY_CHAT);
+        self.settings.update(|settings| settings.os.enabled = false);
+        probe_step("disable Omarchy chat");
+        if !poll_until(1000, || {
+            self.open_chat.get().is_none()
+                && self.messages.is_empty_state()
+                && self
+                    .chatlist
+                    .ordered()
+                    .iter()
+                    .all(|(id, _)| *id != OMARCHY_CHAT)
+        })
+        .await
+        {
+            probe_fail("disable Omarchy chat");
             return;
         }
 
@@ -1873,6 +3210,91 @@ fn message_preview(message: &Msg) -> String {
     }
 }
 
+fn message_content(message: &Msg) -> String {
+    if message.text.is_empty() {
+        message_preview(message)
+    } else {
+        message.text.clone()
+    }
+}
+
+fn ai_prefs(settings: &Settings) -> Prefs {
+    Prefs {
+        chat_provider: settings.ai.chat_provider.clone(),
+        transcribe_provider: settings.ai.transcribe_provider.clone(),
+        chat_model: settings.ai.chat_model.clone(),
+        ollama_url: settings.ai.ollama_url.clone(),
+    }
+}
+
+fn transcript(messages: &[Msg], limit: usize, search: bool) -> String {
+    let start = messages.len().saturating_sub(limit);
+    messages[start..]
+        .iter()
+        .map(|message| {
+            let sender = if message.outgoing {
+                "You"
+            } else if message.sender.trim().is_empty() {
+                "Unknown"
+            } else {
+                &message.sender
+            };
+            if search {
+                format!(
+                    "{} {}: {}",
+                    message.ts.format("%H:%M"),
+                    sender,
+                    message_content(message)
+                )
+            } else {
+                format!(
+                    "[{}] {}: {}",
+                    message.ts.format("%H:%M"),
+                    sender,
+                    message_content(message)
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn search_transcript(title: &str, messages: &[Msg]) -> String {
+    let title = clean_remote_text(title, 80);
+    transcript(messages, 50, true)
+        .lines()
+        .map(|line| format!("[{title}] {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn clean_remote_text(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .filter(|character| !character.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+fn done_text(state: Option<&ReqState<String>>) -> Option<String> {
+    match state {
+        Some(ReqState::Done(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn last_line(text: &str) -> String {
+    text.lines().last().unwrap_or_default().to_string()
+}
+
+fn virtual_last_id(stores: &RefCell<HashMap<i64, VirtualStore>>, chat_id: i64) -> i32 {
+    stores
+        .borrow()
+        .get(&chat_id)
+        .and_then(|store| store.msgs.last())
+        .map(|message| message.id)
+        .unwrap_or(i32::MIN)
+}
+
 async fn poll_until<F>(timeout_ms: u64, condition: F) -> bool
 where
     F: Fn() -> bool,
@@ -1885,6 +3307,14 @@ where
         glib::timeout_future(Duration::from_millis(25)).await;
     }
     condition()
+}
+
+/// `OMG_PROBE_TRACE=1` prints each traversal step before it runs — bisects
+/// crashes that abort the process without a Rust frame.
+fn probe_step(step: &str) {
+    if std::env::var_os("OMG_PROBE_TRACE").is_some() {
+        eprintln!("[probe] {step}");
+    }
 }
 
 fn probe_fail(step: &str) {
