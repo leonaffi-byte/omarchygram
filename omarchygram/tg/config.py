@@ -7,6 +7,8 @@ from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "omarchygram"
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser() / "omarchygram"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "omarchygram"
+MEDIA_DIR = CACHE_DIR / "media"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 SESSION_FILE = DATA_DIR / "omarchygram.session"
 

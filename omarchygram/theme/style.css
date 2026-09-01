@@ -110,6 +110,82 @@ window.omg-window {
   color: var(--muted);
 }
 
+.omg-msg-quote {
+  border-left: 2px solid var(--accent);
+  padding: 2px 8px;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 9pt;
+}
+
+.omg-reaction {
+  background-color: var(--bg-lighter);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 8.5pt;
+}
+
+.omg-msg picture {
+  border-radius: 4px;
+}
+
+.omg-media-placeholder {
+  color: var(--muted);
+  font-size: 9pt;
+  padding: 20px;
+  background-color: var(--bg-dark);
+  border-radius: 4px;
+}
+
+.omg-doc-pill {
+  background-color: var(--bg-dark);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 6px 10px;
+}
+
+.omg-doc-pill:hover {
+  border-color: var(--accent);
+}
+
+.omg-typing {
+  color: var(--accent);
+  font-size: 9pt;
+  font-style: italic;
+}
+
+.omg-reply-bar,
+.omg-edit-bar {
+  background-color: var(--bg-dark);
+  border-left: 2px solid var(--accent);
+  padding: 4px 8px;
+  color: var(--muted);
+  font-size: 9pt;
+}
+
+/* ---- chat switcher overlay (Ctrl+K) ---- */
+
+.omg-switcher {
+  background-color: var(--bg-dark);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 8px;
+}
+
+.omg-switcher entry {
+  background-color: var(--bg-darker);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 6px 10px;
+  caret-color: var(--accent);
+}
+
+.omg-switcher entry:focus-within {
+  border-color: var(--accent);
+}
+
 /* ---- composer ---- */
 
 .omg-composer {
@@ -118,7 +194,8 @@ window.omg-window {
   background-color: var(--bg);
 }
 
-.omg-composer entry {
+.omg-composer entry,
+.omg-composer textview {
   background-color: var(--bg-dark);
   color: var(--fg);
   border: 1px solid var(--bg-lighter);
@@ -127,7 +204,13 @@ window.omg-window {
   caret-color: var(--accent);
 }
 
-.omg-composer entry:focus-within {
+.omg-composer textview text {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+}
+
+.omg-composer entry:focus-within,
+.omg-composer textview:focus-within {
   border-color: var(--accent);
 }
 

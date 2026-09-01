@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 # pip-installing it would need C build deps for no gain.
 dependencies = [
     "telethon>=1.36",
+    "pillow>=10",  # webp sticker -> png for GdkPixbuf
 ]
 
 [project.optional-dependencies]
