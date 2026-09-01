@@ -150,7 +150,19 @@ impl AuthView {
         self.error.set_visible(false);
         self.hint.set_selectable(false);
         self.hint.remove_css_class("omg-empty-state");
-        self.entry.set_visibility(state != AuthState::NeedPassword);
+        let is_password = state == AuthState::NeedPassword;
+        self.entry.set_visibility(!is_password);
+        // Tell input methods this is a password so they don't record/suggest it.
+        self.entry.set_input_purpose(if is_password {
+            gtk::InputPurpose::Password
+        } else {
+            gtk::InputPurpose::FreeForm
+        });
+        self.entry.set_input_hints(if is_password {
+            gtk::InputHints::PRIVATE | gtk::InputHints::NO_SPELLCHECK
+        } else {
+            gtk::InputHints::NONE
+        });
         match state {
             AuthState::NeedPhone => {
                 self.title.set_label("Sign in");
@@ -207,6 +219,10 @@ impl AuthView {
         self.busy.set(false);
         self.entry.set_sensitive(true);
         self.button.set_sensitive(true);
+        // Never leave a rejected password sitting in the buffer.
+        if self.state.get() == AuthState::NeedPassword {
+            self.entry.set_text("");
+        }
         self.entry.grab_focus();
     }
 

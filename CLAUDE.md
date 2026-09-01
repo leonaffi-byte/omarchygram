@@ -23,6 +23,10 @@
 - Colors ONLY from theme tokens via the omg-* CSS classes in `src/theme/style.css` (bg/bg-dark/bg-darker/bg-lighter/fg/muted/accent/selection/red). Never hardcode a color in UI code.
 - Layout: left sidebar chat list (280px fixed), message pane, composer at bottom. One primary action per screen. Keyboard-first: Ctrl+K switcher, Alt+Up/Down chat nav, Enter send / Shift+Enter newline, Esc cancel/focus-composer.
 
+# Known accepted limitations (decided 2026-09-01)
+- Backend command/event channels are unbounded and data commands spawn freely — accepted at personal-client scale; revisit only if memory growth is ever observed.
+- Animated (.tgs) stickers render as "image unavailable". Voice messages open in the default audio app, no in-app playback.
+
 # Delegation notes
 - Areas external agents must NOT touch: `src/tg/` (Telegram backend/auth/session — orchestrator only), `src/theme/mod.rs`, `src/main.rs`, `Cargo.toml`, any file containing credentials. `src/theme/style.css`: UI workers may ADD rules using existing var(--) tokens only.
 - Commit tags: delegated commits end with [codex] / [grok] / [kimi] / [agy]

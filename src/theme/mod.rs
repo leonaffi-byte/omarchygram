@@ -47,7 +47,17 @@ pub fn load_colors() -> BTreeMap<String, String> {
     };
     for (key, value) in colors.iter_mut() {
         if let Some(toml::Value::String(s)) = parsed.get(key.as_str()) {
-            if !s.is_empty() {
+            // Values are substituted into CSS verbatim; only accept what a
+            // color can look like so a theme file cannot inject rules.
+            let valid = if key == "mode" {
+                s == "dark" || s == "light"
+            } else {
+                s.len() >= 4
+                    && s.len() <= 9
+                    && s.starts_with('#')
+                    && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+            };
+            if valid {
                 *value = s.clone();
             }
         }

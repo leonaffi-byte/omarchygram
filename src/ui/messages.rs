@@ -617,6 +617,9 @@ impl MessagesView {
         sender.add_css_class("omg-msg-sender");
         sender.set_halign(gtk::Align::Start);
         sender.set_visible(!message.sender.is_empty());
+        // Remote-controlled string: never let it blow out the layout.
+        sender.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        sender.set_max_width_chars(40);
         widget.append(&sender);
 
         let media_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -644,6 +647,11 @@ impl MessagesView {
                 };
                 let button = gtk::Button::with_label(&label);
                 button.add_css_class("omg-doc-pill");
+                // Remote-controlled filename: cap the pill width.
+                if let Some(child) = button.child().and_downcast::<gtk::Label>() {
+                    child.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    child.set_max_width_chars(36);
+                }
                 let action = self.inner.action.clone();
                 let msg_id = message.id;
                 button.connect_clicked(move |_| {

@@ -81,7 +81,24 @@ fn chmod_600(path: &std::path::Path) {
     if let Ok(meta) = std::fs::metadata(path) {
         let mut perm = meta.permissions();
         perm.set_mode(0o600);
-        let _ = std::fs::set_permissions(path, perm);
+        if let Err(e) = std::fs::set_permissions(path, perm) {
+            eprintln!("omarchygram: could not restrict {}: {e}", path.display());
+        }
+    }
+}
+
+/// The sqlite session plus its -journal/-wal/-shm sidecars all hold auth-key
+/// material; restrict every one that exists (the 0700 parent dir is the
+/// primary barrier, this is defense in depth).
+fn chmod_session_files(session_path: &std::path::Path) {
+    chmod_600(session_path);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut os = session_path.as_os_str().to_owned();
+        os.push(suffix);
+        let sidecar = PathBuf::from(os);
+        if sidecar.exists() {
+            chmod_600(&sidecar);
+        }
     }
 }
 
@@ -170,8 +187,8 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
         Command::DeleteMessage { chat_id, msg_id, respond } => {
             let _ = respond.send(delete_message(&client, &ctx, chat_id, msg_id).await);
         }
-        Command::MarkRead { chat_id, respond } => {
-            let _ = respond.send(mark_read(&client, &ctx, chat_id).await);
+        Command::MarkRead { chat_id, up_to, respond } => {
+            let _ = respond.send(mark_read(&client, &ctx, chat_id, up_to).await);
         }
         Command::Start(_) | Command::SubmitPhone(..) | Command::SubmitCode(..)
         | Command::SubmitPassword(..) => unreachable!("auth commands handled serially"),
@@ -183,21 +200,39 @@ impl Backend {
         self.client.as_ref().ok_or_else(|| "not connected".to_string())
     }
 
-    fn on_authorized(&mut self) {
+    /// Starts the live-update stream. Must succeed BEFORE Ready is reported —
+    /// a silently dead update path is worse than a visible startup error.
+    async fn on_authorized(&mut self) -> Result<(), TgError> {
         if self.update_loop_started {
-            return;
+            return Ok(());
         }
         let Some(updates_rx) = self.updates_rx.take() else {
-            return;
+            return Ok(());
         };
-        self.update_loop_started = true;
         let client = self.client.as_ref().unwrap().clone();
+        let stream = client
+            .stream_updates(updates_rx, UpdatesConfiguration::default())
+            .await
+            .map_err(|e| format!("could not start live updates: {e}"))?;
+        self.update_loop_started = true;
         let ctx = self.ctx.clone();
         let events = self.events.clone();
-        tokio::spawn(update_loop(client, updates_rx, ctx, events));
+        tokio::spawn(consume_updates(stream, client, ctx, events));
+        Ok(())
     }
 
     async fn start(&mut self) -> Result<AuthState, TgError> {
+        // Idempotent: a UI retry must never open a second session/sender pool
+        // over the same auth key.
+        if let Some(client) = self.client.clone() {
+            let authorized = client.is_authorized().await.map_err(|e| e.to_string())?;
+            return if authorized {
+                self.on_authorized().await?;
+                Ok(AuthState::Ready)
+            } else {
+                Ok(AuthState::NeedPhone)
+            };
+        }
         let Some((api_id, api_hash)) = load_credentials() else {
             return Ok(AuthState::NeedCredentials);
         };
@@ -211,7 +246,7 @@ impl Backend {
                 .await
                 .map_err(|e| format!("could not open session: {e}"))?,
         );
-        chmod_600(&self.session_path);
+        chmod_session_files(&self.session_path);
         let SenderPool { runner, updates, handle } = SenderPool::new(session, api_id);
         tokio::spawn(runner.run());
         let client = Client::new(handle);
@@ -219,7 +254,7 @@ impl Backend {
         self.client = Some(client);
         self.updates_rx = Some(updates);
         if authorized {
-            self.on_authorized();
+            self.on_authorized().await?;
             Ok(AuthState::Ready)
         } else {
             Ok(AuthState::NeedPhone)
@@ -244,7 +279,9 @@ impl Backend {
             .ok_or_else(|| "enter your phone first".to_string())?;
         match self.client()?.sign_in(token, code).await {
             Ok(_) => {
-                self.on_authorized();
+                self.on_authorized().await.map_err(|e| {
+                    format!("signed in, but {e} — restart Omarchygram to continue")
+                })?;
                 Ok(AuthState::Ready)
             }
             Err(SignInError::PasswordRequired(ptoken)) => {
@@ -265,7 +302,9 @@ impl Backend {
             .ok_or_else(|| "enter the login code first".to_string())?;
         match self.client()?.check_password(token, password).await {
             Ok(_) => {
-                self.on_authorized();
+                self.on_authorized().await.map_err(|e| {
+                    format!("signed in, but {e} — restart Omarchygram to continue")
+                })?;
                 Ok(AuthState::Ready)
             }
             Err(SignInError::InvalidPassword(fresh_token)) => {
@@ -273,7 +312,14 @@ impl Backend {
                 self.password_token = Some(fresh_token);
                 Err("Wrong password — try again.".into())
             }
-            Err(e) => Err(format!("password check failed: {e}")),
+            Err(e) => {
+                // The password token was consumed and only InvalidPassword
+                // returns a fresh one; the code flow must be redone.
+                self.login_token = None;
+                Err(format!(
+                    "password check failed: {e} — restart Omarchygram and log in again"
+                ))
+            }
         }
     }
 }
@@ -347,6 +393,7 @@ async fn download_media(
     };
     let dir = paths::media_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     let stem = format!("{chat_id}_{msg_id}");
 
     // Serve from cache when already downloaded (webp never survives; see below).
@@ -362,10 +409,15 @@ async fn download_media(
     let ext = match &media {
         Media::Photo(_) => "jpg".to_string(),
         Media::Sticker(_) => "webp".to_string(),
+        // The extension comes from a REMOTE sender's filename and decides
+        // which handler later opens the file — allow only plain ascii.
         Media::Document(d) => d
             .name()
             .and_then(|n| std::path::Path::new(n).extension())
-            .map(|e| e.to_string_lossy().to_string())
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .filter(|e| {
+                (1..=8).contains(&e.len()) && e.chars().all(|c| c.is_ascii_alphanumeric())
+            })
             .unwrap_or_else(|| "bin".to_string()),
         _ => "bin".to_string(),
     };
@@ -374,13 +426,24 @@ async fn download_media(
         .download_media(&media, &path)
         .await
         .map_err(|e| format!("download failed: {e}"))?;
+    chmod_600(&path);
 
     // GdkPixbuf on this system has no webp loader; convert stickers to png.
     // (Animated .tgs stickers fail to decode; the UI shows them as unavailable.)
     if ext == "webp" {
         let png = dir.join(format!("{stem}.png"));
-        let img = image::open(&path).map_err(|e| format!("sticker decode failed: {e}"))?;
+        let mut reader = image::ImageReader::open(&path)
+            .map_err(|e| e.to_string())?
+            .with_guessed_format()
+            .map_err(|e| e.to_string())?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(4096);
+        limits.max_image_height = Some(4096);
+        limits.max_alloc = Some(128 * 1024 * 1024);
+        reader.limits(limits);
+        let img = reader.decode().map_err(|e| format!("sticker decode failed: {e}"))?;
         img.save(&png).map_err(|e| e.to_string())?;
+        chmod_600(&png);
         let _ = std::fs::remove_file(&path);
         return Ok(Some(png));
     }
@@ -469,11 +532,35 @@ async fn delete_message(
     Ok(())
 }
 
-async fn mark_read(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<(), TgError> {
+async fn mark_read(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    chat_id: i64,
+    up_to: i32,
+) -> Result<(), TgError> {
     let peer = ctx.peer(chat_id)?;
-    let mut iter = client.iter_messages(peer).limit(1);
-    if let Some(latest) = iter.next().await.map_err(|e| e.to_string())? {
-        latest.mark_as_read().await.map_err(|e| e.to_string())?;
+    let input_peer: tl::enums::InputPeer = peer.into();
+    // ReadHistory with max_id = the id the UI actually displayed, so a message
+    // racing this request is never marked read unseen.
+    match input_peer {
+        tl::enums::InputPeer::Channel(c) => {
+            client
+                .invoke(&tl::functions::channels::ReadHistory {
+                    channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                        channel_id: c.channel_id,
+                        access_hash: c.access_hash,
+                    }),
+                    max_id: up_to,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        peer => {
+            client
+                .invoke(&tl::functions::messages::ReadHistory { peer, max_id: up_to })
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -489,8 +576,15 @@ fn media_placeholder(media: Option<&Media>) -> &'static str {
 }
 
 fn is_voice(d: &Document) -> bool {
-    d.name().is_none_or(|n| n.is_empty())
-        && d.mime_type().is_some_and(|m| m.starts_with("audio/"))
+    // Telegram's own flag, not a filename/mime guess.
+    if let Some(tl::enums::Document::Document(doc)) = d.raw.document.as_ref() {
+        for attr in &doc.attributes {
+            if let tl::enums::DocumentAttribute::Audio(a) = attr {
+                return a.voice;
+            }
+        }
+    }
+    false
 }
 
 fn register_media(ctx: &Ctx, m: &Message, chat_id: i64) {
@@ -520,13 +614,15 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
                 let tl::enums::MessageReactions::Reactions(r) = r;
                 r.results
                     .iter()
-                    .map(|rc| {
+                    .filter_map(|rc| {
                         let tl::enums::ReactionCount::Count(rc) = rc;
                         let emoji = match &rc.reaction {
                             tl::enums::Reaction::Emoji(e) => e.emoticon.clone(),
-                            _ => "★".to_string(),
+                            tl::enums::Reaction::CustomEmoji(_) => "✦".to_string(),
+                            tl::enums::Reaction::Paid => "⭐".to_string(),
+                            tl::enums::Reaction::Empty => return None,
                         };
-                        Reaction { emoji, count: rc.count }
+                        Some(Reaction { emoji, count: rc.count })
                     })
                     .collect()
             })
@@ -562,29 +658,21 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
         doc_name,
         reply_to: m.reply_to_message_id(),
         reactions,
-        edited: m.edit_date().is_some(),
+        edited: m.edit_date().is_some() && !m.edit_hide(),
     }
 }
 
-async fn update_loop(
+async fn consume_updates(
+    mut stream: grammers_client::client::UpdateStream,
     client: Client,
-    updates_rx: mpsc::UnboundedReceiver<UpdatesLike>,
     ctx: Arc<Ctx>,
     events: async_channel::Sender<Event>,
 ) {
-    let mut stream = match client
-        .stream_updates(updates_rx, UpdatesConfiguration::default())
-        .await
-    {
-        Ok(stream) => stream,
-        Err(e) => {
-            eprintln!("omarchygram: could not start update stream: {e}");
-            return;
-        }
-    };
     loop {
         match stream.next().await {
-            Ok(Update::NewMessage(m)) if !m.outgoing() => {
+            // Outgoing messages are forwarded too: they are how sends from the
+            // user's OTHER devices appear. The UI dedupes local sends by id.
+            Ok(Update::NewMessage(m)) => {
                 let chat_id = m.peer_id().bot_api_dialog_id_unchecked();
                 remember_from_message(&ctx, &m, chat_id).await;
                 let msg = convert(&ctx, &m, chat_id);
@@ -606,6 +694,13 @@ async fn update_loop(
                         return;
                     }
                 }
+                if let tl::enums::Update::MessageReactions(u) = &raw.raw {
+                    if let Some(msg) = refetch_for_reactions(&client, &ctx, u).await {
+                        if events.send(Event::MessageChanged(msg)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -616,10 +711,27 @@ async fn update_loop(
     }
 }
 
+/// Reaction changes arrive only as raw updates; refetch the message so the UI
+/// gets a normal MessageChanged. Best-effort — None on any failure.
+async fn refetch_for_reactions(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    u: &tl::types::UpdateMessageReactions,
+) -> Option<Msg> {
+    let peer_id = match &u.peer {
+        tl::enums::Peer::User(p) => PeerId::user(p.user_id)?,
+        tl::enums::Peer::Chat(p) => PeerId::chat(p.chat_id)?,
+        tl::enums::Peer::Channel(p) => PeerId::channel(p.channel_id)?,
+    };
+    let chat_id = peer_id.bot_api_dialog_id_unchecked();
+    let peer = ctx.peer(chat_id).ok()?;
+    let fetched = client.get_messages_by_id(peer, &[u.msg_id]).await.ok()?;
+    let m = fetched.into_iter().flatten().next()?;
+    Some(convert(ctx, &m, chat_id))
+}
+
 async fn remember_from_message(ctx: &Ctx, m: &Message, chat_id: i64) {
-    if ctx.peers.lock().unwrap().contains_key(&chat_id) {
-        return;
-    }
+    // Always refresh: a message can carry a newer access hash or a renamed title.
     if let Ok(Some(peer_ref)) = m.peer_ref().await {
         let title = m.peer().and_then(|p| p.name()).map(str::to_string);
         ctx.remember(chat_id, peer_ref, title.as_deref());

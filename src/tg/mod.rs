@@ -17,16 +17,25 @@ use tokio::sync::{mpsc, oneshot};
 pub mod paths {
     use std::path::PathBuf;
 
+    // A missing XDG base dir must fail loudly: falling back to a relative
+    // path would drop the session auth key into the current directory.
+
     pub fn config_file() -> PathBuf {
-        dirs::config_dir().unwrap_or_default().join("omarchygram/config.toml")
+        dirs::config_dir()
+            .expect("cannot determine XDG config dir — is HOME set?")
+            .join("omarchygram/config.toml")
     }
 
     pub fn session_file() -> PathBuf {
-        dirs::data_dir().unwrap_or_default().join("omarchygram/omarchygram.session")
+        dirs::data_dir()
+            .expect("cannot determine XDG data dir — is HOME set?")
+            .join("omarchygram/omarchygram.session")
     }
 
     pub fn media_dir() -> PathBuf {
-        dirs::cache_dir().unwrap_or_default().join("omarchygram/media")
+        dirs::cache_dir()
+            .expect("cannot determine XDG cache dir — is HOME set?")
+            .join("omarchygram/media")
     }
 }
 
@@ -34,14 +43,14 @@ pub const SETUP_HELP: &str = "Omarchygram needs Telegram API credentials (one-ti
 
   1. Log in at https://my.telegram.org/apps with your Telegram account
   2. Create an application (any name, platform \"Desktop\")
-  3. Save the credentials:
+  3. Save the credentials (umask keeps the file private from the first byte):
 
      mkdir -p ~/.config/omarchygram
-     cat > ~/.config/omarchygram/config.toml <<EOF
+     (umask 077; cat > ~/.config/omarchygram/config.toml <<EOF
      api_id = <your api_id>
      api_hash = \"<your api_hash>\"
      EOF
-     chmod 600 ~/.config/omarchygram/config.toml
+     )
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +113,9 @@ pub struct Msg {
 /// directly in the receive loop.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// Includes OUTGOING messages sent from the user's other devices/clients
+    /// (`msg.outgoing == true`) — the UI merges by id and must not notify or
+    /// count unread for those.
     NewMessage(Msg),
     /// Edits and reaction updates to already-displayed messages.
     MessageChanged(Msg),
@@ -155,6 +167,9 @@ enum Command {
     },
     MarkRead {
         chat_id: i64,
+        /// Highest message id the UI has actually shown — nothing newer is
+        /// marked read, so a message racing the request stays unread.
+        up_to: i32,
         respond: oneshot::Sender<Result<(), TgError>>,
     },
 }
@@ -311,9 +326,11 @@ impl Tg {
         })
     }
 
-    pub async fn mark_read(&self, chat_id: i64) -> Result<(), TgError> {
+    /// Marks messages up to and including `up_to` as read (never newer ones).
+    pub async fn mark_read(&self, chat_id: i64, up_to: i32) -> Result<(), TgError> {
         roundtrip!(self, |tx| Command::MarkRead {
             chat_id,
+            up_to,
             respond: tx
         })
     }

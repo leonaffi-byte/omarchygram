@@ -43,6 +43,8 @@ fn sample_image() -> Option<PathBuf> {
 fn sample_document(name: &str) -> Option<PathBuf> {
     let dir = paths::media_dir();
     std::fs::create_dir_all(&dir).ok()?;
+    // Basename only — never let a name segment escape the cache dir.
+    let name = std::path::Path::new(name).file_name()?.to_string_lossy().to_string();
     let path = dir.join(format!("mock_{name}"));
     if !path.exists() {
         std::fs::write(&path, "omarchygram mock file: build log excerpt\nall green\n").ok()?;
@@ -282,7 +284,7 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                 }
                 let _ = respond.send(Ok(()));
             }
-            Command::MarkRead { chat_id, respond } => {
+            Command::MarkRead { chat_id, up_to: _, respond } => {
                 st.lock().unwrap().unread.insert(chat_id, 0);
                 let _ = respond.send(Ok(()));
             }

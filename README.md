@@ -32,12 +32,14 @@ commit them.
 
    ```
    mkdir -p ~/.config/omarchygram
-   cat > ~/.config/omarchygram/config.toml <<EOF
+   (umask 077; cat > ~/.config/omarchygram/config.toml <<EOF
    api_id = <your api_id>
    api_hash = "<your api_hash>"
    EOF
-   chmod 600 ~/.config/omarchygram/config.toml
+   )
    ```
+
+   (The `umask` makes the file private from the moment it is created.)
 
 On the first `cargo run` the app asks for your phone number and the login code
 Telegram sends you (and your password if you use two-step verification). The

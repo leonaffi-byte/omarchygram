@@ -438,13 +438,16 @@ impl ShellInner {
         let active = self.window_is_active();
         let is_open = self.open_chat.get() == Some(message.chat_id);
         let read_triggered = is_open && active;
+        // Outgoing = sent from the user's own other device: show it (the store
+        // dedupes against local sends by id), but never notify or count unread.
+        let own = message.outgoing;
         self.remember_last(&message);
         self.chatlist.upsert(
             message.chat_id,
             &chat_title(&message),
             &message_preview(&message),
             Some(message.ts),
-            if read_triggered {
+            if own || read_triggered {
                 UnreadUpdate::Delta(0)
             } else {
                 UnreadUpdate::Delta(1)
@@ -453,11 +456,11 @@ impl ShellInner {
         if is_open {
             let inserted = self.messages.merge_event(message.clone());
             self.start_image_downloads(inserted);
-            if read_triggered {
+            if read_triggered && !own {
                 self.queue_mark_read(message.chat_id, message.id, self.epoch.get());
             }
         }
-        if !active || !is_open {
+        if !own && (!active || !is_open) {
             self.notify(&message);
         }
     }
@@ -476,8 +479,16 @@ impl ShellInner {
         } else {
             &message.chat_title
         };
-        let notification = gio::Notification::new(title);
-        notification.set_body(Some(&message_preview(message)));
+        // Escape: mako/dunst render Pango markup in notification bodies, so
+        // raw remote text could spoof or break the notification.
+        let title = glib::markup_escape_text(title);
+        let mut body = message_preview(message);
+        if body.chars().count() > 200 {
+            body = body.chars().take(200).collect::<String>() + "…";
+        }
+        let body = glib::markup_escape_text(&body);
+        let notification = gio::Notification::new(title.as_str());
+        notification.set_body(Some(body.as_str()));
         application.send_notification(Some(&format!("chat-{}", message.chat_id)), &notification);
     }
 
@@ -920,7 +931,7 @@ impl ShellInner {
         }
         let this = self.clone();
         glib::MainContext::default().spawn_local(async move {
-            let result = this.tg.mark_read(chat_id).await;
+            let result = this.tg.mark_read(chat_id, sent_through).await;
             let (same_epoch, latest_seen, follow_up) = {
                 let mut states = this.mark_reads.borrow_mut();
                 let state = states.entry(chat_id).or_default();
