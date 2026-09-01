@@ -52,8 +52,7 @@ pub fn load_colors() -> BTreeMap<String, String> {
             let valid = if key == "mode" {
                 s == "dark" || s == "light"
             } else {
-                s.len() >= 4
-                    && s.len() <= 9
+                matches!(s.len(), 4 | 5 | 7 | 9) // #rgb #rgba #rrggbb #rrggbbaa
                     && s.starts_with('#')
                     && s[1..].chars().all(|c| c.is_ascii_hexdigit())
             };

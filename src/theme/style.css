@@ -22,6 +22,16 @@ window.omg-window {
   font-size: 10.5pt;
 }
 
+/* GTK's default focus ring is Adwaita blue — retint it everywhere so no
+   non-token color ever appears. */
+.omg-window entry,
+.omg-window textview,
+.omg-window button,
+.omg-window row,
+.omg-window listbox row {
+  outline-color: var(--accent);
+}
+
 .omg-window selection {
   background-color: var(--selection);
   color: var(--fg);
@@ -139,6 +149,7 @@ window.omg-window {
 }
 
 .omg-doc-pill {
+  background-image: none;
   background-color: var(--bg-dark);
   border: 1px solid var(--bg-lighter);
   border-radius: 4px;
@@ -166,6 +177,7 @@ window.omg-window {
 
 button.omg-attach,
 button.omg-bar-close {
+  background-image: none;
   background-color: var(--bg-dark);
   color: var(--muted);
   border: 1px solid var(--bg-lighter);
@@ -187,6 +199,7 @@ popover.omg-menu > contents {
 }
 
 button.omg-menu-item {
+  background-image: none;
   background-color: transparent;
   color: var(--fg);
   border: none;
@@ -286,6 +299,9 @@ button.omg-menu-item.omg-danger {
 }
 
 button.omg-primary {
+  /* GTK buttons paint a background-image gradient by default; without
+     clearing it, background-color never shows. */
+  background-image: none;
   background-color: var(--accent);
   color: var(--bg-darker);
   border: none;

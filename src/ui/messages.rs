@@ -186,9 +186,12 @@ impl MessagesView {
         let attach = gtk::Button::with_label("+");
         attach.add_css_class("omg-attach");
         attach.set_valign(gtk::Align::End);
+        // Inert until a chat is open (reset_chat enables both).
+        attach.set_sensitive(false);
         composer_box.append(&attach);
 
         let composer = gtk::TextView::new();
+        composer.set_sensitive(false);
         composer.set_wrap_mode(gtk::WrapMode::WordChar);
         composer.set_accepts_tab(false);
         composer.set_top_margin(4);
@@ -444,6 +447,8 @@ impl MessagesView {
     }
 
     pub fn reset_chat(&self, chat_id: i64, title: &str, epoch: u64) {
+        self.inner.composer.set_sensitive(true);
+        self.inner.attach.set_sensitive(true);
         self.cancel_pending_scroll();
         self.inner.scroll_epoch.set(epoch);
         self.inner.edit.borrow_mut().take();

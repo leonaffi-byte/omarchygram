@@ -207,7 +207,12 @@ impl Backend {
             return Ok(());
         }
         let Some(updates_rx) = self.updates_rx.take() else {
-            return Ok(());
+            // The receiver was consumed by a failed earlier attempt; there is
+            // no way to rebuild it — never report Ready with dead updates.
+            return Err(
+                "live updates are unavailable after an earlier failure — restart Omarchygram"
+                    .to_string(),
+            );
         };
         let client = self.client.as_ref().unwrap().clone();
         let stream = client
@@ -239,7 +244,10 @@ impl Backend {
         self.api_hash = Some(api_hash);
         if let Some(dir) = self.session_path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            // The 0700 dir is the primary barrier around the auth key —
+            // failing to establish it is a startup error, not a log line.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("could not restrict session dir: {e}"))?;
         }
         let session = Arc::new(
             SqliteSession::open(&self.session_path)
@@ -250,9 +258,11 @@ impl Backend {
         let SenderPool { runner, updates, handle } = SenderPool::new(session, api_id);
         tokio::spawn(runner.run());
         let client = Client::new(handle);
-        let authorized = client.is_authorized().await.map_err(|e| e.to_string())?;
-        self.client = Some(client);
+        // Store BEFORE the fallible RPC below: a network failure here must not
+        // let a Retry open a second sender pool over the same session.
+        self.client = Some(client.clone());
         self.updates_rx = Some(updates);
+        let authorized = client.is_authorized().await.map_err(|e| e.to_string())?;
         if authorized {
             self.on_authorized().await?;
             Ok(AuthState::Ready)
