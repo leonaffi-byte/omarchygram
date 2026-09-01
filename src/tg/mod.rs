@@ -6,6 +6,7 @@
 //! context (`glib::MainContext::spawn_local`); `Event`s are read from
 //! `Tg::events` the same way. Both mock and real backends behave identically.
 
+mod archive;
 mod mock;
 mod real;
 
@@ -96,6 +97,8 @@ pub struct Msg {
     pub chat_title: String,
     /// Display name; empty when unknown, "You" for own messages.
     pub sender: String,
+    /// Bot-API id of the sender (a user id), when known.
+    pub sender_id: Option<i64>,
     pub text: String,
     pub ts: DateTime<Local>,
     pub outgoing: bool,
@@ -106,6 +109,24 @@ pub struct Msg {
     pub reply_to: Option<i32>,
     pub reactions: Vec<Reaction>,
     pub edited: bool,
+    /// Deleted on Telegram but kept by the local archive (anti-delete).
+    pub deleted: bool,
+}
+
+/// A previous text of an edited message (edit history).
+#[derive(Debug, Clone)]
+pub struct MsgVersion {
+    pub text: String,
+    pub replaced_at: DateTime<Local>,
+}
+
+/// Behavior flags the UI forwards from settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackendFlags {
+    /// No read receipts, no online status.
+    pub ghost_mode: bool,
+    /// get_history merges archived deleted messages (struck through).
+    pub anti_delete: bool,
 }
 
 /// Pushed by the backend; read via `Tg::events`. Arrive on whatever context
@@ -121,6 +142,9 @@ pub enum Event {
     MessageChanged(Msg),
     /// name may be empty. UI owns the "X is typing" timeout (suggest 5s).
     Typing { chat_id: i64, name: String },
+    /// Messages deleted on Telegram. With anti-delete the UI keeps the rows
+    /// struck through (msg.deleted); otherwise it removes them.
+    MessageDeleted { chat_id: i64, msg_ids: Vec<i32> },
 }
 
 /// User-facing error text; show it, don't parse it.
@@ -171,6 +195,17 @@ enum Command {
         /// marked read, so a message racing the request stays unread.
         up_to: i32,
         respond: oneshot::Sender<Result<(), TgError>>,
+    },
+    SetFlags(BackendFlags, oneshot::Sender<Result<(), TgError>>),
+    GetHistoryAtDate {
+        chat_id: i64,
+        date: DateTime<Local>,
+        respond: oneshot::Sender<Result<Vec<Msg>, TgError>>,
+    },
+    GetEditHistory {
+        chat_id: i64,
+        msg_id: i32,
+        respond: oneshot::Sender<Result<Vec<MsgVersion>, TgError>>,
     },
 }
 
@@ -331,6 +366,40 @@ impl Tg {
         roundtrip!(self, |tx| Command::MarkRead {
             chat_id,
             up_to,
+            respond: tx
+        })
+    }
+
+    /// Forward ghost-mode / anti-delete from settings. Call at startup and
+    /// whenever settings change; idempotent.
+    pub async fn set_flags(&self, flags: BackendFlags) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::SetFlags(flags, tx))
+    }
+
+    /// Up to 50 messages at or before `date`, newest last (jump-to-date).
+    /// Empty when the chat has nothing that old.
+    pub async fn get_history_at_date(
+        &self,
+        chat_id: i64,
+        date: DateTime<Local>,
+    ) -> Result<Vec<Msg>, TgError> {
+        roundtrip!(self, |tx| Command::GetHistoryAtDate {
+            chat_id,
+            date,
+            respond: tx
+        })
+    }
+
+    /// Previous texts of an edited message, oldest first. Empty when the
+    /// archive never saw an earlier version.
+    pub async fn get_edit_history(
+        &self,
+        chat_id: i64,
+        msg_id: i32,
+    ) -> Result<Vec<MsgVersion>, TgError> {
+        roundtrip!(self, |tx| Command::GetEditHistory {
+            chat_id,
+            msg_id,
             respond: tx
         })
     }

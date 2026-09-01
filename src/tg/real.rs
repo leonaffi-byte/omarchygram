@@ -28,8 +28,10 @@ use grammers_client::{Client, SenderPool, SignInError};
 use grammers_tl_types as tl;
 use tokio::sync::mpsc;
 
+use super::archive::Archive;
 use super::{
-    paths, AuthState, ChatSummary, Command, Event, MediaKind, Msg, Reaction, TgError,
+    paths, AuthState, BackendFlags, ChatSummary, Command, Event, MediaKind, Msg, Reaction,
+    TgError,
 };
 
 /// Shared between the command loop, spawned data tasks, and the update loop.
@@ -37,6 +39,9 @@ struct Ctx {
     peers: Mutex<HashMap<i64, PeerRef>>,
     titles: Mutex<HashMap<i64, String>>,
     media: Mutex<HashMap<(i64, i32), Media>>,
+    /// Local archive (always on; anti-delete/edit-history read from it).
+    archive: Option<Archive>,
+    flags: Mutex<BackendFlags>,
 }
 
 impl Ctx {
@@ -114,6 +119,14 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
             peers: Mutex::new(HashMap::new()),
             titles: Mutex::new(HashMap::new()),
             media: Mutex::new(HashMap::new()),
+            archive: match Archive::open().await {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    eprintln!("omarchygram: archive disabled: {e}");
+                    None
+                }
+            },
+            flags: Mutex::new(BackendFlags::default()),
         }),
         events,
         update_loop_started: false,
@@ -159,6 +172,9 @@ fn respond_not_connected(cmd: Command) {
         Command::EditText { respond, .. } => drop(respond.send(Err(E.into()))),
         Command::DeleteMessage { respond, .. } => drop(respond.send(Err(E.into()))),
         Command::MarkRead { respond, .. } => drop(respond.send(Err(E.into()))),
+        Command::SetFlags(_, tx) => drop(tx.send(Err(E.into()))),
+        Command::GetHistoryAtDate { respond, .. } => drop(respond.send(Err(E.into()))),
+        Command::GetEditHistory { respond, .. } => drop(respond.send(Err(E.into()))),
         Command::Start(_) | Command::SubmitPhone(..) | Command::SubmitCode(..)
         | Command::SubmitPassword(..) => unreachable!("auth commands handled serially"),
     }
@@ -189,6 +205,19 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
         }
         Command::MarkRead { chat_id, up_to, respond } => {
             let _ = respond.send(mark_read(&client, &ctx, chat_id, up_to).await);
+        }
+        Command::SetFlags(flags, tx) => {
+            let _ = tx.send(set_flags(&client, &ctx, flags).await);
+        }
+        Command::GetHistoryAtDate { chat_id, date, respond } => {
+            let _ = respond.send(get_history_at_date(&client, &ctx, chat_id, date).await);
+        }
+        Command::GetEditHistory { chat_id, msg_id, respond } => {
+            let versions = match &ctx.archive {
+                Some(a) => a.versions(chat_id, msg_id).await,
+                None => vec![],
+            };
+            let _ = respond.send(Ok(versions));
         }
         Command::Start(_) | Command::SubmitPhone(..) | Command::SubmitCode(..)
         | Command::SubmitPassword(..) => unreachable!("auth commands handled serially"),
@@ -388,7 +417,71 @@ async fn get_history(
         }
     }
     out.reverse(); // newest last (display order)
+    merge_deleted(ctx, chat_id, before_id, &mut out).await;
     Ok(out)
+}
+
+/// Anti-delete: splice archived deleted messages into a history page. The
+/// page covers ids [oldest returned, before_id) — or up to the newest when
+/// this is the first page — so deleted messages in that window reappear.
+async fn merge_deleted(ctx: &Ctx, chat_id: i64, before_id: Option<i32>, page: &mut Vec<Msg>) {
+    if !ctx.flags.lock().unwrap().anti_delete {
+        return;
+    }
+    let Some(archive) = &ctx.archive else { return };
+    let min_id = page.first().map(|m| m.id).unwrap_or(1);
+    let max_id = before_id.map(|b| b - 1).unwrap_or(i32::MAX);
+    if max_id < min_id {
+        return;
+    }
+    let deleted = archive.deleted_between(chat_id, min_id, max_id).await;
+    if deleted.is_empty() {
+        return;
+    }
+    let title = ctx.titles.lock().unwrap().get(&chat_id).cloned().unwrap_or_default();
+    for mut d in deleted {
+        if page.iter().any(|m| m.id == d.id) {
+            continue;
+        }
+        d.chat_title = title.clone();
+        page.push(d);
+    }
+    page.sort_by_key(|m| m.id);
+}
+
+async fn get_history_at_date(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    chat_id: i64,
+    date: chrono::DateTime<Local>,
+) -> Result<Vec<Msg>, TgError> {
+    let peer = ctx.peer(chat_id)?;
+    // offset_date = messages strictly older than this unix time, newest first.
+    let mut iter = client
+        .iter_messages(peer)
+        .offset_date(date.timestamp() as i32 + 1)
+        .limit(50);
+    let mut out = Vec::new();
+    while let Some(m) = iter.next().await.map_err(|e| e.to_string())? {
+        out.push(convert(ctx, &m, chat_id));
+        if out.len() >= 50 {
+            break;
+        }
+    }
+    out.reverse();
+    Ok(out)
+}
+
+async fn set_flags(client: &Client, ctx: &Arc<Ctx>, flags: BackendFlags) -> Result<(), TgError> {
+    let was_ghost = { std::mem::replace(&mut *ctx.flags.lock().unwrap(), flags).ghost_mode };
+    if flags.ghost_mode && !was_ghost {
+        // Appear offline now; ghost mark_read is a no-op from here on.
+        client
+            .invoke(&tl::functions::account::UpdateStatus { offline: true })
+            .await
+            .map_err(|e| format!("could not set offline status: {e}"))?;
+    }
+    Ok(())
 }
 
 async fn download_media(
@@ -548,6 +641,9 @@ async fn mark_read(
     chat_id: i64,
     up_to: i32,
 ) -> Result<(), TgError> {
+    if ctx.flags.lock().unwrap().ghost_mode {
+        return Ok(()); // ghost mode: never send read receipts
+    }
     let peer = ctx.peer(chat_id)?;
     let input_peer: tl::enums::InputPeer = peer.into();
     // ReadHistory with max_id = the id the UI actually displayed, so a message
@@ -656,11 +752,12 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
             .unwrap_or_default()
     };
 
-    Msg {
+    let msg = Msg {
         id: m.id(),
         chat_id,
         chat_title,
         sender,
+        sender_id: m.sender_id().map(|p| p.bot_api_dialog_id_unchecked()),
         text: m.text().to_string(),
         ts: m.date().with_timezone(&Local),
         outgoing: m.outgoing(),
@@ -669,7 +766,12 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
         reply_to: m.reply_to_message_id(),
         reactions,
         edited: m.edit_date().is_some() && !m.edit_hide(),
+        deleted: false,
+    };
+    if let Some(archive) = &ctx.archive {
+        archive.record(msg.clone());
     }
+    msg
 }
 
 async fn consume_updates(
@@ -696,6 +798,29 @@ async fn consume_updates(
                 let msg = convert(&ctx, &m, chat_id);
                 if events.send(Event::MessageChanged(msg)).await.is_err() {
                     return;
+                }
+            }
+            Ok(Update::MessageDeleted(d)) => {
+                let channel_chat = d
+                    .channel_id()
+                    .and_then(PeerId::channel)
+                    .map(|p| p.bot_api_dialog_id_unchecked());
+                let flagged: Vec<(i64, i32)> = match &ctx.archive {
+                    Some(a) => a.mark_deleted(channel_chat, d.messages().to_vec()).await,
+                    // Without an archive only channel deletions are attributable.
+                    None => match channel_chat {
+                        Some(c) => d.messages().iter().map(|&id| (c, id)).collect(),
+                        None => vec![],
+                    },
+                };
+                let mut by_chat: HashMap<i64, Vec<i32>> = HashMap::new();
+                for (c, id) in flagged {
+                    by_chat.entry(c).or_default().push(id);
+                }
+                for (chat_id, msg_ids) in by_chat {
+                    if events.send(Event::MessageDeleted { chat_id, msg_ids }).await.is_err() {
+                        return;
+                    }
                 }
             }
             Ok(Update::Raw(raw)) => {

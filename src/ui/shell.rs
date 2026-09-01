@@ -411,6 +411,35 @@ impl ShellInner {
                     }
                 }
             }
+            Event::MessageDeleted { chat_id, msg_ids } => {
+                // Default (anti-delete off): drop the rows, reconciling the
+                // sidebar preview when the deleted message was the last one.
+                if self.open_chat.get() == Some(chat_id) {
+                    let title = self.title_for(chat_id);
+                    for msg_id in msg_ids {
+                        let was_last = self.messages.is_last(msg_id);
+                        let next_last = was_last
+                            .then(|| self.messages.last_before(msg_id))
+                            .flatten();
+                        if was_last {
+                            let reconciled =
+                                self.reconcile_deleted_last(chat_id, msg_id, next_last);
+                            let (preview, time) = reconciled
+                                .as_ref()
+                                .map(|m| (message_preview(m), Some(m.ts)))
+                                .unwrap_or_else(|| (String::new(), None));
+                            self.chatlist.upsert(
+                                chat_id,
+                                &title,
+                                &preview,
+                                time,
+                                UnreadUpdate::Delta(0),
+                            );
+                        }
+                        self.messages.remove(msg_id);
+                    }
+                }
+            }
             Event::Typing { chat_id, name } => {
                 if self.open_chat.get() != Some(chat_id) {
                     return;

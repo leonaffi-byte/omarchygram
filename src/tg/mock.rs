@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, Local};
 use tokio::sync::mpsc;
 
-use super::{paths, AuthState, ChatSummary, Command, Event, MediaKind, Msg, Reaction};
+use super::{paths, AuthState, BackendFlags, ChatSummary, Command, Event, MediaKind, Msg, MsgVersion, Reaction};
 
 fn t(minutes_ago: i64) -> DateTime<Local> {
     Local::now() - Duration::minutes(minutes_ago)
@@ -58,6 +58,7 @@ fn msg(id: i32, chat_id: i64, sender: &str, text: &str, ts: DateTime<Local>, out
         chat_id,
         chat_title: title(chat_id).to_string(),
         sender: sender.to_string(),
+        sender_id: Some(if outgoing { 424242 } else { chat_id }),
         text: text.to_string(),
         ts,
         outgoing,
@@ -66,6 +67,7 @@ fn msg(id: i32, chat_id: i64, sender: &str, text: &str, ts: DateTime<Local>, out
         reply_to: None,
         reactions: vec![],
         edited: false,
+        deleted: false,
     }
 }
 
@@ -76,6 +78,10 @@ struct MockState {
     history: HashMap<i64, Vec<Msg>>,
     /// Files "sent" from this session, so download_media returns the original.
     sent_files: HashMap<i32, PathBuf>,
+    flags: BackendFlags,
+    /// Archived-deleted messages per chat (served when anti_delete is on).
+    deleted: HashMap<i64, Vec<Msg>>,
+    versions: HashMap<(i64, i32), Vec<MsgVersion>>,
 }
 
 impl MockState {
@@ -111,12 +117,24 @@ impl MockState {
         history.insert(4, vec![
             msg(401, 4, "Arch Linux ARM", "linux 7.1.9-arch1-2 has landed in core", t(2100), false),
         ]);
+        // Deni already deleted one message and edited another — anti-delete
+        // and edit-history have something to show without a live event.
+        let mut deleted = HashMap::new();
+        deleted.insert(2, vec![Msg { deleted: true, ..msg(200, 2, "Deni", "never mind, wrong chat", t(345), false) }]);
+        let mut versions = HashMap::new();
+        versions.insert(
+            (2, 203),
+            vec![MsgVersion { text: "stale lockfile again".into(), replaced_at: t(336) }],
+        );
         MockState {
             auth: AuthState::NeedCredentials,
             next_id: 1000,
             unread: HashMap::from([(1, 1), (2, 0), (3, 0), (4, 3)]),
             history,
             sent_files: HashMap::new(),
+            flags: BackendFlags::default(),
+            deleted,
+            versions,
         }
     }
 
@@ -187,7 +205,7 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
             Command::GetHistory { chat_id, before_id, respond } => {
                 let st = st.lock().unwrap();
                 let msgs = st.history.get(&chat_id).cloned().unwrap_or_default();
-                let result = match before_id {
+                let mut result = match before_id {
                     None => msgs,
                     Some(before) => {
                         // Fabricate one older page so pagination can be exercised, then stop.
@@ -201,6 +219,12 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                         }
                     }
                 };
+                if st.flags.anti_delete && before_id.is_none() {
+                    if let Some(del) = st.deleted.get(&chat_id) {
+                        result.extend(del.iter().cloned());
+                        result.sort_by_key(|m| m.id);
+                    }
+                }
                 let _ = respond.send(Ok(result));
             }
             Command::DownloadMedia { chat_id, msg_id, respond } => {
@@ -244,7 +268,15 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                     st.next_id += 1; // reserve the reply's id
                     sent
                 };
-                schedule_reply(st.clone(), &events, chat_id, sent.id + 1);
+                let lower = text.to_lowercase();
+                let demo = if lower.contains("delete") {
+                    Demo::DeleteReply
+                } else if lower.contains("edit") {
+                    Demo::EditReply
+                } else {
+                    Demo::None
+                };
+                schedule_reply(st.clone(), &events, chat_id, sent.id + 1, demo);
                 let _ = respond.send(Ok(sent));
             }
             Command::SendFile { chat_id, path, caption, respond } => {
@@ -270,9 +302,16 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                         .get_mut(&chat_id)
                         .and_then(|msgs| msgs.iter_mut().find(|m| m.id == msg_id))
                         .map(|m| {
-                            m.text = text;
+                            let old = std::mem::replace(&mut m.text, text);
                             m.edited = true;
-                            m.clone()
+                            (m.clone(), old)
+                        })
+                        .map(|(m, old)| {
+                            st.versions
+                                .entry((chat_id, msg_id))
+                                .or_default()
+                                .push(MsgVersion { text: old, replaced_at: t(0) });
+                            m
                         })
                         .ok_or_else(|| format!("no message {msg_id} in chat {chat_id}"))
                 };
@@ -285,8 +324,30 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                 let _ = respond.send(Ok(()));
             }
             Command::MarkRead { chat_id, up_to: _, respond } => {
-                st.lock().unwrap().unread.insert(chat_id, 0);
+                let mut st = st.lock().unwrap();
+                if !st.flags.ghost_mode {
+                    st.unread.insert(chat_id, 0);
+                }
                 let _ = respond.send(Ok(()));
+            }
+            Command::SetFlags(flags, tx) => {
+                st.lock().unwrap().flags = flags;
+                let _ = tx.send(Ok(()));
+            }
+            Command::GetHistoryAtDate { chat_id, date, respond } => {
+                let st = st.lock().unwrap();
+                let mut msgs: Vec<Msg> = st
+                    .history
+                    .get(&chat_id)
+                    .map(|v| v.iter().filter(|m| m.ts <= date).cloned().collect())
+                    .unwrap_or_default();
+                let keep = msgs.len().saturating_sub(50);
+                msgs.drain(..keep);
+                let _ = respond.send(Ok(msgs));
+            }
+            Command::GetEditHistory { chat_id, msg_id, respond } => {
+                let v = st.lock().unwrap().versions.get(&(chat_id, msg_id)).cloned().unwrap_or_default();
+                let _ = respond.send(Ok(v));
             }
         }
     }
@@ -295,11 +356,21 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
 /// Simulate the other side: a typing signal, then an incoming reply — persisted
 /// to history and unread state BEFORE the event, so reopening the chat agrees
 /// with what the UI displayed live.
+#[derive(Clone, Copy, PartialEq)]
+enum Demo {
+    None,
+    /// The mock reply gets deleted 2.5s after arriving (anti-delete demo).
+    DeleteReply,
+    /// The mock reply gets edited 2.5s after arriving (edit-history demo).
+    EditReply,
+}
+
 fn schedule_reply(
     st: Arc<Mutex<MockState>>,
     events: &async_channel::Sender<Event>,
     chat_id: i64,
     reply_id: i32,
+    demo: Demo,
 ) {
     let events = events.clone();
     tokio::spawn(async move {
@@ -314,6 +385,44 @@ fn schedule_reply(
             st.history.entry(chat_id).or_default().push(reply.clone());
             *st.unread.entry(chat_id).or_insert(0) += 1;
         }
-        let _ = events.send(Event::NewMessage(reply)).await;
+        let _ = events.send(Event::NewMessage(reply.clone())).await;
+        match demo {
+            Demo::None => {}
+            Demo::DeleteReply => {
+                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                {
+                    let mut st = st.lock().unwrap();
+                    if let Some(msgs) = st.history.get_mut(&chat_id) {
+                        msgs.retain(|m| m.id != reply_id);
+                    }
+                    let mut gone = reply.clone();
+                    gone.deleted = true;
+                    st.deleted.entry(chat_id).or_default().push(gone);
+                }
+                let _ = events
+                    .send(Event::MessageDeleted { chat_id, msg_ids: vec![reply_id] })
+                    .await;
+            }
+            Demo::EditReply => {
+                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                let edited = {
+                    let mut st = st.lock().unwrap();
+                    st.versions
+                        .entry((chat_id, reply_id))
+                        .or_default()
+                        .push(MsgVersion { text: reply.text.clone(), replaced_at: t(0) });
+                    let mut e = reply.clone();
+                    e.text = "(mock reply) got it — actually, make that thursday".into();
+                    e.edited = true;
+                    if let Some(msgs) = st.history.get_mut(&chat_id) {
+                        if let Some(m) = msgs.iter_mut().find(|m| m.id == reply_id) {
+                            *m = e.clone();
+                        }
+                    }
+                    e
+                };
+                let _ = events.send(Event::MessageChanged(edited)).await;
+            }
+        }
     });
 }

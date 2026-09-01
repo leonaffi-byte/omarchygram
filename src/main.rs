@@ -13,6 +13,13 @@ fn main() -> glib::ExitCode {
     let smoke = args.iter().any(|a| a == "--smoke");
     let probe = args.iter().any(|a| a == "--probe");
 
+    if smoke {
+        // Never let offline demo/probe runs touch the user's real settings.
+        let tmp = std::env::temp_dir().join(format!("omarchygram-smoke-{}.toml", std::process::id()));
+        // SAFETY: called before any thread is spawned (GTK/backends start below).
+        unsafe { std::env::set_var("OMG_SETTINGS_PATH", &tmp) };
+    }
+
     let app = gtk::Application::builder().application_id(APP_ID).build();
     app.connect_activate(move |app| build(app, smoke, probe));
     // GTK must not see our flags.
