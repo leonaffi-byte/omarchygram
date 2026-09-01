@@ -7,3 +7,8 @@ config.toml
 dist/
 build/
 *.egg-info/
+
+
+# Added by cargo
+
+/target
