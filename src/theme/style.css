@@ -320,6 +320,90 @@ button.omg-primary:focus-visible {
   outline-offset: 1px;
 }
 
+/* ---- settings panel ---- */
+
+.omg-settings {
+  background-color: var(--bg);
+}
+
+.omg-section {
+  color: var(--muted);
+  font-size: 10pt;
+  font-weight: bold;
+}
+
+.omg-settings entry {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 4px 8px;
+  caret-color: var(--accent);
+}
+
+.omg-settings entry:focus-within {
+  border-color: var(--accent);
+}
+
+/* GTK switches paint an Adwaita-blue background-image when checked; clearing
+   it lets the token colors below show. */
+switch.omg-switch {
+  background-image: none;
+  background-color: var(--bg-lighter);
+  box-shadow: none;
+}
+
+switch.omg-switch,
+switch.omg-switch slider {
+  outline-color: var(--accent);
+}
+
+switch.omg-switch:checked {
+  background-image: none;
+  background-color: var(--accent);
+}
+
+switch.omg-switch slider {
+  background-image: none;
+  background-color: var(--fg);
+  box-shadow: none;
+}
+
+/* ---- chat header extras ---- */
+
+.omg-clock {
+  color: var(--muted);
+  font-size: 9pt;
+}
+
+.omg-ghost {
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 8.5pt;
+}
+
+/* Jump-to-date popover: gtk::Calendar defaults to Adwaita colors — restyle
+   with tokens only (bg-dark, fg, accent selection, no painted gradients). */
+popover.omg-menu contents calendar,
+popover.omg-menu contents calendar > header,
+popover.omg-menu contents calendar > grid,
+popover.omg-menu contents calendar > grid > label {
+  background-image: none;
+  background-color: var(--bg-dark);
+  color: var(--fg);
+}
+
+popover.omg-menu contents calendar > grid > label.other-month {
+  color: var(--muted);
+}
+
+popover.omg-menu contents calendar > grid > label:selected {
+  background-color: var(--accent);
+  color: var(--bg-darker);
+}
+
 scrollbar slider {
   background-color: var(--bg-lighter);
   border-radius: 0;

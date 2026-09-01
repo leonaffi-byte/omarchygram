@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use chrono::{DateTime, Local};
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
@@ -21,6 +22,10 @@ pub enum MessageAction {
     Media(i32),
     Paginate,
     CancelMode,
+    CopyMessageId(i32),
+    CopyUserId(i32),
+    JumpToDate(DateTime<Local>),
+    JumpToLatest,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +71,9 @@ struct EditMode {
 struct MessagesInner {
     header_title: gtk::Label,
     typing: gtk::Label,
+    ghost: gtk::Label,
+    clock: gtk::Label,
+    bottom_button: gtk::Button,
     scroll: gtk::ScrolledWindow,
     list: gtk::Box,
     loading: gtk::Label,
@@ -78,6 +86,8 @@ struct MessagesInner {
     drop_target: gtk::DropTarget,
     store: RefCell<MessageStore>,
     action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    time_format: RefCell<String>,
+    detached: Cell<bool>,
     busy: Cell<bool>,
     paging: Cell<bool>,
     exhausted: Cell<bool>,
@@ -121,6 +131,43 @@ impl MessagesView {
         typing.add_css_class("omg-typing");
         typing.set_visible(false);
         header.append(&typing);
+
+        let ghost = gtk::Label::new(Some("ghost"));
+        ghost.add_css_class("omg-ghost");
+        ghost.set_visible(false);
+        ghost.set_valign(gtk::Align::Center);
+        header.append(&ghost);
+
+        let clock = gtk::Label::new(None);
+        clock.add_css_class("omg-clock");
+        clock.set_visible(false);
+        clock.set_valign(gtk::Align::Center);
+        // Tabular digits so the ticking clock doesn't jitter the header.
+        let clock_attrs = gtk::pango::AttrList::new();
+        clock_attrs.insert(gtk::pango::AttrFontFeatures::new("tnum"));
+        clock.set_attributes(Some(&clock_attrs));
+        header.append(&clock);
+
+        let jump_button = gtk::Button::with_label("Jump…");
+        jump_button.add_css_class("omg-attach");
+        jump_button.set_valign(gtk::Align::Center);
+        header.append(&jump_button);
+        let jump_popover = gtk::Popover::new();
+        jump_popover.add_css_class("omg-menu");
+        jump_popover.set_has_arrow(false);
+        jump_popover.set_parent(&jump_button);
+        // Manually parented popover: unparent when closed so the widget tree doesn't keep it alive.
+        jump_popover.connect_closed(|popover| popover.unparent());
+        let calendar = gtk::Calendar::new();
+        jump_popover.set_child(Some(&calendar));
+
+        // Jump back to the latest page; always visible while detached.
+        let bottom_button = gtk::Button::with_label("▼");
+        bottom_button.add_css_class("omg-attach");
+        bottom_button.set_valign(gtk::Align::Center);
+        bottom_button.set_visible(false);
+        header.append(&bottom_button);
+
         widget.append(&header);
 
         let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -213,9 +260,51 @@ impl MessagesView {
         let drop_target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
         composer_box.add_controller(drop_target.clone());
 
+        {
+            let popover = jump_popover.clone();
+            let button = jump_button.downgrade();
+            jump_button.connect_clicked(move |_| {
+                let Some(button) = button.upgrade() else {
+                    return;
+                };
+                // The popover unparents itself on close; re-parent before re-showing.
+                if popover.parent().is_none() {
+                    popover.set_parent(&button);
+                }
+                popover.popup();
+            });
+        }
+        {
+            let action = action.clone();
+            // Weak: the calendar is a child of the popover, a strong capture would cycle.
+            let popover = jump_popover.downgrade();
+            calendar.connect_day_selected(move |calendar| {
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+                let Some(date) = calendar_day_end(calendar) else {
+                    return;
+                };
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::JumpToDate(date));
+                }
+            });
+        }
+        {
+            let action = action.clone();
+            bottom_button.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::JumpToLatest);
+                }
+            });
+        }
+
         let inner = Rc::new(MessagesInner {
             header_title,
             typing,
+            ghost,
+            clock,
+            bottom_button,
             scroll,
             list,
             loading,
@@ -228,6 +317,8 @@ impl MessagesView {
             drop_target,
             store: RefCell::new(MessageStore::default()),
             action,
+            time_format: RefCell::new("%H:%M".to_string()),
+            detached: Cell::new(false),
             busy: Cell::new(false),
             paging: Cell::new(false),
             exhausted: Cell::new(false),
@@ -467,6 +558,31 @@ impl MessagesView {
         self.inner.header_title.set_label(title);
         self.inner.loading.set_label("Loading…");
         self.inner.loading.set_visible(true);
+        self.set_detached(false);
+        self.inner.paging.set(false);
+        self.inner.exhausted.set(false);
+        self.inner.suppress_paging.set(true);
+        self.inner.stick_to_bottom.set(true);
+    }
+
+    /// History-only reset for jump-to-date / jump-to-latest on the SAME chat:
+    /// clears the store/paging/scroll state and shows the loading label, but
+    /// preserves the composer draft, reply/edit mode, and busy sensitivity
+    /// (C5/C13). `detached` is left to the caller.
+    pub fn reset_history(&self, chat_id: i64, epoch: u64) {
+        self.cancel_pending_scroll();
+        self.inner.scroll_epoch.set(epoch);
+        self.clear_error();
+        self.clear_typing();
+        while let Some(child) = self.inner.list.first_child() {
+            self.inner.list.remove(&child);
+        }
+        *self.inner.store.borrow_mut() = MessageStore {
+            chat_id: Some(chat_id),
+            ..MessageStore::default()
+        };
+        self.inner.loading.set_label("Loading…");
+        self.inner.loading.set_visible(true);
         self.inner.paging.set(false);
         self.inner.exhausted.set(false);
         self.inner.suppress_paging.set(true);
@@ -488,7 +604,9 @@ impl MessagesView {
     }
 
     pub fn merge_event(&self, message: Msg) -> Vec<i32> {
-        let should_stick = self.inner.stick_to_bottom.get();
+        // Detached (jumped-to historical page): merge into the store but never
+        // auto-scroll; the ▼ button stays visible (C4).
+        let should_stick = self.inner.stick_to_bottom.get() && !self.inner.detached.get();
         let adjustment = self.inner.scroll.vadjustment();
         let saved_upper = adjustment.upper();
         if should_stick {
@@ -681,7 +799,7 @@ impl MessagesView {
         let time = gtk::Label::new(None);
         time.add_css_class("omg-msg-time");
         time.set_halign(gtk::Align::End);
-        set_time_label(&time, message);
+        set_time_label(&time, message, &self.inner.time_format.borrow());
         widget.append(&time);
 
         let reactions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -743,7 +861,7 @@ impl MessagesView {
             (None, true) => {}
         }
         drop(text_label);
-        set_time_label(&row.time, &message);
+        set_time_label(&row.time, &message, &self.inner.time_format.borrow());
         update_reactions(&row, &message);
     }
 
@@ -836,6 +954,26 @@ impl MessagesView {
             });
         }
         menu.append(&copy);
+
+        let copy_message_id = menu_button("Copy message id", false);
+        Self::connect_menu_action(
+            inner,
+            &copy_message_id,
+            &popover,
+            MessageAction::CopyMessageId(msg_id),
+        );
+        menu.append(&copy_message_id);
+
+        if message.sender_id.is_some() {
+            let copy_user_id = menu_button("Copy user id", false);
+            Self::connect_menu_action(
+                inner,
+                &copy_user_id,
+                &popover,
+                MessageAction::CopyUserId(msg_id),
+            );
+            menu.append(&copy_user_id);
+        }
 
         let reply = menu_button("Reply", false);
         Self::connect_menu_action(inner, &reply, &popover, MessageAction::Reply(msg_id));
@@ -1123,7 +1261,9 @@ impl MessagesView {
     }
 
     pub fn finish_image(&self, msg_id: i32, path: PathBuf, texture: &gdk::Texture) -> bool {
-        let should_stick = self.inner.stick_to_bottom.get();
+        // A historical (detached) view must never be yanked to the tail by a
+        // late image swap-in (C4 + detached semantics).
+        let should_stick = self.inner.stick_to_bottom.get() && !self.inner.detached.get();
         let adjustment = self.inner.scroll.vadjustment();
         let saved_upper = adjustment.upper();
         if should_stick {
@@ -1273,11 +1413,116 @@ impl MessagesView {
     pub fn typing_generation(&self) -> u64 {
         self.inner.typing_generation.get()
     }
+
+    /// The strftime format used for message times; re-formats every row.
+    /// Invalid formats are rejected so chrono's formatter can never panic
+    /// while rendering (the last valid format is kept instead).
+    pub fn set_time_format(&self, format: &str) {
+        if !valid_time_format(format) {
+            return;
+        }
+        *self.inner.time_format.borrow_mut() = format.to_string();
+        let rows: Vec<(gtk::Label, Msg)> = {
+            let store = self.inner.store.borrow();
+            store
+                .order
+                .iter()
+                .filter_map(|id| {
+                    store
+                        .entries
+                        .get(id)
+                        .map(|entry| (entry.row.time.clone(), entry.msg.clone()))
+                })
+                .collect()
+        };
+        for (label, message) in rows {
+            set_time_label(&label, &message, format);
+        }
+    }
+
+    pub fn set_clock(&self, text: Option<&str>) {
+        match text {
+            Some(text) => {
+                self.inner.clock.set_label(text);
+                self.inner.clock.set_visible(true);
+            }
+            None => {
+                self.inner.clock.set_visible(false);
+                self.inner.clock.set_label("");
+            }
+        }
+    }
+
+    pub fn set_ghost(&self, on: bool) {
+        self.inner.ghost.set_visible(on);
+    }
+
+    /// Detached = viewing a jumped-to historical page; the ▼ button stays
+    /// visible and reloads the latest page.
+    pub fn set_detached(&self, detached: bool) {
+        self.inner.detached.set(detached);
+        self.inner.bottom_button.set_visible(detached);
+    }
+
+    pub fn is_detached(&self) -> bool {
+        self.inner.detached.get()
+    }
+
+    /// Drives the same code path as clicking the ▼ button.
+    pub fn trigger_jump_to_latest(&self) {
+        self.inner.bottom_button.emit_clicked();
+    }
+
+    /// Time label text of the newest message in the store (probe helper).
+    pub fn last_time_label(&self) -> Option<String> {
+        let store = self.inner.store.borrow();
+        store
+            .order
+            .last()
+            .and_then(|id| store.entries.get(id))
+            .map(|entry| entry.row.time.label().to_string())
+    }
 }
 
-fn set_time_label(label: &gtk::Label, message: &Msg) {
+fn set_time_label(label: &gtk::Label, message: &Msg, format: &str) {
     let edited = if message.edited { " edited" } else { "" };
-    label.set_label(&format!("{}{}", message.ts.format("%H:%M"), edited));
+    // Never let an invalid strftime panic the formatter: fall back to "%H:%M".
+    let text = format_time(&message.ts, format)
+        .or_else(|| format_time(&message.ts, "%H:%M"))
+        .unwrap_or_default();
+    label.set_label(&format!("{text}{edited}"));
+}
+
+/// Render a timestamp, returning None instead of panicking: chrono's Display
+/// formatter fails with fmt::Error on invalid directives, which `to_string()`
+/// would turn into a panic. `write!` surfaces the error.
+fn format_time(ts: &DateTime<Local>, format: &str) -> Option<String> {
+    use std::fmt::Write;
+    let mut rendered = String::new();
+    write!(rendered, "{}", ts.format(format)).ok().map(|_| rendered)
+}
+
+/// Probe a strftime format by writing a fixed timestamp into a String; an
+/// invalid directive yields Err instead of panicking later during rendering.
+fn valid_time_format(format: &str) -> bool {
+    use std::fmt::Write;
+    let Some(fixed) = DateTime::<chrono::Utc>::from_timestamp(946_782_345, 0) else {
+        return false;
+    };
+    let mut rendered = String::new();
+    write!(rendered, "{}", fixed.format(format)).is_ok()
+}
+
+/// 23:59:59 local on the calendar's selected day.
+fn calendar_day_end(calendar: &gtk::Calendar) -> Option<DateTime<Local>> {
+    let date = calendar.date();
+    let naive = chrono::NaiveDate::from_ymd_opt(
+        date.year(),
+        date.month() as u32,
+        date.day_of_month() as u32,
+    )?
+    .and_hms_opt(23, 59, 59)?;
+    naive.and_local_timezone(Local).earliest()
 }
 
 fn message_label(text: &str) -> gtk::Label {
