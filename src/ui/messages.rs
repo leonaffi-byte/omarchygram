@@ -1,0 +1,1320 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::rc::Rc;
+
+use gtk::gdk;
+use gtk::glib;
+use gtk::prelude::*;
+use gtk4 as gtk;
+
+use crate::tg::{MediaKind, Msg};
+
+#[derive(Clone)]
+pub enum MessageAction {
+    Submit,
+    Attach,
+    DropFile(gtk::gio::File),
+    Reply(i32),
+    Edit(i32),
+    Delete(i32),
+    Media(i32),
+    Paginate,
+    CancelMode,
+}
+
+#[derive(Clone, Debug)]
+pub enum MediaState {
+    NotStarted,
+    InFlight,
+    Done(PathBuf),
+    Failed,
+}
+
+#[derive(Clone)]
+struct MessageRow {
+    widget: gtk::Box,
+    sender: gtk::Label,
+    quote: gtk::Label,
+    text: Rc<RefCell<Option<gtk::Label>>>,
+    time: gtk::Label,
+    reactions: gtk::Box,
+    reaction_labels: Rc<RefCell<Vec<gtk::Label>>>,
+    media_slot: gtk::Box,
+    media_button: Option<gtk::Button>,
+}
+
+struct MessageEntry {
+    msg: Msg,
+    row: MessageRow,
+    media_state: MediaState,
+    media_retryable: bool,
+}
+
+#[derive(Default)]
+struct MessageStore {
+    chat_id: Option<i64>,
+    order: Vec<i32>,
+    entries: HashMap<i32, MessageEntry>,
+}
+
+struct EditMode {
+    msg_id: i32,
+    draft: String,
+}
+
+struct MessagesInner {
+    header_title: gtk::Label,
+    typing: gtk::Label,
+    scroll: gtk::ScrolledWindow,
+    list: gtk::Box,
+    loading: gtk::Label,
+    error: gtk::Label,
+    reply_bar: gtk::Box,
+    reply_label: gtk::Label,
+    edit_bar: gtk::Box,
+    composer: gtk::TextView,
+    attach: gtk::Button,
+    drop_target: gtk::DropTarget,
+    store: RefCell<MessageStore>,
+    action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    busy: Cell<bool>,
+    paging: Cell<bool>,
+    exhausted: Cell<bool>,
+    suppress_paging: Cell<bool>,
+    stick_to_bottom: Cell<bool>,
+    reply_to: Cell<Option<i32>>,
+    edit: RefCell<Option<EditMode>>,
+    typing_generation: Cell<u64>,
+    scroll_epoch: Cell<u64>,
+    upper_handler: RefCell<Option<glib::SignalHandlerId>>,
+    upper_tick: RefCell<Option<gtk::TickCallbackId>>,
+}
+
+pub struct MessagesView {
+    pub widget: gtk::Box,
+    inner: Rc<MessagesInner>,
+}
+
+impl Clone for MessagesView {
+    fn clone(&self) -> Self {
+        Self {
+            widget: self.widget.clone(),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl MessagesView {
+    pub fn new() -> Self {
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        widget.set_hexpand(true);
+        widget.set_vexpand(true);
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        header.add_css_class("omg-chat-header");
+        let header_title = gtk::Label::new(Some("Select a chat"));
+        header_title.set_halign(gtk::Align::Start);
+        header_title.set_hexpand(true);
+        header.append(&header_title);
+        let typing = gtk::Label::new(None);
+        typing.add_css_class("omg-typing");
+        typing.set_visible(false);
+        header.append(&typing);
+        widget.append(&header);
+
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        list.add_css_class("omg-messages");
+        list.set_margin_start(16);
+        list.set_margin_end(16);
+        list.set_margin_top(8);
+        list.set_margin_bottom(8);
+
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_child(Some(&list));
+        scroll.set_hexpand(true);
+        scroll.set_vexpand(true);
+
+        let middle = gtk::Overlay::new();
+        middle.set_child(Some(&scroll));
+        middle.set_hexpand(true);
+        middle.set_vexpand(true);
+        let loading = gtk::Label::new(Some("Select a chat"));
+        loading.add_css_class("omg-empty-state");
+        loading.set_halign(gtk::Align::Center);
+        loading.set_valign(gtk::Align::Center);
+        middle.add_overlay(&loading);
+        widget.append(&middle);
+
+        let error = gtk::Label::new(None);
+        error.add_css_class("omg-error");
+        error.set_halign(gtk::Align::Start);
+        error.set_margin_start(8);
+        error.set_margin_end(8);
+        error.set_wrap(true);
+        error.set_visible(false);
+        widget.append(&error);
+
+        let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        reply_bar.add_css_class("omg-reply-bar");
+        reply_bar.set_visible(false);
+        let reply_label = gtk::Label::new(None);
+        reply_label.set_halign(gtk::Align::Start);
+        reply_label.set_hexpand(true);
+        reply_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        reply_bar.append(&reply_label);
+        let reply_close = gtk::Button::with_label("x");
+        reply_close.add_css_class("omg-bar-close");
+        reply_bar.append(&reply_close);
+        widget.append(&reply_bar);
+
+        let edit_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        edit_bar.add_css_class("omg-edit-bar");
+        edit_bar.set_visible(false);
+        let edit_label = gtk::Label::new(Some("Editing message"));
+        edit_label.set_halign(gtk::Align::Start);
+        edit_label.set_hexpand(true);
+        edit_bar.append(&edit_label);
+        let edit_close = gtk::Button::with_label("x");
+        edit_close.add_css_class("omg-bar-close");
+        edit_bar.append(&edit_close);
+        widget.append(&edit_bar);
+
+        let composer_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        composer_box.add_css_class("omg-composer");
+        let attach = gtk::Button::with_label("+");
+        attach.add_css_class("omg-attach");
+        attach.set_valign(gtk::Align::End);
+        composer_box.append(&attach);
+
+        let composer = gtk::TextView::new();
+        composer.set_wrap_mode(gtk::WrapMode::WordChar);
+        composer.set_accepts_tab(false);
+        composer.set_top_margin(4);
+        composer.set_bottom_margin(4);
+        composer.set_left_margin(4);
+        composer.set_right_margin(4);
+
+        let composer_scroll = gtk::ScrolledWindow::new();
+        composer_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        composer_scroll.set_min_content_height(36);
+        composer_scroll.set_max_content_height(120);
+        composer_scroll.set_propagate_natural_height(true);
+        composer_scroll.set_hexpand(true);
+        composer_scroll.set_child(Some(&composer));
+        composer_box.append(&composer_scroll);
+        widget.append(&composer_box);
+
+        let action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>> = Rc::new(RefCell::new(None));
+        let drop_target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        composer_box.add_controller(drop_target.clone());
+
+        let inner = Rc::new(MessagesInner {
+            header_title,
+            typing,
+            scroll,
+            list,
+            loading,
+            error,
+            reply_bar,
+            reply_label,
+            edit_bar,
+            composer,
+            attach,
+            drop_target,
+            store: RefCell::new(MessageStore::default()),
+            action,
+            busy: Cell::new(false),
+            paging: Cell::new(false),
+            exhausted: Cell::new(false),
+            suppress_paging: Cell::new(false),
+            stick_to_bottom: Cell::new(true),
+            reply_to: Cell::new(None),
+            edit: RefCell::new(None),
+            typing_generation: Cell::new(0),
+            scroll_epoch: Cell::new(0),
+            upper_handler: RefCell::new(None),
+            upper_tick: RefCell::new(None),
+        });
+        let view = Self { widget, inner };
+        view.connect_controls(reply_close, edit_close);
+        view
+    }
+
+    fn connect_controls(&self, reply_close: gtk::Button, edit_close: gtk::Button) {
+        {
+            let action = self.inner.action.clone();
+            self.inner.attach.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::Attach);
+                }
+            });
+        }
+        for button in [reply_close, edit_close] {
+            let action = self.inner.action.clone();
+            button.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::CancelMode);
+                }
+            });
+        }
+
+        let key_controller = gtk::EventControllerKey::new();
+        {
+            let inner = self.inner.clone();
+            key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+                if !matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
+                    return glib::Propagation::Proceed;
+                }
+                if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+                    return glib::Propagation::Proceed;
+                }
+                if !inner.busy.get() {
+                    if let Some(callback) = inner.action.borrow().as_ref().cloned() {
+                        callback(MessageAction::Submit);
+                    }
+                }
+                glib::Propagation::Stop
+            });
+        }
+        self.inner.composer.add_controller(key_controller);
+
+        {
+            let inner = self.inner.clone();
+            self.inner.drop_target.connect_drop(move |_, value, _, _| {
+                if inner.busy.get() {
+                    return false;
+                }
+                let Ok(files) = value.get::<gdk::FileList>() else {
+                    return false;
+                };
+                let Some(file) = files.files().into_iter().next() else {
+                    return false;
+                };
+                if let Some(callback) = inner.action.borrow().as_ref().cloned() {
+                    callback(MessageAction::DropFile(file));
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+
+        {
+            let inner = self.inner.clone();
+            let adjustment = self.inner.scroll.vadjustment();
+            adjustment.connect_value_changed(move |adjustment| {
+                if inner.suppress_paging.get() {
+                    return;
+                }
+                inner
+                    .stick_to_bottom
+                    .set(adjustment.value() >= adjustment.upper() - adjustment.page_size() - 4.0);
+                if adjustment.value() <= 4.0 && !inner.paging.get() && !inner.exhausted.get() {
+                    if let Some(callback) = inner.action.borrow().as_ref().cloned() {
+                        callback(MessageAction::Paginate);
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn set_action(&self, callback: Rc<dyn Fn(MessageAction)>) {
+        *self.inner.action.borrow_mut() = Some(callback);
+    }
+
+    fn cancel_pending_scroll(&self) {
+        let adjustment = self.inner.scroll.vadjustment();
+        if let Some(handler) = self.inner.upper_handler.borrow_mut().take() {
+            adjustment.disconnect(handler);
+        }
+        if let Some(tick) = self.inner.upper_tick.borrow_mut().take() {
+            tick.remove();
+        }
+    }
+
+    fn after_upper_change<F>(&self, saved_upper: f64, callback: F)
+    where
+        F: FnOnce(&gtk::Adjustment, bool) + 'static,
+    {
+        self.cancel_pending_scroll();
+        let adjustment = self.inner.scroll.vadjustment();
+        let epoch = self.inner.scroll_epoch.get();
+        if (adjustment.upper() - saved_upper).abs() > f64::EPSILON {
+            callback(&adjustment, true);
+            return;
+        }
+
+        let callback = Rc::new(RefCell::new(Some(callback)));
+        let inner = self.inner.clone();
+        let callback_for_signal = callback.clone();
+        let handler = adjustment.connect_upper_notify(move |adjustment| {
+            if inner.scroll_epoch.get() != epoch {
+                return;
+            }
+            if (adjustment.upper() - saved_upper).abs() <= f64::EPSILON {
+                return;
+            }
+            if let Some(handler) = inner.upper_handler.borrow_mut().take() {
+                adjustment.disconnect(handler);
+            }
+            if let Some(tick) = inner.upper_tick.borrow_mut().take() {
+                tick.remove();
+            }
+            if let Some(callback) = callback_for_signal.borrow_mut().take() {
+                callback(adjustment, true);
+            }
+        });
+        *self.inner.upper_handler.borrow_mut() = Some(handler);
+
+        let adjustment_for_tick = adjustment.clone();
+        let inner = self.inner.clone();
+        let callback_for_tick = callback;
+        let frames = Cell::new(0);
+        let tick = self.inner.scroll.add_tick_callback(move |_, _| {
+            if inner.scroll_epoch.get() != epoch {
+                if let Some(handler) = inner.upper_handler.borrow_mut().take() {
+                    adjustment_for_tick.disconnect(handler);
+                }
+                inner.upper_tick.borrow_mut().take();
+                callback_for_tick.borrow_mut().take();
+                return glib::ControlFlow::Break;
+            }
+            let changed = (adjustment_for_tick.upper() - saved_upper).abs() > f64::EPSILON;
+            frames.set(frames.get() + 1);
+            if !changed && frames.get() < 3 {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(handler) = inner.upper_handler.borrow_mut().take() {
+                adjustment_for_tick.disconnect(handler);
+            }
+            inner.upper_tick.borrow_mut().take();
+            if let Some(callback) = callback_for_tick.borrow_mut().take() {
+                callback(&adjustment_for_tick, changed);
+            }
+            glib::ControlFlow::Break
+        });
+        *self.inner.upper_tick.borrow_mut() = Some(tick);
+    }
+
+    fn after_next_upper_or_tick<F>(&self, callback: F)
+    where
+        F: FnOnce(&gtk::Adjustment) + 'static,
+    {
+        self.cancel_pending_scroll();
+        let adjustment = self.inner.scroll.vadjustment();
+        let epoch = self.inner.scroll_epoch.get();
+        let callback = Rc::new(RefCell::new(Some(callback)));
+        let inner = self.inner.clone();
+        let callback_for_signal = callback.clone();
+        let handler = adjustment.connect_upper_notify(move |adjustment| {
+            if inner.scroll_epoch.get() != epoch {
+                return;
+            }
+            if let Some(handler) = inner.upper_handler.borrow_mut().take() {
+                adjustment.disconnect(handler);
+            }
+            if let Some(tick) = inner.upper_tick.borrow_mut().take() {
+                tick.remove();
+            }
+            if let Some(callback) = callback_for_signal.borrow_mut().take() {
+                callback(adjustment);
+            }
+        });
+        *self.inner.upper_handler.borrow_mut() = Some(handler);
+
+        let adjustment_for_tick = adjustment.clone();
+        let inner = self.inner.clone();
+        let tick = self.inner.scroll.add_tick_callback(move |_, _| {
+            if let Some(handler) = inner.upper_handler.borrow_mut().take() {
+                adjustment_for_tick.disconnect(handler);
+            }
+            inner.upper_tick.borrow_mut().take();
+            if inner.scroll_epoch.get() == epoch {
+                if let Some(callback) = callback.borrow_mut().take() {
+                    callback(&adjustment_for_tick);
+                }
+            } else {
+                callback.borrow_mut().take();
+            }
+            glib::ControlFlow::Break
+        });
+        *self.inner.upper_tick.borrow_mut() = Some(tick);
+    }
+
+    pub fn reset_chat(&self, chat_id: i64, title: &str, epoch: u64) {
+        self.cancel_pending_scroll();
+        self.inner.scroll_epoch.set(epoch);
+        self.inner.edit.borrow_mut().take();
+        self.inner.edit_bar.set_visible(false);
+        self.cancel_reply();
+        self.set_composer_text("");
+        self.clear_error();
+        self.clear_typing();
+        while let Some(child) = self.inner.list.first_child() {
+            self.inner.list.remove(&child);
+        }
+        *self.inner.store.borrow_mut() = MessageStore {
+            chat_id: Some(chat_id),
+            ..MessageStore::default()
+        };
+        self.inner.header_title.set_label(title);
+        self.inner.loading.set_label("Loading…");
+        self.inner.loading.set_visible(true);
+        self.inner.paging.set(false);
+        self.inner.exhausted.set(false);
+        self.inner.suppress_paging.set(true);
+        self.inner.stick_to_bottom.set(true);
+    }
+
+    pub fn finish_initial(&self, messages: Vec<Msg>) -> Vec<i32> {
+        let adjustment = self.inner.scroll.vadjustment();
+        let inserted = self.merge(messages);
+        self.inner.loading.set_visible(false);
+        adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
+        let inner = self.inner.clone();
+        self.after_next_upper_or_tick(move |adjustment| {
+            adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
+            inner.stick_to_bottom.set(true);
+            inner.suppress_paging.set(false);
+        });
+        inserted
+    }
+
+    pub fn merge_event(&self, message: Msg) -> Vec<i32> {
+        let should_stick = self.inner.stick_to_bottom.get();
+        let adjustment = self.inner.scroll.vadjustment();
+        let saved_upper = adjustment.upper();
+        if should_stick {
+            self.inner.suppress_paging.set(true);
+        }
+        let inserted = self.merge(vec![message]);
+        if should_stick {
+            let inner = self.inner.clone();
+            self.after_upper_change(saved_upper, move |adjustment, changed| {
+                if changed {
+                    adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
+                }
+                inner.stick_to_bottom.set(true);
+                inner.suppress_paging.set(false);
+            });
+        }
+        inserted
+    }
+
+    pub fn begin_page(&self) -> Option<i32> {
+        if self.inner.loading.is_visible()
+            || self.inner.paging.get()
+            || self.inner.exhausted.get()
+            || self.inner.suppress_paging.get()
+        {
+            return None;
+        }
+        let oldest = self.inner.store.borrow().order.first().copied()?;
+        self.inner.paging.set(true);
+        Some(oldest)
+    }
+
+    pub fn finish_page(&self, messages: Vec<Msg>) -> Vec<i32> {
+        let adjustment = self.inner.scroll.vadjustment();
+        let saved_upper = adjustment.upper();
+        let saved_value = adjustment.value();
+        self.inner.suppress_paging.set(true);
+        let inserted = self.merge(messages);
+        self.inner.paging.set(false);
+        if inserted.is_empty() {
+            self.inner.exhausted.set(true);
+            self.inner.suppress_paging.set(false);
+            return inserted;
+        }
+        let inner = self.inner.clone();
+        self.after_upper_change(saved_upper, move |adjustment, changed| {
+            if changed {
+                let restored = saved_value + adjustment.upper() - saved_upper;
+                adjustment.set_value(restored);
+            }
+            inner.suppress_paging.set(false);
+        });
+        inserted
+    }
+
+    pub fn fail_page(&self, message: &str) {
+        self.inner.paging.set(false);
+        self.show_error(message);
+    }
+
+    pub fn fail_initial(&self, message: &str) {
+        self.inner.loading.set_visible(false);
+        self.inner.suppress_paging.set(false);
+        self.show_error(message);
+    }
+
+    pub fn trigger_pagination(&self) {
+        if let Some(callback) = self.inner.action.borrow().as_ref().cloned() {
+            callback(MessageAction::Paginate);
+        }
+    }
+
+    fn merge(&self, messages: Vec<Msg>) -> Vec<i32> {
+        let mut inserted = Vec::new();
+        for message in messages {
+            let current_chat = self.inner.store.borrow().chat_id;
+            if current_chat != Some(message.chat_id) {
+                continue;
+            }
+            let existing = self.inner.store.borrow().entries.contains_key(&message.id);
+            if existing {
+                self.update_existing(message);
+                continue;
+            }
+            let row = self.build_row(&message);
+            let media_state = MediaState::NotStarted;
+            let id = message.id;
+            self.inner.store.borrow_mut().entries.insert(
+                id,
+                MessageEntry {
+                    msg: message,
+                    row,
+                    media_state,
+                    media_retryable: false,
+                },
+            );
+            self.inner.store.borrow_mut().order.push(id);
+            inserted.push(id);
+        }
+        self.inner.store.borrow_mut().order.sort_unstable();
+        self.reorder_rows();
+        self.refresh_quotes();
+        inserted
+    }
+
+    fn build_row(&self, message: &Msg) -> MessageRow {
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        widget.add_css_class("omg-msg");
+        widget.set_hexpand(false);
+        widget.set_halign(if message.outgoing {
+            gtk::Align::End
+        } else {
+            gtk::Align::Start
+        });
+        widget.add_css_class(if message.outgoing {
+            "omg-msg-out"
+        } else {
+            "omg-msg-in"
+        });
+
+        let quote = gtk::Label::new(None);
+        quote.add_css_class("omg-msg-quote");
+        quote.set_halign(gtk::Align::Start);
+        quote.set_wrap(true);
+        quote.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        quote.set_max_width_chars(60);
+        quote.set_visible(message.reply_to.is_some());
+        widget.append(&quote);
+
+        let sender = gtk::Label::new(Some(&message.sender));
+        sender.add_css_class("omg-msg-sender");
+        sender.set_halign(gtk::Align::Start);
+        sender.set_visible(!message.sender.is_empty());
+        widget.append(&sender);
+
+        let media_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        media_slot.set_halign(if message.outgoing {
+            gtk::Align::End
+        } else {
+            gtk::Align::Start
+        });
+        widget.append(&media_slot);
+
+        let mut media_button = None;
+        match message.media {
+            Some(MediaKind::Photo | MediaKind::Sticker) => {
+                let placeholder = gtk::Label::new(Some("loading image…"));
+                placeholder.add_css_class("omg-media-placeholder");
+                media_slot.append(&placeholder);
+            }
+            Some(MediaKind::Document | MediaKind::Voice) => {
+                let label = match message.media {
+                    Some(MediaKind::Voice) => "voice message".to_string(),
+                    _ => message
+                        .doc_name
+                        .clone()
+                        .unwrap_or_else(|| "document".to_string()),
+                };
+                let button = gtk::Button::with_label(&label);
+                button.add_css_class("omg-doc-pill");
+                let action = self.inner.action.clone();
+                let msg_id = message.id;
+                button.connect_clicked(move |_| {
+                    if let Some(callback) = action.borrow().as_ref().cloned() {
+                        callback(MessageAction::Media(msg_id));
+                    }
+                });
+                media_slot.append(&button);
+                media_button = Some(button);
+            }
+            None => {}
+        }
+
+        let text = if message.text.is_empty() {
+            None
+        } else {
+            let text = message_label(&message.text);
+            widget.append(&text);
+            Some(text)
+        };
+
+        let time = gtk::Label::new(None);
+        time.add_css_class("omg-msg-time");
+        time.set_halign(gtk::Align::End);
+        set_time_label(&time, message);
+        widget.append(&time);
+
+        let reactions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        reactions.set_halign(gtk::Align::Start);
+        widget.append(&reactions);
+        let reaction_labels = Rc::new(RefCell::new(Vec::new()));
+
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3);
+        {
+            let inner = Rc::downgrade(&self.inner);
+            let msg_id = message.id;
+            gesture.connect_pressed(move |_, _, x, y| {
+                if let Some(inner) = inner.upgrade() {
+                    MessagesView::show_context_menu(&inner, msg_id, x, y);
+                }
+            });
+        }
+        widget.add_controller(gesture);
+
+        let row = MessageRow {
+            widget,
+            sender,
+            quote,
+            text: Rc::new(RefCell::new(text)),
+            time,
+            reactions,
+            reaction_labels,
+            media_slot,
+            media_button,
+        };
+        update_reactions(&row, message);
+        row
+    }
+
+    fn update_existing(&self, message: Msg) {
+        let row = {
+            let mut store = self.inner.store.borrow_mut();
+            let Some(entry) = store.entries.get_mut(&message.id) else {
+                return;
+            };
+            entry.msg = message.clone();
+            entry.row.clone()
+        };
+        row.sender.set_label(&message.sender);
+        row.sender.set_visible(!message.sender.is_empty());
+        let mut text_label = row.text.borrow_mut();
+        match (text_label.as_ref(), message.text.is_empty()) {
+            (Some(label), false) => label.set_label(&message.text),
+            (Some(label), true) => {
+                row.widget.remove(label);
+                *text_label = None;
+            }
+            (None, false) => {
+                let label = message_label(&message.text);
+                row.widget.insert_child_after(&label, Some(&row.media_slot));
+                *text_label = Some(label);
+            }
+            (None, true) => {}
+        }
+        drop(text_label);
+        set_time_label(&row.time, &message);
+        update_reactions(&row, &message);
+    }
+
+    fn reorder_rows(&self) {
+        let rows: Vec<gtk::Box> = {
+            let store = self.inner.store.borrow();
+            store
+                .order
+                .iter()
+                .filter_map(|id| store.entries.get(id).map(|entry| entry.row.widget.clone()))
+                .collect()
+        };
+        let mut previous: Option<gtk::Widget> = None;
+        for row in rows {
+            if row.parent().is_none() {
+                self.inner.list.append(&row);
+            }
+            self.inner.list.reorder_child_after(&row, previous.as_ref());
+            previous = Some(row.upcast());
+        }
+    }
+
+    fn refresh_quotes(&self) {
+        let (quoted, rows) = {
+            let store = self.inner.store.borrow();
+            let quoted: HashMap<i32, (String, String)> = store
+                .entries
+                .iter()
+                .map(|(&id, entry)| (id, (entry.msg.sender.clone(), entry.msg.text.clone())))
+                .collect();
+            let rows: Vec<(Option<i32>, gtk::Label)> = store
+                .entries
+                .values()
+                .map(|entry| (entry.msg.reply_to, entry.row.quote.clone()))
+                .collect();
+            (quoted, rows)
+        };
+        for (reply_to, quote) in rows {
+            let Some(reply_to) = reply_to else {
+                quote.set_visible(false);
+                continue;
+            };
+            let label = quoted
+                .get(&reply_to)
+                .map(|(sender, text)| {
+                    let sender = if sender.is_empty() { "Unknown" } else { sender };
+                    format!("{}: {}", sender, snippet(text, 60))
+                })
+                .unwrap_or_else(|| "replied message".to_string());
+            quote.set_label(&label);
+            quote.set_visible(true);
+        }
+    }
+
+    fn show_context_menu(inner: &Rc<MessagesInner>, msg_id: i32, x: f64, y: f64) {
+        let snapshot = inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .map(|entry| entry.msg.clone());
+        let Some(message) = snapshot else { return };
+        let row = inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .map(|entry| entry.row.widget.clone());
+        let Some(row) = row else { return };
+
+        let popover = gtk::Popover::new();
+        popover.add_css_class("omg-menu");
+        popover.set_has_arrow(false);
+        popover.set_parent(&row);
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        popover.set_child(Some(&menu));
+        popover.connect_closed(|popover| popover.unparent());
+
+        let copy = menu_button("Copy", false);
+        {
+            let clipboard = row.clipboard();
+            let text = message.text.clone();
+            let popover = popover.downgrade();
+            copy.connect_clicked(move |_| {
+                clipboard.set_text(&text);
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+            });
+        }
+        menu.append(&copy);
+
+        let reply = menu_button("Reply", false);
+        Self::connect_menu_action(inner, &reply, &popover, MessageAction::Reply(msg_id));
+        menu.append(&reply);
+
+        if message.outgoing && message.media.is_none() && !message.text.is_empty() {
+            let edit = menu_button("Edit", false);
+            Self::connect_menu_action(inner, &edit, &popover, MessageAction::Edit(msg_id));
+            menu.append(&edit);
+        }
+        if message.outgoing {
+            let delete = menu_button("Delete", true);
+            Self::connect_menu_action(inner, &delete, &popover, MessageAction::Delete(msg_id));
+            menu.append(&delete);
+        }
+        popover.popup();
+    }
+
+    fn connect_menu_action(
+        inner: &Rc<MessagesInner>,
+        button: &gtk::Button,
+        popover: &gtk::Popover,
+        message_action: MessageAction,
+    ) {
+        let action = inner.action.clone();
+        let popover = popover.downgrade();
+        button.connect_clicked(move |_| {
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
+            if let Some(callback) = action.borrow().as_ref().cloned() {
+                callback(message_action.clone());
+            }
+        });
+    }
+
+    pub fn begin_reply(&self, msg_id: i32) {
+        if self.inner.edit.borrow().is_some() {
+            self.cancel_edit();
+        }
+        let Some(message) = self.message(msg_id) else {
+            return;
+        };
+        let sender = if message.sender.is_empty() {
+            "Unknown"
+        } else {
+            &message.sender
+        };
+        self.inner.reply_to.set(Some(msg_id));
+        self.inner.reply_label.set_label(&format!(
+            "Reply to {}: {}",
+            sender,
+            snippet(&message.text, 60)
+        ));
+        self.inner.reply_bar.set_visible(true);
+        self.focus_composer();
+    }
+
+    pub fn begin_edit(&self, msg_id: i32) {
+        let Some(message) = self.message(msg_id) else {
+            return;
+        };
+        if !message.outgoing || message.media.is_some() || message.text.is_empty() {
+            return;
+        }
+        self.cancel_reply();
+        if self.inner.edit.borrow().is_some() {
+            self.cancel_edit();
+        }
+        let draft = self.composer_text();
+        *self.inner.edit.borrow_mut() = Some(EditMode { msg_id, draft });
+        self.set_composer_text(&message.text);
+        self.inner.edit_bar.set_visible(true);
+        self.focus_composer();
+    }
+
+    pub fn cancel_mode(&self) -> bool {
+        if self.inner.edit.borrow().is_some() {
+            self.cancel_edit();
+            true
+        } else if self.inner.reply_to.get().is_some() {
+            self.cancel_reply();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cancel_all_modes(&self) {
+        self.cancel_edit();
+        self.cancel_reply();
+    }
+
+    pub fn prepare_attachment(&self) {
+        self.cancel_reply();
+    }
+
+    fn cancel_reply(&self) {
+        self.inner.reply_to.set(None);
+        self.inner.reply_bar.set_visible(false);
+    }
+
+    fn cancel_edit(&self) {
+        let edit = self.inner.edit.borrow_mut().take();
+        if let Some(edit) = edit {
+            self.set_composer_text(&edit.draft);
+        }
+        self.inner.edit_bar.set_visible(false);
+    }
+
+    pub fn complete_text_operation(&self, snapshot_text: &str, epoch_is_current: bool) {
+        if self.composer_text() != snapshot_text {
+            return;
+        }
+        self.set_composer_text("");
+        if !epoch_is_current {
+            return;
+        }
+        self.inner.edit.borrow_mut().take();
+        self.inner.edit_bar.set_visible(false);
+        self.cancel_reply();
+    }
+
+    pub fn composer_text(&self) -> String {
+        let buffer = self.inner.composer.buffer();
+        buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), true)
+            .to_string()
+    }
+
+    pub fn set_composer_text(&self, text: &str) {
+        self.inner.composer.buffer().set_text(text);
+    }
+
+    pub fn reply_to(&self) -> Option<i32> {
+        self.inner.reply_to.get()
+    }
+
+    pub fn edit_id(&self) -> Option<i32> {
+        self.inner.edit.borrow().as_ref().map(|edit| edit.msg_id)
+    }
+
+    pub fn set_busy(&self, busy: bool) {
+        self.inner.busy.set(busy);
+        self.inner.composer.set_sensitive(!busy);
+        self.inner.attach.set_sensitive(!busy);
+        self.inner.drop_target.set_actions(if busy {
+            gdk::DragAction::empty()
+        } else {
+            gdk::DragAction::COPY
+        });
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.inner.busy.get()
+    }
+
+    pub fn focus_composer(&self) {
+        self.inner.composer.grab_focus();
+    }
+
+    pub fn show_error(&self, message: &str) {
+        self.inner.error.set_label(message);
+        self.inner.error.set_visible(true);
+    }
+
+    pub fn clear_error(&self) {
+        self.inner.error.set_visible(false);
+        self.inner.error.set_label("");
+    }
+
+    pub fn message(&self, msg_id: i32) -> Option<Msg> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .map(|entry| entry.msg.clone())
+    }
+
+    pub fn last_message(&self) -> Option<Msg> {
+        let store = self.inner.store.borrow();
+        store
+            .order
+            .last()
+            .and_then(|id| store.entries.get(id))
+            .map(|entry| entry.msg.clone())
+    }
+
+    pub fn last_before(&self, msg_id: i32) -> Option<Msg> {
+        let store = self.inner.store.borrow();
+        store
+            .order
+            .iter()
+            .rev()
+            .filter(|id| **id != msg_id)
+            .find_map(|id| store.entries.get(id))
+            .map(|entry| entry.msg.clone())
+    }
+
+    pub fn is_last(&self, msg_id: i32) -> bool {
+        self.inner.store.borrow().order.last() == Some(&msg_id)
+    }
+
+    pub fn remove(&self, msg_id: i32) -> Option<Msg> {
+        let entry = {
+            let mut store = self.inner.store.borrow_mut();
+            let entry = store.entries.remove(&msg_id)?;
+            store.order.retain(|id| *id != msg_id);
+            entry
+        };
+        self.inner.list.remove(&entry.row.widget);
+        self.refresh_quotes();
+        Some(entry.msg)
+    }
+
+    pub fn contains(&self, msg_id: i32) -> bool {
+        self.inner.store.borrow().entries.contains_key(&msg_id)
+    }
+
+    pub fn contains_text(&self, text: &str) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .values()
+            .any(|entry| entry.msg.text == text)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.store.borrow().order.len()
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.inner.loading.is_visible() && self.inner.loading.label() == "Loading…"
+    }
+
+    pub fn pagination_ready(&self) -> bool {
+        !self.inner.loading.is_visible()
+            && !self.inner.paging.get()
+            && !self.inner.suppress_paging.get()
+    }
+
+    pub fn find_outgoing_text(&self, text: &str) -> Option<i32> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .values()
+            .find(|entry| entry.msg.outgoing && entry.msg.text == text)
+            .map(|entry| entry.msg.id)
+    }
+
+    pub fn begin_media(&self, msg_id: i32) -> Option<MediaKind> {
+        let (kind, button) = {
+            let mut store = self.inner.store.borrow_mut();
+            let entry = store.entries.get_mut(&msg_id)?;
+            let may_start = matches!(entry.media_state, MediaState::NotStarted)
+                || matches!(entry.media_state, MediaState::Failed) && entry.media_retryable;
+            if !may_start {
+                return None;
+            }
+            let kind = entry.msg.media?;
+            entry.media_state = MediaState::InFlight;
+            entry.media_retryable = false;
+            (kind, entry.row.media_button.clone())
+        };
+        if let Some(button) = button {
+            button.set_sensitive(false);
+        }
+        Some(kind)
+    }
+
+    pub fn media_state(&self, msg_id: i32) -> Option<MediaState> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .map(|entry| entry.media_state.clone())
+    }
+
+    pub fn media_kind(&self, msg_id: i32) -> Option<MediaKind> {
+        self.message(msg_id).and_then(|message| message.media)
+    }
+
+    pub fn finish_image(&self, msg_id: i32, path: PathBuf, texture: &gdk::Texture) -> bool {
+        let should_stick = self.inner.stick_to_bottom.get();
+        let adjustment = self.inner.scroll.vadjustment();
+        let saved_upper = adjustment.upper();
+        if should_stick {
+            self.inner.suppress_paging.set(true);
+        }
+        let (media_slot, outgoing) = {
+            let mut store = self.inner.store.borrow_mut();
+            let Some(entry) = store.entries.get_mut(&msg_id) else {
+                if should_stick {
+                    self.inner.suppress_paging.set(false);
+                }
+                return false;
+            };
+            entry.media_state = MediaState::Done(path);
+            (entry.row.media_slot.clone(), entry.msg.outgoing)
+        };
+        while let Some(child) = media_slot.first_child() {
+            media_slot.remove(&child);
+        }
+        let picture = gtk::Picture::for_paintable(texture);
+        picture.set_can_shrink(true);
+        picture.set_hexpand(false);
+        picture.set_halign(if outgoing {
+            gtk::Align::End
+        } else {
+            gtk::Align::Start
+        });
+        let width = texture.width().max(1);
+        let height = texture.height().max(1);
+        let scale = (320.0 / width as f64).min(320.0 / height as f64).min(1.0);
+        picture.set_size_request(
+            (width as f64 * scale).round() as i32,
+            (height as f64 * scale).round() as i32,
+        );
+        let action = self.inner.action.clone();
+        let gesture = gtk::GestureClick::new();
+        gesture.connect_released(move |_, _, _, _| {
+            if let Some(callback) = action.borrow().as_ref().cloned() {
+                callback(MessageAction::Media(msg_id));
+            }
+        });
+        picture.add_controller(gesture);
+        media_slot.append(&picture);
+        if should_stick {
+            let inner = self.inner.clone();
+            self.after_upper_change(saved_upper, move |adjustment, changed| {
+                if changed {
+                    adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
+                }
+                inner.stick_to_bottom.set(true);
+                inner.suppress_paging.set(false);
+            });
+        }
+        true
+    }
+
+    pub fn finish_media_path(&self, msg_id: i32, path: PathBuf) -> bool {
+        let button = {
+            let mut store = self.inner.store.borrow_mut();
+            let Some(entry) = store.entries.get_mut(&msg_id) else {
+                return false;
+            };
+            entry.media_state = MediaState::Done(path);
+            entry.row.media_button.clone()
+        };
+        if let Some(button) = button {
+            button.set_sensitive(true);
+        }
+        true
+    }
+
+    pub fn fail_media(&self, msg_id: i32, retryable: bool) -> bool {
+        let (kind, media_slot, button, base) = {
+            let mut store = self.inner.store.borrow_mut();
+            let Some(entry) = store.entries.get_mut(&msg_id) else {
+                return false;
+            };
+            entry.media_state = MediaState::Failed;
+            entry.media_retryable = retryable;
+            let kind = entry.msg.media;
+            let base = match kind {
+                Some(MediaKind::Voice) => Some("voice message".to_string()),
+                Some(MediaKind::Document) => Some(
+                    entry
+                        .msg
+                        .doc_name
+                        .clone()
+                        .unwrap_or_else(|| "document".to_string()),
+                ),
+                _ => None,
+            };
+            (
+                kind,
+                entry.row.media_slot.clone(),
+                entry.row.media_button.clone(),
+                base,
+            )
+        };
+        match kind {
+            Some(MediaKind::Photo | MediaKind::Sticker) => {
+                while let Some(child) = media_slot.first_child() {
+                    media_slot.remove(&child);
+                }
+                let label = gtk::Label::new(Some("image unavailable"));
+                label.add_css_class("omg-media-placeholder");
+                media_slot.append(&label);
+            }
+            Some(MediaKind::Document | MediaKind::Voice) => {
+                if let (Some(button), Some(base)) = (button, base) {
+                    button.set_label(&format!("{base} (unavailable)"));
+                    button.set_sensitive(retryable);
+                }
+            }
+            None => {}
+        }
+        true
+    }
+
+    pub fn set_typing(&self, name: &str) -> u64 {
+        let generation = self.inner.typing_generation.get().wrapping_add(1);
+        self.inner.typing_generation.set(generation);
+        let label = if name.is_empty() {
+            "typing…".to_string()
+        } else {
+            format!("{name} is typing…")
+        };
+        self.inner.typing.set_label(&label);
+        self.inner.typing.set_visible(true);
+        generation
+    }
+
+    pub fn clear_typing_if(&self, generation: u64) {
+        if self.inner.typing_generation.get() == generation {
+            self.inner.typing.set_visible(false);
+            self.inner.typing.set_label("");
+        }
+    }
+
+    pub fn clear_typing(&self) {
+        self.inner
+            .typing_generation
+            .set(self.inner.typing_generation.get().wrapping_add(1));
+        self.inner.typing.set_visible(false);
+        self.inner.typing.set_label("");
+    }
+
+    pub fn typing_generation(&self) -> u64 {
+        self.inner.typing_generation.get()
+    }
+}
+
+fn set_time_label(label: &gtk::Label, message: &Msg) {
+    let edited = if message.edited { " edited" } else { "" };
+    label.set_label(&format!("{}{}", message.ts.format("%H:%M"), edited));
+}
+
+fn message_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_halign(gtk::Align::Start);
+    label.set_selectable(true);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_max_width_chars(60);
+    label
+}
+
+fn update_reactions(row: &MessageRow, message: &Msg) {
+    let mut labels = row.reaction_labels.borrow_mut();
+    while labels.len() < message.reactions.len() {
+        let label = gtk::Label::new(None);
+        label.add_css_class("omg-reaction");
+        row.reactions.append(&label);
+        labels.push(label);
+    }
+    for (index, label) in labels.iter().enumerate() {
+        let Some(reaction) = message.reactions.get(index) else {
+            label.set_visible(false);
+            continue;
+        };
+        let text = if reaction.count == 1 {
+            reaction.emoji.clone()
+        } else {
+            format!("{} {}", reaction.emoji, reaction.count)
+        };
+        label.set_label(&text);
+        label.set_visible(true);
+    }
+    row.reactions.set_visible(!message.reactions.is_empty());
+}
+
+fn menu_button(label: &str, danger: bool) -> gtk::Button {
+    let button = gtk::Button::with_label(label);
+    button.add_css_class("omg-menu-item");
+    if danger {
+        button.add_css_class("omg-danger");
+    }
+    button.set_halign(gtk::Align::Fill);
+    button
+}
+
+fn snippet(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
