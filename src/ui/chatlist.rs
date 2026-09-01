@@ -31,6 +31,7 @@ pub struct ChatList {
     list: gtk::ListBox,
     rows: Rc<RefCell<HashMap<i64, ChatRow>>>,
     order: Rc<RefCell<Vec<i64>>>,
+    virtual_order: Rc<RefCell<Vec<i64>>>,
     selected: Rc<Cell<Option<i64>>>,
     on_open: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
 }
@@ -55,6 +56,7 @@ impl ChatList {
 
         let rows = Rc::new(RefCell::new(HashMap::<i64, ChatRow>::new()));
         let order = Rc::new(RefCell::new(Vec::<i64>::new()));
+        let virtual_order = Rc::new(RefCell::new(Vec::<i64>::new()));
         let selected = Rc::new(Cell::new(None));
         let on_open: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>> = Rc::new(RefCell::new(None));
 
@@ -83,6 +85,7 @@ impl ChatList {
             list,
             rows,
             order,
+            virtual_order,
             selected,
             on_open,
         }
@@ -94,12 +97,13 @@ impl ChatList {
 
     pub fn set_chats(&self, chats: Vec<ChatSummary>) {
         let supplied: HashSet<i64> = chats.iter().map(|chat| chat.id).collect();
+        let virtual_ids: HashSet<i64> = self.virtual_order.borrow().iter().copied().collect();
         let preserved: Vec<i64> = self
             .order
             .borrow()
             .iter()
             .copied()
-            .filter(|id| !supplied.contains(id))
+            .filter(|id| !supplied.contains(id) && !virtual_ids.contains(id))
             .collect();
         for chat in &chats {
             self.ensure_row(chat.id, &chat.title);
@@ -111,9 +115,50 @@ impl ChatList {
                 UnreadUpdate::Set(chat.unread),
             );
         }
-        let mut new_order: Vec<i64> = chats.into_iter().map(|chat| chat.id).collect();
+        let mut new_order = self.virtual_order.borrow().clone();
+        new_order.extend(chats.into_iter().map(|chat| chat.id));
         new_order.extend(preserved);
         *self.order.borrow_mut() = new_order;
+        self.reorder_widgets();
+    }
+
+    /// Replace the reserved prefix of local virtual chats. Real rows retain
+    /// their widgets and relative order below this prefix.
+    pub fn set_virtual(&self, rows: Vec<(i64, String, String)>) {
+        let wanted: HashSet<i64> = rows.iter().map(|(id, _, _)| *id).collect();
+        let old = self.virtual_order.borrow().clone();
+        for chat_id in old.into_iter().filter(|id| !wanted.contains(id)) {
+            let removed = self.rows.borrow_mut().remove(&chat_id);
+            if let Some(row) = removed {
+                self.list.remove(&row.widget);
+            }
+            self.order.borrow_mut().retain(|id| *id != chat_id);
+            if self.selected.get() == Some(chat_id) {
+                self.selected.set(None);
+                self.list.unselect_all();
+            }
+        }
+
+        let mut virtual_order = Vec::with_capacity(rows.len());
+        for (chat_id, title, preview) in rows {
+            self.ensure_row(chat_id, &title);
+            if let Some(row) = self.rows.borrow().get(&chat_id) {
+                row.widget.add_css_class("omg-virtual");
+            }
+            self.update_row(chat_id, &title, &preview, None, UnreadUpdate::Set(0));
+            virtual_order.push(chat_id);
+        }
+        *self.virtual_order.borrow_mut() = virtual_order.clone();
+        let virtual_ids: HashSet<i64> = virtual_order.iter().copied().collect();
+        let real: Vec<i64> = self
+            .order
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|id| !virtual_ids.contains(id))
+            .collect();
+        virtual_order.extend(real);
+        *self.order.borrow_mut() = virtual_order;
         self.reorder_widgets();
     }
 
@@ -130,7 +175,17 @@ impl ChatList {
         {
             let mut order = self.order.borrow_mut();
             order.retain(|id| *id != chat_id);
-            order.insert(0, chat_id);
+            if self.virtual_order.borrow().contains(&chat_id) {
+                let index = self
+                    .virtual_order
+                    .borrow()
+                    .iter()
+                    .position(|id| *id == chat_id)
+                    .unwrap_or(0);
+                order.insert(index, chat_id);
+            } else {
+                order.insert(self.virtual_order.borrow().len(), chat_id);
+            }
         }
         self.reorder_widgets();
     }

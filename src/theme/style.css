@@ -59,6 +59,10 @@ window.omg-window {
   border-left: 2px solid var(--accent);
 }
 
+.omg-chat-row.omg-virtual {
+  border-left-color: var(--accent);
+}
+
 .omg-chat-title {
   color: var(--fg);
 }
@@ -103,6 +107,11 @@ window.omg-window {
 .omg-msg-out {
   background-color: var(--bg-dark);
   border-left: 2px solid var(--accent);
+}
+
+.omg-msg-mono,
+.omg-msg-mono label {
+  font-family: "JetBrainsMono Nerd Font", monospace;
 }
 
 .omg-msg-sender {
