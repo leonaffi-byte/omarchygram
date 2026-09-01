@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 
 use crate::settings::{Settings, SettingsStore};
-use crate::tg::{AuthState, BackendFlags, Event, MediaKind, Msg, SETUP_HELP, Tg};
+use crate::tg::{AuthState, BackendFlags, Event, MediaKind, Msg, Tg, SETUP_HELP};
 
 use super::auth::{AuthAction, AuthView};
 use super::chatlist::{ChatList, UnreadUpdate};
@@ -31,6 +31,12 @@ struct ReadState {
     in_flight: bool,
     latest: i32,
     sent_through: i32,
+}
+
+#[derive(Clone, Copy)]
+struct FlagsRequest {
+    flags: BackendFlags,
+    generation: u64,
 }
 
 struct ShellInner {
@@ -52,12 +58,18 @@ struct ShellInner {
     started: Cell<bool>,
     dialogs_loaded: Cell<bool>,
     dialogs_in_flight: Cell<bool>,
+    dialogs_refresh_again: Cell<bool>,
     window_hooked: Cell<bool>,
     composer_operation: Cell<bool>,
     mark_reads: RefCell<HashMap<i64, ReadState>>,
     last_by_chat: RefCell<HashMap<i64, Msg>>,
+    settings_gen: Cell<u64>,
+    tombstones: RefCell<HashMap<i64, HashSet<i32>>>,
+    flags_initialized: Cell<bool>,
+    desired_flags: Cell<BackendFlags>,
+    anti_reload_pending: Cell<bool>,
     flags_in_flight: Cell<bool>,
-    flags_pending: RefCell<Option<BackendFlags>>,
+    flags_pending: RefCell<Option<FlagsRequest>>,
     typing_timeout: RefCell<Option<glib::SourceId>>,
     probe_started: Cell<bool>,
     auth_probe_started: Cell<bool>,
@@ -133,10 +145,16 @@ impl Shell {
             started: Cell::new(false),
             dialogs_loaded: Cell::new(false),
             dialogs_in_flight: Cell::new(false),
+            dialogs_refresh_again: Cell::new(false),
             window_hooked: Cell::new(false),
             composer_operation: Cell::new(false),
             mark_reads: RefCell::new(HashMap::new()),
             last_by_chat: RefCell::new(HashMap::new()),
+            settings_gen: Cell::new(0),
+            tombstones: RefCell::new(HashMap::new()),
+            flags_initialized: Cell::new(false),
+            desired_flags: Cell::new(BackendFlags::default()),
+            anti_reload_pending: Cell::new(false),
             flags_in_flight: Cell::new(false),
             flags_pending: RefCell::new(None),
             typing_timeout: RefCell::new(None),
@@ -326,36 +344,64 @@ impl ShellInner {
     /// Push settings into the UI and the backend (clock, ghost pill, message
     /// time format, backend flags). Called on READY and on every change.
     fn apply_settings(self: &Rc<Self>, settings: &Settings) {
+        let generation = self.settings_gen.get().wrapping_add(1);
+        self.settings_gen.set(generation);
         self.messages.set_time_format(settings.time_format());
         self.messages.set_ghost(settings.ghost_mode);
+        self.messages.set_edit_history(settings.edit_history);
         self.update_clock(settings.header_clock);
-        self.push_flags(BackendFlags {
+        let flags = BackendFlags {
             ghost_mode: settings.ghost_mode,
             anti_delete: settings.anti_delete,
-        });
+        };
+        let previous = self.desired_flags.replace(flags);
+        let initialized = self.flags_initialized.replace(true);
+        if initialized && previous.anti_delete != flags.anti_delete {
+            self.anti_reload_pending.set(true);
+            if !flags.anti_delete {
+                self.tombstones.borrow_mut().clear();
+            }
+        }
+        // Forward on every store change. Besides keeping the backend snapshot
+        // explicit, this guarantees a current-generation completion exists if
+        // an unrelated setting changes while an anti-delete flip is in flight.
+        self.push_flags(FlagsRequest { flags, generation });
     }
 
-    /// Coalesced set_flags: at most one call in flight. While a call is in
-    /// flight, newer values replace the pending one; a completion sends the
-    /// latest pending value next, so the backend never ends up with a stale
-    /// (older-completing-later) flag state.
-    fn push_flags(self: &Rc<Self>, flags: BackendFlags) {
+    /// Coalesced set_flags: flags reach the backend before any anti-delete
+    /// reload. Generation checks discard stale completions, while serialization
+    /// prevents an older backend call from completing after a newer one (D1).
+    fn push_flags(self: &Rc<Self>, request: FlagsRequest) {
         if self.flags_in_flight.get() {
-            *self.flags_pending.borrow_mut() = Some(flags);
+            *self.flags_pending.borrow_mut() = Some(request);
             return;
         }
         self.flags_in_flight.set(true);
         let tg = self.tg.clone();
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
-            if let Err(error) = tg.set_flags(flags).await {
-                eprintln!("set_flags: {error}");
-            }
+            let result = tg.set_flags(request.flags).await;
             let Some(this) = weak.upgrade() else { return };
             this.flags_in_flight.set(false);
+            match result {
+                Ok(()) if request.generation == this.settings_gen.get() => {
+                    if this.anti_reload_pending.replace(false) {
+                        if let Some(chat_id) = this.open_chat.get() {
+                            this.clone().force_reload(chat_id);
+                        }
+                    }
+                }
+                Ok(()) => {
+                    // A newer settings snapshot is queued (or already sent),
+                    // so this completion must not reload data.
+                }
+                Err(error) => {
+                    eprintln!("set_flags: {error}");
+                }
+            }
             let pending = this.flags_pending.borrow_mut().take();
-            if let Some(flags) = pending {
-                this.push_flags(flags);
+            if let Some(request) = pending {
+                this.push_flags(request);
             }
         });
     }
@@ -412,6 +458,7 @@ impl ShellInner {
 
     fn load_dialogs(self: &Rc<Self>) {
         if self.dialogs_in_flight.replace(true) {
+            self.dialogs_refresh_again.set(true);
             return;
         }
         let this = self.clone();
@@ -474,6 +521,9 @@ impl ShellInner {
                     this.dialogs_error_box.set_visible(true);
                 }
             }
+            if this.dialogs_refresh_again.replace(false) {
+                this.load_dialogs();
+            }
         });
     }
 
@@ -512,11 +562,12 @@ impl ShellInner {
         match event {
             Event::NewMessage(message) => self.handle_new_message(message),
             Event::MessageChanged(message) => {
+                let message = self.apply_tombstone(message);
                 if self.open_chat.get() == Some(message.chat_id) {
                     let was_last = self.messages.is_last(message.id);
                     let inserted = self.messages.merge_event(message.clone());
                     self.start_image_downloads(inserted);
-                    if was_last {
+                    if was_last && !message.deleted {
                         self.remember_last(&message);
                         self.chatlist.upsert(
                             message.chat_id,
@@ -529,32 +580,74 @@ impl ShellInner {
                 }
             }
             Event::MessageDeleted { chat_id, msg_ids } => {
-                // Default (anti-delete off): drop the rows, reconciling the
-                // sidebar preview when the deleted message was the last one.
-                if self.open_chat.get() == Some(chat_id) {
-                    let title = self.title_for(chat_id);
-                    for msg_id in msg_ids {
-                        let was_last = self.messages.is_last(msg_id);
-                        let next_last = was_last
-                            .then(|| self.messages.last_before(msg_id))
-                            .flatten();
-                        if was_last {
-                            let reconciled =
-                                self.reconcile_deleted_last(chat_id, msg_id, next_last);
-                            let (preview, time) = reconciled
-                                .as_ref()
-                                .map(|m| (message_preview(m), Some(m.ts)))
-                                .unwrap_or_else(|| (String::new(), None));
-                            self.chatlist.upsert(
-                                chat_id,
-                                &title,
-                                &preview,
-                                time,
-                                UnreadUpdate::Delta(0),
-                            );
+                let is_open = self.open_chat.get() == Some(chat_id);
+                let anti_delete = self.settings.get().anti_delete;
+                let tracked_last = self
+                    .last_by_chat
+                    .borrow()
+                    .get(&chat_id)
+                    .map(|message| message.id);
+                let tracked_was_deleted = tracked_last
+                    .is_some_and(|tracked| msg_ids.iter().any(|msg_id| *msg_id == tracked));
+
+                if anti_delete {
+                    self.tombstones
+                        .borrow_mut()
+                        .entry(chat_id)
+                        .or_default()
+                        .extend(msg_ids.iter().copied());
+                    if is_open {
+                        for msg_id in &msg_ids {
+                            self.messages.mark_deleted(*msg_id);
                         }
-                        self.messages.remove(msg_id);
                     }
+                } else if is_open {
+                    // Anti-delete off: remove rows and retain the established
+                    // last-message/sidebar reconciliation behavior.
+                    let title = self.title_for(chat_id);
+                    let store_last_was_deleted = self
+                        .messages
+                        .last_message()
+                        .is_some_and(|message| msg_ids.contains(&message.id));
+                    for msg_id in &msg_ids {
+                        self.messages.remove(*msg_id);
+                    }
+                    if tracked_was_deleted || store_last_was_deleted {
+                        let next_last = self.messages.last_message();
+                        let reconciled = if let Some(deleted_id) =
+                            tracked_last.filter(|tracked| msg_ids.contains(tracked))
+                        {
+                            self.reconcile_deleted_last(chat_id, deleted_id, next_last)
+                        } else {
+                            let mut last_by_chat = self.last_by_chat.borrow_mut();
+                            if let Some(message) = next_last {
+                                last_by_chat.insert(chat_id, message.clone());
+                                Some(message)
+                            } else {
+                                last_by_chat.remove(&chat_id);
+                                None
+                            }
+                        };
+                        let (preview, time) = reconciled
+                            .as_ref()
+                            .map(|message| (message_preview(message), Some(message.ts)))
+                            .unwrap_or_else(|| (String::new(), None));
+                        self.chatlist.upsert(
+                            chat_id,
+                            &title,
+                            &preview,
+                            time,
+                            UnreadUpdate::Delta(0),
+                        );
+                    }
+                }
+
+                // A closed chat has no complete message store to reconcile.
+                // Drop the stale tracked preview and let dialogs provide the
+                // authoritative new last message, with refreshes coalesced.
+                if !is_open && tracked_was_deleted {
+                    self.last_by_chat.borrow_mut().remove(&chat_id);
+                    self.load_dialogs();
                 }
             }
             Event::Typing { chat_id, name } => {
@@ -581,32 +674,35 @@ impl ShellInner {
     }
 
     fn handle_new_message(self: &Rc<Self>, message: Msg) {
+        let message = self.apply_tombstone(message);
         let active = self.window_is_active();
         let is_open = self.open_chat.get() == Some(message.chat_id);
         let read_triggered = is_open && active;
         // Outgoing = sent from the user's own other device: show it (the store
         // dedupes against local sends by id), but never notify or count unread.
         let own = message.outgoing;
-        self.remember_last(&message);
-        self.chatlist.upsert(
-            message.chat_id,
-            &chat_title(&message),
-            &message_preview(&message),
-            Some(message.ts),
-            if own || read_triggered {
-                UnreadUpdate::Delta(0)
-            } else {
-                UnreadUpdate::Delta(1)
-            },
-        );
+        if !message.deleted {
+            self.remember_last(&message);
+            self.chatlist.upsert(
+                message.chat_id,
+                &chat_title(&message),
+                &message_preview(&message),
+                Some(message.ts),
+                if own || read_triggered {
+                    UnreadUpdate::Delta(0)
+                } else {
+                    UnreadUpdate::Delta(1)
+                },
+            );
+        }
         if is_open {
             let inserted = self.messages.merge_event(message.clone());
             self.start_image_downloads(inserted);
-            if read_triggered && !own {
+            if read_triggered && !own && !message.deleted {
                 self.queue_mark_read(message.chat_id, message.id, self.epoch.get());
             }
         }
-        if !own && (!active || !is_open) {
+        if !own && !message.deleted && (!active || !is_open) {
             self.notify(&message);
         }
     }
@@ -650,31 +746,51 @@ impl ShellInner {
         self.chatlist.select_chat(chat_id);
         let title = self.title_for(chat_id);
         self.messages.reset_chat(chat_id, &title, epoch);
-        let this = self.clone();
+        self.start_initial_load(chat_id, epoch);
+    }
+
+    /// Reload the current chat even when it is already open. This is the data
+    /// half of the flags-before-data anti-delete transition (D2).
+    fn force_reload(self: Rc<Self>, chat_id: i64) {
+        if self.open_chat.get() != Some(chat_id) {
+            return;
+        }
+        let epoch = self.bump_epoch();
+        let title = self.title_for(chat_id);
+        self.messages.reset_chat(chat_id, &title, epoch);
+        self.start_initial_load(chat_id, epoch);
+    }
+
+    // History completions are guarded by EPOCH only (C1). They are not
+    // settings_gen-guarded on purpose: the merge already applies the CURRENT
+    // anti-delete flag (apply_tombstones), an anti-delete flip force_reloads
+    // (new epoch), and a gen-discard would strand Loading…/paging (C3).
+    fn start_initial_load(self: Rc<Self>, chat_id: i64, epoch: u64) {
         glib::MainContext::default().spawn_local(async move {
-            match this.tg.get_history(chat_id, None).await {
-                Ok(messages) => {
-                    if !this.is_current(chat_id, epoch) {
+            match self.tg.get_history(chat_id, None).await {
+                Ok(mut messages) => {
+                    if !self.is_current(chat_id, epoch) {
                         return;
                     }
-                    if let Some(last) = messages.last() {
-                        this.remember_last(last);
+                    self.apply_tombstones(chat_id, &mut messages);
+                    if let Some(last) = messages.iter().rev().find(|message| !message.deleted) {
+                        self.remember_last(last);
                     }
-                    let inserted = this.messages.finish_initial(messages);
-                    this.start_image_downloads(inserted);
-                    if this.window_is_active() {
-                        let latest = this
+                    let inserted = self.messages.finish_initial(messages);
+                    self.start_image_downloads(inserted);
+                    if self.window_is_active() {
+                        let latest = self
                             .messages
                             .last_message()
                             .map(|message| message.id)
                             .unwrap_or(0);
-                        this.queue_mark_read(chat_id, latest, epoch);
+                        self.queue_mark_read(chat_id, latest, epoch);
                     }
                 }
                 Err(error) => {
                     eprintln!("get_history({chat_id}): {error}");
-                    if this.is_current(chat_id, epoch) {
-                        this.messages.fail_initial(&error);
+                    if self.is_current(chat_id, epoch) {
+                        self.messages.fail_initial(&error);
                     }
                 }
             }
@@ -691,10 +807,11 @@ impl ShellInner {
         let epoch = self.epoch.get();
         glib::MainContext::default().spawn_local(async move {
             match self.tg.get_history(chat_id, Some(before_id)).await {
-                Ok(messages) => {
+                Ok(mut messages) => {
                     if !self.is_current(chat_id, epoch) {
                         return;
                     }
+                    self.apply_tombstones(chat_id, &mut messages);
                     let inserted = self.messages.finish_page(messages);
                     self.start_image_downloads(inserted);
                 }
@@ -721,6 +838,7 @@ impl ShellInner {
             }
             MessageAction::Reply(msg_id) => self.messages.begin_reply(msg_id),
             MessageAction::Edit(msg_id) => self.messages.begin_edit(msg_id),
+            MessageAction::EditHistory(msg_id) => self.open_edit_history(msg_id),
             MessageAction::Delete(msg_id) => self.delete_message(msg_id),
             MessageAction::Media(msg_id) => self.media_action(msg_id),
             MessageAction::Paginate => self.paginate(),
@@ -748,6 +866,40 @@ impl ShellInner {
         }
     }
 
+    fn open_edit_history(self: Rc<Self>, msg_id: i32) {
+        let Some(chat_id) = self.open_chat.get() else {
+            return;
+        };
+        let Some(message) = self.messages.message(msg_id) else {
+            return;
+        };
+        if message.deleted || !message.edited || !self.settings.get().edit_history {
+            return;
+        }
+        let epoch = self.epoch.get();
+        let settings_gen = self.settings_gen.get();
+        glib::MainContext::default().spawn_local(async move {
+            let result = self.tg.get_edit_history(chat_id, msg_id).await;
+            let valid = self.is_current(chat_id, epoch)
+                && self.settings_gen.get() == settings_gen
+                && self.settings.get().edit_history
+                && self.messages.contains(msg_id)
+                && !self.messages.is_deleted(msg_id);
+            if !valid {
+                return;
+            }
+            match result {
+                Ok(versions) => {
+                    self.messages.show_edit_history(msg_id, versions);
+                }
+                Err(error) => {
+                    eprintln!("get_edit_history({chat_id}, {msg_id}): {error}");
+                    self.messages.show_error(&error);
+                }
+            }
+        });
+    }
+
     /// Jump-to-date: re-render the open chat around a historical day. The view
     /// stays `detached` (▼ always visible) until the user reloads the latest
     /// page; pagination upward from the jumped page keeps working (C3).
@@ -762,10 +914,11 @@ impl ShellInner {
         let this = self.clone();
         glib::MainContext::default().spawn_local(async move {
             match this.tg.get_history_at_date(chat_id, date).await {
-                Ok(messages) => {
+                Ok(mut messages) => {
                     if !this.is_current(chat_id, epoch) {
                         return;
                     }
+                    this.apply_tombstones(chat_id, &mut messages);
                     let inserted = this.messages.finish_initial(messages);
                     this.start_image_downloads(inserted);
                     this.messages.set_detached(true);
@@ -798,11 +951,12 @@ impl ShellInner {
         let this = self.clone();
         glib::MainContext::default().spawn_local(async move {
             match this.tg.get_history(chat_id, None).await {
-                Ok(messages) => {
+                Ok(mut messages) => {
                     if !this.is_current(chat_id, epoch) {
                         return;
                     }
-                    if let Some(last) = messages.last() {
+                    this.apply_tombstones(chat_id, &mut messages);
+                    if let Some(last) = messages.iter().rev().find(|message| !message.deleted) {
                         this.remember_last(last);
                     }
                     let inserted = this.messages.finish_initial(messages);
@@ -853,7 +1007,8 @@ impl ShellInner {
                 self.composer_operation.set(false);
                 match result {
                     Ok(message) => {
-                        if was_last {
+                        let message = self.apply_tombstone(message);
+                        if was_last && !message.deleted {
                             self.remember_last(&message);
                             if self.is_tracked_last(chat_id, msg_id) {
                                 self.chatlist.upsert(
@@ -889,14 +1044,17 @@ impl ShellInner {
             self.composer_operation.set(false);
             match result {
                 Ok(message) => {
-                    self.remember_last(&message);
-                    self.chatlist.upsert(
-                        chat_id,
-                        &title,
-                        &message_preview(&message),
-                        Some(message.ts),
-                        UnreadUpdate::Delta(0),
-                    );
+                    let message = self.apply_tombstone(message);
+                    if !message.deleted {
+                        self.remember_last(&message);
+                        self.chatlist.upsert(
+                            chat_id,
+                            &title,
+                            &message_preview(&message),
+                            Some(message.ts),
+                            UnreadUpdate::Delta(0),
+                        );
+                    }
                     if self.is_current(chat_id, epoch) {
                         let inserted = self.messages.merge_event(message);
                         self.start_image_downloads(inserted);
@@ -994,14 +1152,17 @@ impl ShellInner {
         self.composer_operation.set(false);
         match result {
             Ok(message) => {
-                self.remember_last(&message);
-                self.chatlist.upsert(
-                    chat_id,
-                    &title,
-                    &message_preview(&message),
-                    Some(message.ts),
-                    UnreadUpdate::Delta(0),
-                );
+                let message = self.apply_tombstone(message);
+                if !message.deleted {
+                    self.remember_last(&message);
+                    self.chatlist.upsert(
+                        chat_id,
+                        &title,
+                        &message_preview(&message),
+                        Some(message.ts),
+                        UnreadUpdate::Delta(0),
+                    );
+                }
                 if self.is_current(chat_id, epoch) {
                     let inserted = self.messages.merge_event(message);
                     self.start_image_downloads(inserted);
@@ -1227,6 +1388,59 @@ impl ShellInner {
         next
     }
 
+    fn apply_tombstone(&self, mut message: Msg) -> Msg {
+        if self.settings.get().anti_delete {
+            let mut tombstones = self.tombstones.borrow_mut();
+            let ids = tombstones.entry(message.chat_id).or_default();
+            if message.deleted {
+                ids.insert(message.id);
+            }
+            if ids.contains(&message.id) {
+                message.deleted = true;
+            }
+        }
+        message
+    }
+
+    fn apply_tombstones(&self, chat_id: i64, messages: &mut Vec<Msg>) {
+        if !self.settings.get().anti_delete {
+            messages.retain(|message| !message.deleted);
+            return;
+        }
+        let mut tombstones = self.tombstones.borrow_mut();
+        let ids = tombstones.entry(chat_id).or_default();
+        for message in messages.iter() {
+            if message.deleted {
+                ids.insert(message.id);
+            }
+        }
+        for message in messages {
+            if ids.contains(&message.id) {
+                message.deleted = true;
+            }
+        }
+    }
+
+    fn tombstone_contains(&self, chat_id: i64, msg_id: i32) -> bool {
+        self.tombstones
+            .borrow()
+            .get(&chat_id)
+            .is_some_and(|ids| ids.contains(&msg_id))
+    }
+
+    fn tombstones_empty(&self, chat_id: i64) -> bool {
+        self.tombstones
+            .borrow()
+            .get(&chat_id)
+            .is_none_or(HashSet::is_empty)
+    }
+
+    fn flags_settled(&self) -> bool {
+        !self.flags_in_flight.get()
+            && self.flags_pending.borrow().is_none()
+            && !self.anti_reload_pending.get()
+    }
+
     fn is_current(&self, chat_id: i64, epoch: u64) -> bool {
         self.open_chat.get() == Some(chat_id) && self.epoch.get() == epoch
     }
@@ -1431,7 +1645,8 @@ impl ShellInner {
             probe_fail("open settings");
             return;
         }
-        self.settings.update(|settings| settings.show_seconds = true);
+        self.settings
+            .update(|settings| settings.show_seconds = true);
         if !poll_until(1000, || {
             self.messages
                 .last_time_label()
@@ -1442,7 +1657,8 @@ impl ShellInner {
             probe_fail("show seconds");
             return;
         }
-        self.settings.update(|settings| settings.show_seconds = false);
+        self.settings
+            .update(|settings| settings.show_seconds = false);
         if !poll_until(1000, || {
             self.messages
                 .last_time_label()
@@ -1484,6 +1700,126 @@ impl ShellInner {
             probe_fail("reload latest");
             return;
         }
+
+        // Wave 2: anti-delete must reach the backend before the forced reload.
+        self.settings.update(|settings| settings.anti_delete = true);
+        if !poll_until(3000, || self.flags_settled() && !self.messages.is_loading()).await {
+            probe_fail("anti-delete flags before data");
+            return;
+        }
+        let deni = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find_map(|(id, title)| (title == "Deni").then_some(id));
+        let Some(deni) = deni else {
+            probe_fail("find Deni");
+            return;
+        };
+        self.clone().open_chat(deni);
+        if !poll_until(3000, || {
+            self.open_chat.get() == Some(deni)
+                && !self.messages.is_loading()
+                && self.messages.contains(205)
+                && self.messages.is_marked_deleted(205)
+        })
+        .await
+        {
+            probe_fail("archived deleted row");
+            return;
+        }
+
+        let last_id = self
+            .messages
+            .last_message()
+            .map(|message| message.id)
+            .unwrap_or(0);
+        self.messages.set_composer_text("please delete this");
+        self.clone().submit_composer();
+        if !poll_until(6000, || {
+            self.messages
+                .find_incoming_text_after("(mock reply) got it", last_id)
+                .is_some_and(|msg_id| {
+                    self.messages.is_marked_deleted(msg_id) && self.tombstone_contains(deni, msg_id)
+                })
+        })
+        .await
+        {
+            probe_fail("live deleted tombstone");
+            return;
+        }
+
+        self.settings
+            .update(|settings| settings.anti_delete = false);
+        if !poll_until(3500, || {
+            self.flags_settled()
+                && !self.messages.is_loading()
+                && !self.messages.contains(205)
+                && self.messages.contains(204)
+                && self.tombstones_empty(deni)
+        })
+        .await
+        {
+            probe_fail("disable anti-delete reload");
+            return;
+        }
+
+        self.settings
+            .update(|settings| settings.edit_history = true);
+        let previous_last_id = self
+            .messages
+            .last_message()
+            .map(|message| message.id)
+            .unwrap_or(0);
+        self.messages.set_composer_text("edit this");
+        self.clone().submit_composer();
+        if !poll_until(6000, || {
+            self.messages
+                .find_edited_incoming_after(previous_last_id)
+                .is_some()
+        })
+        .await
+        {
+            probe_fail("live edited reply");
+            return;
+        }
+        let Some(edited_reply) = self.messages.find_edited_incoming_after(previous_last_id) else {
+            probe_fail("find edited reply");
+            return;
+        };
+        let edited_text = self
+            .messages
+            .message(edited_reply)
+            .map(|message| message.text)
+            .unwrap_or_default();
+        self.messages.clear_history_probe();
+        self.clone().open_edit_history(edited_reply);
+        if !poll_until(3000, || {
+            self.messages.history_version_count() >= 1
+                && self.messages.history_current_text().as_deref() == Some(edited_text.as_str())
+        })
+        .await
+        {
+            probe_fail("edit history popover");
+            return;
+        }
+        self.messages.dismiss_row_popovers();
+
+        let render_count = self.messages.initial_render_count();
+        self.clone().force_reload(deni);
+        self.clone().force_reload(deni);
+        if !poll_until(3500, || {
+            !self.messages.is_loading()
+                && self.messages.initial_render_count() == render_count.wrapping_add(1)
+                && self.messages.ids_unique()
+                && self.messages.rendered_row_count() == self.messages.len()
+        })
+        .await
+        {
+            probe_fail("force reload race");
+            return;
+        }
+
         let Some(window) = self.window() else {
             probe_fail("find application window");
             return;

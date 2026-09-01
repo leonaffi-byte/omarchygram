@@ -9,7 +9,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
-use crate::tg::{MediaKind, Msg};
+use crate::tg::{MediaKind, Msg, MsgVersion};
 
 #[derive(Clone)]
 pub enum MessageAction {
@@ -18,6 +18,7 @@ pub enum MessageAction {
     DropFile(gtk::gio::File),
     Reply(i32),
     Edit(i32),
+    EditHistory(i32),
     Delete(i32),
     Media(i32),
     Paginate,
@@ -43,6 +44,7 @@ struct MessageRow {
     quote: gtk::Label,
     text: Rc<RefCell<Option<gtk::Label>>>,
     time: gtk::Label,
+    deleted_tag: gtk::Label,
     reactions: gtk::Box,
     reaction_labels: Rc<RefCell<Vec<gtk::Label>>>,
     media_slot: gtk::Box,
@@ -87,6 +89,7 @@ struct MessagesInner {
     store: RefCell<MessageStore>,
     action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
     time_format: RefCell<String>,
+    edit_history: Cell<bool>,
     detached: Cell<bool>,
     busy: Cell<bool>,
     paging: Cell<bool>,
@@ -99,6 +102,11 @@ struct MessagesInner {
     scroll_epoch: Cell<u64>,
     upper_handler: RefCell<Option<glib::SignalHandlerId>>,
     upper_tick: RefCell<Option<gtk::TickCallbackId>>,
+    context_popover: RefCell<Option<gtk::Popover>>,
+    history_popover: RefCell<Option<gtk::Popover>>,
+    initial_render_count: Cell<u64>,
+    history_version_count: Cell<usize>,
+    history_current_text: RefCell<Option<String>>,
 }
 
 pub struct MessagesView {
@@ -318,6 +326,7 @@ impl MessagesView {
             store: RefCell::new(MessageStore::default()),
             action,
             time_format: RefCell::new("%H:%M".to_string()),
+            edit_history: Cell::new(false),
             detached: Cell::new(false),
             busy: Cell::new(false),
             paging: Cell::new(false),
@@ -330,6 +339,11 @@ impl MessagesView {
             scroll_epoch: Cell::new(0),
             upper_handler: RefCell::new(None),
             upper_tick: RefCell::new(None),
+            context_popover: RefCell::new(None),
+            history_popover: RefCell::new(None),
+            initial_render_count: Cell::new(0),
+            history_version_count: Cell::new(0),
+            history_current_text: RefCell::new(None),
         });
         let view = Self { widget, inner };
         view.connect_controls(reply_close, edit_close);
@@ -538,8 +552,9 @@ impl MessagesView {
     }
 
     pub fn reset_chat(&self, chat_id: i64, title: &str, epoch: u64) {
-        self.inner.composer.set_sensitive(true);
-        self.inner.attach.set_sensitive(true);
+        let composer_enabled = !self.inner.busy.get();
+        self.inner.composer.set_sensitive(composer_enabled);
+        self.inner.attach.set_sensitive(composer_enabled);
         self.cancel_pending_scroll();
         self.inner.scroll_epoch.set(epoch);
         self.inner.edit.borrow_mut().take();
@@ -548,6 +563,7 @@ impl MessagesView {
         self.set_composer_text("");
         self.clear_error();
         self.clear_typing();
+        self.dismiss_row_popovers();
         while let Some(child) = self.inner.list.first_child() {
             self.inner.list.remove(&child);
         }
@@ -574,6 +590,7 @@ impl MessagesView {
         self.inner.scroll_epoch.set(epoch);
         self.clear_error();
         self.clear_typing();
+        self.dismiss_row_popovers();
         while let Some(child) = self.inner.list.first_child() {
             self.inner.list.remove(&child);
         }
@@ -590,6 +607,9 @@ impl MessagesView {
     }
 
     pub fn finish_initial(&self, messages: Vec<Msg>) -> Vec<i32> {
+        self.inner
+            .initial_render_count
+            .set(self.inner.initial_render_count.get().wrapping_add(1));
         let adjustment = self.inner.scroll.vadjustment();
         let inserted = self.merge(messages);
         self.inner.loading.set_visible(false);
@@ -798,9 +818,14 @@ impl MessagesView {
 
         let time = gtk::Label::new(None);
         time.add_css_class("omg-msg-time");
-        time.set_halign(gtk::Align::End);
         set_time_label(&time, message, &self.inner.time_format.borrow());
-        widget.append(&time);
+        let deleted_tag = gtk::Label::new(Some("deleted"));
+        deleted_tag.add_css_class("omg-msg-time");
+        let meta = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        meta.set_halign(gtk::Align::End);
+        meta.append(&time);
+        meta.append(&deleted_tag);
+        widget.append(&meta);
 
         let reactions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         reactions.set_halign(gtk::Align::Start);
@@ -826,11 +851,13 @@ impl MessagesView {
             quote,
             text: Rc::new(RefCell::new(text)),
             time,
+            deleted_tag,
             reactions,
             reaction_labels,
             media_slot,
             media_button,
         };
+        set_deleted_rendering(&row, message.deleted);
         update_reactions(&row, message);
         row
     }
@@ -862,6 +889,7 @@ impl MessagesView {
         }
         drop(text_label);
         set_time_label(&row.time, &message, &self.inner.time_format.borrow());
+        set_deleted_rendering(&row, message.deleted);
         update_reactions(&row, &message);
     }
 
@@ -932,6 +960,7 @@ impl MessagesView {
             .map(|entry| entry.row.widget.clone());
         let Some(row) = row else { return };
 
+        Self::dismiss_popover(&inner.context_popover);
         let popover = gtk::Popover::new();
         popover.add_css_class("omg-menu");
         popover.set_has_arrow(false);
@@ -939,7 +968,12 @@ impl MessagesView {
         popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
         popover.set_child(Some(&menu));
-        popover.connect_closed(|popover| popover.unparent());
+        popover.connect_closed(|popover| {
+            if popover.parent().is_some() {
+                popover.unparent();
+            }
+        });
+        *inner.context_popover.borrow_mut() = Some(popover.clone());
 
         let copy = menu_button("Copy", false);
         {
@@ -954,6 +988,12 @@ impl MessagesView {
             });
         }
         menu.append(&copy);
+
+        // Deleted rows are archive evidence, not actionable Telegram rows.
+        if message.deleted {
+            popover.popup();
+            return;
+        }
 
         let copy_message_id = menu_button("Copy message id", false);
         Self::connect_menu_action(
@@ -973,6 +1013,17 @@ impl MessagesView {
                 MessageAction::CopyUserId(msg_id),
             );
             menu.append(&copy_user_id);
+        }
+
+        if message.edited && inner.edit_history.get() {
+            let history = menu_button("Edit history", false);
+            Self::connect_menu_action(
+                inner,
+                &history,
+                &popover,
+                MessageAction::EditHistory(msg_id),
+            );
+            menu.append(&history);
         }
 
         let reply = menu_button("Reply", false);
@@ -1179,6 +1230,7 @@ impl MessagesView {
     }
 
     pub fn remove(&self, msg_id: i32) -> Option<Msg> {
+        self.dismiss_row_popovers();
         let entry = {
             let mut store = self.inner.store.borrow_mut();
             let entry = store.entries.remove(&msg_id)?;
@@ -1188,6 +1240,41 @@ impl MessagesView {
         self.inner.list.remove(&entry.row.widget);
         self.refresh_quotes();
         Some(entry.msg)
+    }
+
+    pub fn mark_deleted(&self, msg_id: i32) -> bool {
+        let row = {
+            let mut store = self.inner.store.borrow_mut();
+            let Some(entry) = store.entries.get_mut(&msg_id) else {
+                return false;
+            };
+            entry.msg.deleted = true;
+            entry.row.clone()
+        };
+        set_deleted_rendering(&row, true);
+        true
+    }
+
+    pub fn is_deleted(&self, msg_id: i32) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| entry.msg.deleted)
+    }
+
+    pub fn is_marked_deleted(&self, msg_id: i32) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| {
+                entry.msg.deleted
+                    && entry.row.widget.has_css_class("omg-msg-deleted")
+                    && entry.row.deleted_tag.is_visible()
+            })
     }
 
     pub fn contains(&self, msg_id: i32) -> bool {
@@ -1224,6 +1311,26 @@ impl MessagesView {
             .entries
             .values()
             .find(|entry| entry.msg.outgoing && entry.msg.text == text)
+            .map(|entry| entry.msg.id)
+    }
+
+    pub fn find_incoming_text_after(&self, text: &str, after_id: i32) -> Option<i32> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .values()
+            .find(|entry| !entry.msg.outgoing && entry.msg.id > after_id && entry.msg.text == text)
+            .map(|entry| entry.msg.id)
+    }
+
+    pub fn find_edited_incoming_after(&self, after_id: i32) -> Option<i32> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .values()
+            .find(|entry| !entry.msg.outgoing && entry.msg.id > after_id && entry.msg.edited)
             .map(|entry| entry.msg.id)
     }
 
@@ -1457,6 +1564,108 @@ impl MessagesView {
         self.inner.ghost.set_visible(on);
     }
 
+    pub fn set_edit_history(&self, on: bool) {
+        self.inner.edit_history.set(on);
+    }
+
+    pub fn clear_history_probe(&self) {
+        self.inner.history_version_count.set(0);
+        self.inner.history_current_text.borrow_mut().take();
+    }
+
+    pub fn show_edit_history(&self, msg_id: i32, versions: Vec<MsgVersion>) -> bool {
+        let (row, current_text) = {
+            let store = self.inner.store.borrow();
+            let Some(entry) = store.entries.get(&msg_id) else {
+                return false;
+            };
+            if entry.msg.deleted {
+                return false;
+            }
+            (entry.row.widget.clone(), entry.msg.text.clone())
+        };
+
+        let version_count = versions.len();
+        Self::dismiss_popover(&self.inner.history_popover);
+        let popover = gtk::Popover::new();
+        popover.add_css_class("omg-history");
+        popover.set_has_arrow(false);
+        popover.set_parent(&row);
+        popover.connect_closed(|popover| {
+            if popover.parent().is_some() {
+                popover.unparent();
+            }
+        });
+        *self.inner.history_popover.borrow_mut() = Some(popover.clone());
+        let contents = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        popover.set_child(Some(&contents));
+
+        if versions.is_empty() {
+            let empty = gtk::Label::new(Some("no earlier versions"));
+            empty.add_css_class("omg-empty-state");
+            empty.set_halign(gtk::Align::Start);
+            empty.set_selectable(true);
+            contents.append(&empty);
+            self.inner.history_current_text.borrow_mut().take();
+        } else {
+            let format = self.inner.time_format.borrow().clone();
+            for version in versions {
+                let time = format_time(&version.replaced_at, &format)
+                    .or_else(|| format_time(&version.replaced_at, "%H:%M"))
+                    .unwrap_or_default();
+                contents.append(&history_row(&time, &version.text));
+            }
+            contents.append(&history_row("current", &current_text));
+            *self.inner.history_current_text.borrow_mut() = Some(current_text);
+        }
+        self.inner.history_version_count.set(version_count);
+        popover.popup();
+        true
+    }
+
+    fn dismiss_popover(slot: &RefCell<Option<gtk::Popover>>) {
+        let popover = slot.borrow_mut().take();
+        if let Some(popover) = popover {
+            popover.popdown();
+            if popover.parent().is_some() {
+                popover.unparent();
+            }
+        }
+    }
+
+    pub fn dismiss_row_popovers(&self) {
+        Self::dismiss_popover(&self.inner.context_popover);
+        Self::dismiss_popover(&self.inner.history_popover);
+    }
+
+    pub fn history_version_count(&self) -> usize {
+        self.inner.history_version_count.get()
+    }
+
+    pub fn history_current_text(&self) -> Option<String> {
+        self.inner.history_current_text.borrow().clone()
+    }
+
+    pub fn initial_render_count(&self) -> u64 {
+        self.inner.initial_render_count.get()
+    }
+
+    pub fn ids_unique(&self) -> bool {
+        let store = self.inner.store.borrow();
+        let mut ids = std::collections::HashSet::new();
+        store.order.iter().all(|id| ids.insert(*id)) && store.order.len() == store.entries.len()
+    }
+
+    pub fn rendered_row_count(&self) -> usize {
+        let mut count = 0;
+        let mut child = self.inner.list.first_child();
+        while let Some(row) = child {
+            count += 1;
+            child = row.next_sibling();
+        }
+        count
+    }
+
     /// Detached = viewing a jumped-to historical page; the ▼ button stays
     /// visible and reloads the latest page.
     pub fn set_detached(&self, detached: bool) {
@@ -1499,7 +1708,9 @@ fn set_time_label(label: &gtk::Label, message: &Msg, format: &str) {
 fn format_time(ts: &DateTime<Local>, format: &str) -> Option<String> {
     use std::fmt::Write;
     let mut rendered = String::new();
-    write!(rendered, "{}", ts.format(format)).ok().map(|_| rendered)
+    write!(rendered, "{}", ts.format(format))
+        .ok()
+        .map(|_| rendered)
 }
 
 /// Probe a strftime format by writing a fixed timestamp into a String; an
@@ -1557,6 +1768,27 @@ fn update_reactions(row: &MessageRow, message: &Msg) {
         label.set_visible(true);
     }
     row.reactions.set_visible(!message.reactions.is_empty());
+}
+
+fn set_deleted_rendering(row: &MessageRow, deleted: bool) {
+    if deleted {
+        row.widget.add_css_class("omg-msg-deleted");
+    } else {
+        row.widget.remove_css_class("omg-msg-deleted");
+    }
+    row.deleted_tag.set_visible(deleted);
+}
+
+fn history_row(time: &str, text: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    row.add_css_class("omg-history-row");
+    let time = gtk::Label::new(Some(time));
+    time.add_css_class("omg-msg-time");
+    time.set_halign(gtk::Align::Start);
+    row.append(&time);
+    let text = message_label(text);
+    row.append(&text);
+    row
 }
 
 fn menu_button(label: &str, danger: bool) -> gtk::Button {

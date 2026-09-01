@@ -116,6 +116,31 @@ window.omg-window {
   font-size: 8pt;
 }
 
+.omg-msg-deleted label {
+  color: var(--muted);
+  text-decoration-line: line-through;
+}
+
+.omg-msg-deleted .omg-msg-time {
+  text-decoration-line: none;
+}
+
+popover.omg-history > contents {
+  background-color: var(--bg-dark);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 4px;
+}
+
+.omg-history .omg-history-row,
+.omg-history .omg-empty-state {
+  padding: 8px;
+}
+
+.omg-history .omg-history-row + .omg-history-row {
+  border-top: 1px solid var(--bg-lighter);
+}
+
 .omg-empty-state {
   color: var(--muted);
 }
