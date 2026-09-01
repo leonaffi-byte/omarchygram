@@ -1,54 +1,63 @@
-# Spec: tests, desktop entry, README
+# Spec: tests, desktop entry, README (Rust)
 
 ## Context
-Omarchygram = Python 3.14 + GTK4 (PyGObject, system) + Telethon (venv) Telegram
-client themed from Omarchy. Read `CLAUDE.md` for architecture. Venv already
-exists: run everything with `.venv/bin/python`.
+Omarchygram = Rust + gtk4-rs + grammers Telegram client themed from Omarchy.
+Read `CLAUDE.md` for architecture and commands. The crate builds as lib + bin;
+tests import `omarchygram::…`. Backend contract: `src/tg/mod.rs` (`Tg`,
+`Event`, `AuthState`, `ChatSummary`, `Msg`, `MediaKind`); theme functions:
+`src/theme/mod.rs` (`load_colors()`, `build_css(&colors)`).
 
 ## Files to create (ONLY these)
-1. `tests/test_theme.py` — for `omarchygram/theme/omarchy.py`:
-   - `build_css(load_colors())` returns a string containing no `$` characters
-     and containing every DEFAULTS hex value or theme override.
-   - `load_colors()` with `COLORS_FILE` monkeypatched to a nonexistent path
-     returns exactly DEFAULTS.
-   - `load_colors()` with `COLORS_FILE` monkeypatched to a tmp toml defining
-     `accent = "#123456"` returns that accent and DEFAULTS for missing keys.
-   - Do NOT instantiate ThemeManager (needs a display) — pure functions only.
-2. `tests/test_mock.py` — for `omarchygram/tg/mock.py` (use `asyncio.run` or
-   pytest-style async helpers WITHOUT adding dependencies; plain
-   `asyncio.run(main())` inside sync tests is fine):
-   - `start()` returns READY normally; with env `OMG_MOCK_AUTH=1` returns
-     NEED_PHONE, then phone→code("2fa")→NEED_PASSWORD→password→READY, and
-     code("12345")→READY (use monkeypatch.setenv).
-   - `get_dialogs()` sorted by last_time descending; 4 chats.
-   - `send_text` appends to history; `get_history` returns it last.
-   - The 1.5s echo reply: skip testing it (needs a running loop with time) OR
-     test via `asyncio.get_event_loop().call_later` being irrelevant — simply
-     call `_echo(1)` directly after registering `on_new_message` and assert the
-     callback received a Message for chat 1.
-3. `packaging/omarchygram.desktop` — Name=Omarchygram,
-   Comment=Telegram client themed by Omarchy, Exec=omarchygram, Terminal=false,
-   Type=Application, Categories=Network;InstantMessaging;
-   (no Icon line yet).
-4. `bin/install-desktop` — bash, executable: writes a copy of the .desktop file
-   to `~/.local/share/applications/omarchygram.desktop` with Exec rewritten to
-   the absolute path `<repo>/.venv/bin/python -m omarchygram` (derive repo root
-   from the script location), then runs `update-desktop-database
-   ~/.local/share/applications` if that command exists. Idempotent.
-5. `README.md` — short and factual: what it is (one sentence), screenshot
-   placeholder line, requirements (Arch: gtk4 python-gobject), setup (venv
-   command from CLAUDE.md), Telegram API credential setup (summarize the steps
-   from `omarchygram/tg/config.py` SETUP_HELP), run commands (normal and
-   --smoke), how theming works (reads
+1. `tests/theme.rs` — for `omarchygram::theme`:
+   - `build_css(&load_colors())` output contains NO `$` character and contains
+     every color value of the map it was built from.
+   - `build_css` with a hand-built BTreeMap (all keys from load_colors()'s
+     default result, `accent` set to `#123456`) contains `#123456`.
+   - NOTE: `load_colors()` reads the live Omarchy state of the machine, so
+     never assert specific colors from it — only structural properties (has
+     the standard keys, values start with `#` or are "dark"/"light" for mode).
+   - Do NOT touch GTK (no ThemeManager) — pure functions only.
+2. `tests/mock_backend.rs` — for `Tg::spawn_mock()` (use `#[tokio::test]`;
+   tokio is already a dependency with the macros feature):
+   - `start()` → Ready. (Auth-flow env-var testing is NOT possible here since
+     env vars race across tests — skip auth states.)
+   - `get_dialogs()` → 4 chats, sorted by last_time descending.
+   - `get_history(1, None)` → last message text contains "thursday";
+     `get_history(1, Some(<first id>))` → 2 older messages;
+     `get_history(2, Some(<first id of chat 2>))` → empty.
+   - `send_text(1, "hi", None)` → Ok Msg with outgoing true; a subsequent
+     `get_history(1, None)` contains it. After sending, two events arrive on
+     `tg.events` (`Typing`, then `NewMessage`) within 5s — assert with
+     `tokio::time::timeout`.
+   - `edit_text` sets `edited`; `delete_message` removes;
+     `download_media(1, 103)` → Ok(Some(path)) OR Ok(None) if the machine has
+     no /usr/share/omarchy themes — accept both, but on Some the path exists.
+3. `packaging/omarchygram.desktop` — Name=Omarchygram, Comment=Telegram client
+   themed by Omarchy, Exec=omarchygram, Terminal=false, Type=Application,
+   Categories=Network;InstantMessaging; (no Icon line yet).
+4. `bin/install-desktop` — bash, executable: builds `cargo build --release`
+   if `target/release/omarchygram` is missing, then writes
+   `~/.local/share/applications/omarchygram.desktop` based on the packaging
+   file with Exec rewritten to the absolute `target/release/omarchygram` path
+   (derive the repo root from the script's own location), then runs
+   `update-desktop-database ~/.local/share/applications` when available.
+   Idempotent.
+5. `README.md` — short and factual: what it is (one sentence); requirements
+   (Arch: gtk4, rust); build/run commands from CLAUDE.md (normal, --smoke);
+   one-time Telegram API credential setup (steps as in `SETUP_HELP` in
+   `src/tg/mod.rs`: my.telegram.org → config.toml → chmod 600); the keyboard
+   bindings table (Ctrl+K switcher, Alt+Up/Down chats, Enter send,
+   Shift+Enter newline, Esc cancel/focus composer); how theming works (reads
    `~/.local/state/omarchy/current/theme/colors.toml`, live-retints on Omarchy
-   theme switch). Plain language, no marketing tone, no emoji, no badges.
+   theme switch); `bin/install-desktop` for a launcher entry. Plain language,
+   no marketing tone, no emoji, no badges.
 
 ## Must NOT touch
-Anything under `omarchygram/` (the package), `pyproject.toml`, `CLAUDE.md`,
-`specs/`, git state (NO commits — orchestrator owns git).
+Anything under `src/`, `Cargo.toml`, `CLAUDE.md`, `specs/`, git state
+(NO commits — orchestrator owns git). No new dependencies.
 
-## Acceptance criteria (machine-checkable)
-1. `.venv/bin/python -m pytest -q` → exit 0.
-2. `bash -n bin/install-desktop` → exit 0; file is executable.
+## Acceptance criteria (machine-checkable — run them, report results)
+1. `cargo test` → exit 0 (UI may still be the placeholder — do not test UI).
+2. `bash -n bin/install-desktop` → exit 0; `test -x bin/install-desktop` → exit 0.
 3. `grep -q "^Exec=" packaging/omarchygram.desktop` → exit 0.
-4. `README.md` exists and mentions `--smoke` and `my.telegram.org`.
+4. README.md exists and mentions `--smoke` and `my.telegram.org`.

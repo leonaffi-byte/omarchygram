@@ -1,8 +1,6 @@
-mod theme;
-mod tg;
-mod ui;
-
 use std::rc::Rc;
+
+use omarchygram::{theme, tg, ui};
 
 use gtk4 as gtk;
 use gtk4::glib;
