@@ -82,6 +82,9 @@ pub struct Reaction {
 pub struct Msg {
     pub id: i32,
     pub chat_id: i64,
+    /// Title of the chat this message belongs to (may be empty when unknown).
+    /// Lets the UI create a sidebar row for a chat outside the loaded dialogs.
+    pub chat_title: String,
     /// Display name; empty when unknown, "You" for own messages.
     pub sender: String,
     pub text: String,

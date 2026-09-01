@@ -6,11 +6,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Local};
 use tokio::sync::mpsc;
 
-use super::{AuthState, ChatSummary, Command, Event, MediaKind, Msg, Reaction};
+use super::{paths, AuthState, ChatSummary, Command, Event, MediaKind, Msg, Reaction};
 
 fn t(minutes_ago: i64) -> DateTime<Local> {
     Local::now() - Duration::minutes(minutes_ago)
@@ -27,24 +28,33 @@ fn title(chat_id: i64) -> &'static str {
 }
 
 fn sample_image() -> Option<PathBuf> {
-    let mut hits: Vec<PathBuf> = glob_previews().collect();
-    hits.sort();
-    hits.into_iter().next()
-}
-
-fn glob_previews() -> impl Iterator<Item = PathBuf> {
-    std::fs::read_dir("/usr/share/omarchy/themes")
+    let mut hits: Vec<PathBuf> = std::fs::read_dir("/usr/share/omarchy/themes")
         .into_iter()
         .flatten()
         .flatten()
         .map(|e| e.path().join("preview.png"))
         .filter(|p| p.exists())
+        .collect();
+    hits.sort();
+    hits.into_iter().next()
+}
+
+/// A real on-disk file for mock document downloads, so open-with-default works.
+fn sample_document(name: &str) -> Option<PathBuf> {
+    let dir = paths::media_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("mock_{name}"));
+    if !path.exists() {
+        std::fs::write(&path, "omarchygram mock file: build log excerpt\nall green\n").ok()?;
+    }
+    Some(path)
 }
 
 fn msg(id: i32, chat_id: i64, sender: &str, text: &str, ts: DateTime<Local>, outgoing: bool) -> Msg {
     Msg {
         id,
         chat_id,
+        chat_title: title(chat_id).to_string(),
         sender: sender.to_string(),
         text: text.to_string(),
         ts,
@@ -62,6 +72,8 @@ struct MockState {
     next_id: i32,
     unread: HashMap<i64, i32>,
     history: HashMap<i64, Vec<Msg>>,
+    /// Files "sent" from this session, so download_media returns the original.
+    sent_files: HashMap<i32, PathBuf>,
 }
 
 impl MockState {
@@ -102,6 +114,7 @@ impl MockState {
             next_id: 1000,
             unread: HashMap::from([(1, 1), (2, 0), (3, 0), (4, 3)]),
             history,
+            sent_files: HashMap::new(),
         }
     }
 
@@ -120,33 +133,38 @@ impl MockState {
 }
 
 pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_channel::Sender<Event>) {
-    let mut st = MockState::new();
+    // Shared with spawned tasks (delayed replies, downloads). Never held
+    // across an await.
+    let st = Arc::new(Mutex::new(MockState::new()));
 
     while let Some(cmd) = cmds.recv().await {
         match cmd {
             Command::Start(tx) => {
                 // OMG_MOCK_AUTH=1 lets the auth screens be walked offline.
-                st.auth = if std::env::var("OMG_MOCK_AUTH").is_ok_and(|v| !v.is_empty()) {
+                let auth = if std::env::var("OMG_MOCK_AUTH").is_ok_and(|v| !v.is_empty()) {
                     AuthState::NeedPhone
                 } else {
                     AuthState::Ready
                 };
-                let _ = tx.send(Ok(st.auth));
+                st.lock().unwrap().auth = auth;
+                let _ = tx.send(Ok(auth));
             }
             Command::SubmitPhone(_, tx) => {
-                st.auth = AuthState::NeedCode;
-                let _ = tx.send(Ok(st.auth));
+                st.lock().unwrap().auth = AuthState::NeedCode;
+                let _ = tx.send(Ok(AuthState::NeedCode));
             }
             Command::SubmitCode(code, tx) => {
                 // "2fa" exercises the password screen; anything else signs straight in.
-                st.auth = if code == "2fa" { AuthState::NeedPassword } else { AuthState::Ready };
-                let _ = tx.send(Ok(st.auth));
+                let auth = if code == "2fa" { AuthState::NeedPassword } else { AuthState::Ready };
+                st.lock().unwrap().auth = auth;
+                let _ = tx.send(Ok(auth));
             }
             Command::SubmitPassword(_, tx) => {
-                st.auth = AuthState::Ready;
-                let _ = tx.send(Ok(st.auth));
+                st.lock().unwrap().auth = AuthState::Ready;
+                let _ = tx.send(Ok(AuthState::Ready));
             }
             Command::GetDialogs(tx) => {
+                let st = st.lock().unwrap();
                 let mut out: Vec<ChatSummary> = st
                     .history
                     .iter()
@@ -165,6 +183,7 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                 let _ = tx.send(Ok(out));
             }
             Command::GetHistory { chat_id, before_id, respond } => {
+                let st = st.lock().unwrap();
                 let msgs = st.history.get(&chat_id).cloned().unwrap_or_default();
                 let result = match before_id {
                     None => msgs,
@@ -183,25 +202,51 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                 let _ = respond.send(Ok(result));
             }
             Command::DownloadMedia { chat_id, msg_id, respond } => {
-                // Simulate network so loading placeholders are visible.
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                let path = st.history.get(&chat_id).and_then(|msgs| {
-                    msgs.iter()
-                        .find(|m| m.id == msg_id)
-                        .filter(|m| matches!(m.media, Some(MediaKind::Photo | MediaKind::Sticker)))
-                        .and_then(|_| sample_image())
+                // Spawned: downloads must never block other commands.
+                let (media, doc_name, sent_path) = {
+                    let st = st.lock().unwrap();
+                    let found = st
+                        .history
+                        .get(&chat_id)
+                        .and_then(|msgs| msgs.iter().find(|m| m.id == msg_id));
+                    (
+                        found.and_then(|m| m.media),
+                        found.and_then(|m| m.doc_name.clone()),
+                        st.sent_files.get(&msg_id).cloned(),
+                    )
+                };
+                tokio::spawn(async move {
+                    // Simulate network so loading placeholders are visible.
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let path = if let Some(p) = sent_path {
+                        Some(p)
+                    } else {
+                        match media {
+                            Some(MediaKind::Photo | MediaKind::Sticker) => sample_image(),
+                            Some(MediaKind::Document) => {
+                                sample_document(doc_name.as_deref().unwrap_or("file.txt"))
+                            }
+                            // Voice playback files are not mocked; UI shows "unavailable".
+                            _ => None,
+                        }
+                    };
+                    let _ = respond.send(Ok(path));
                 });
-                let _ = respond.send(Ok(path));
             }
             Command::SendText { chat_id, text, reply_to, respond } => {
-                st.next_id += 1;
-                let sent = Msg { reply_to, ..msg(st.next_id, chat_id, "You", &text, t(0), true) };
-                st.history.entry(chat_id).or_default().push(sent.clone());
-                schedule_reply(&events, chat_id, st.next_id + 1);
-                st.next_id += 1; // reserve the echo's id
+                let sent = {
+                    let mut st = st.lock().unwrap();
+                    st.next_id += 1;
+                    let sent = Msg { reply_to, ..msg(st.next_id, chat_id, "You", &text, t(0), true) };
+                    st.history.entry(chat_id).or_default().push(sent.clone());
+                    st.next_id += 1; // reserve the reply's id
+                    sent
+                };
+                schedule_reply(st.clone(), &events, chat_id, sent.id + 1);
                 let _ = respond.send(Ok(sent));
             }
             Command::SendFile { chat_id, path, caption, respond } => {
+                let mut st = st.lock().unwrap();
                 st.next_id += 1;
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 let is_image = ["png", "jpg", "jpeg", "webp"].iter().any(|ext| {
@@ -212,39 +257,48 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                     doc_name: if is_image { None } else { Some(name) },
                     ..msg(st.next_id, chat_id, "You", &caption, t(0), true)
                 };
+                st.sent_files.insert(sent.id, path);
                 st.history.entry(chat_id).or_default().push(sent.clone());
                 let _ = respond.send(Ok(sent));
             }
             Command::EditText { chat_id, msg_id, text, respond } => {
-                let result = st
-                    .history
-                    .get_mut(&chat_id)
-                    .and_then(|msgs| msgs.iter_mut().find(|m| m.id == msg_id))
-                    .map(|m| {
-                        m.text = text;
-                        m.edited = true;
-                        m.clone()
-                    })
-                    .ok_or_else(|| format!("no message {msg_id} in chat {chat_id}"));
+                let result = {
+                    let mut st = st.lock().unwrap();
+                    st.history
+                        .get_mut(&chat_id)
+                        .and_then(|msgs| msgs.iter_mut().find(|m| m.id == msg_id))
+                        .map(|m| {
+                            m.text = text;
+                            m.edited = true;
+                            m.clone()
+                        })
+                        .ok_or_else(|| format!("no message {msg_id} in chat {chat_id}"))
+                };
                 let _ = respond.send(result);
             }
             Command::DeleteMessage { chat_id, msg_id, respond } => {
-                if let Some(msgs) = st.history.get_mut(&chat_id) {
+                if let Some(msgs) = st.lock().unwrap().history.get_mut(&chat_id) {
                     msgs.retain(|m| m.id != msg_id);
                 }
                 let _ = respond.send(Ok(()));
             }
             Command::MarkRead { chat_id, respond } => {
-                st.unread.insert(chat_id, 0);
+                st.lock().unwrap().unread.insert(chat_id, 0);
                 let _ = respond.send(Ok(()));
             }
         }
     }
 }
 
-/// Simulate the other side: a typing signal, then an incoming reply, so
-/// live-update paths can be exercised offline.
-fn schedule_reply(events: &async_channel::Sender<Event>, chat_id: i64, reply_id: i32) {
+/// Simulate the other side: a typing signal, then an incoming reply — persisted
+/// to history and unread state BEFORE the event, so reopening the chat agrees
+/// with what the UI displayed live.
+fn schedule_reply(
+    st: Arc<Mutex<MockState>>,
+    events: &async_channel::Sender<Event>,
+    chat_id: i64,
+    reply_id: i32,
+) {
     let events = events.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
@@ -252,15 +306,12 @@ fn schedule_reply(events: &async_channel::Sender<Event>, chat_id: i64, reply_id:
             .send(Event::Typing { chat_id, name: title(chat_id).to_string() })
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-        let _ = events
-            .send(Event::NewMessage(msg(
-                reply_id,
-                chat_id,
-                title(chat_id),
-                "(mock reply) got it",
-                t(0),
-                false,
-            )))
-            .await;
+        let reply = msg(reply_id, chat_id, title(chat_id), "(mock reply) got it", t(0), false);
+        {
+            let mut st = st.lock().unwrap();
+            st.history.entry(chat_id).or_default().push(reply.clone());
+            *st.unread.entry(chat_id).or_insert(0) += 1;
+        }
+        let _ = events.send(Event::NewMessage(reply)).await;
     });
 }

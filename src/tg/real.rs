@@ -3,6 +3,11 @@
 //! Runs inside the backend tokio runtime (see tg/mod.rs). The UI never sees
 //! grammers types; everything is converted at this boundary.
 //!
+//! Auth commands are handled serially by `Backend`; data commands (history,
+//! sends, downloads, …) are spawned so a slow download or upload never blocks
+//! a chat switch or send. Shared state lives in `Ctx` (std::sync::Mutex,
+//! never held across an await).
+//!
 //! Chat ids exposed to the UI are Bot-API dialog ids (what `PeerId`
 //! bitpacks): positive for users, negative for groups/channels — no collisions.
 
@@ -27,7 +32,7 @@ use super::{
     paths, AuthState, ChatSummary, Command, Event, MediaKind, Msg, Reaction, TgError,
 };
 
-/// Shared between the command loop and the update loop.
+/// Shared between the command loop, spawned data tasks, and the update loop.
 struct Ctx {
     peers: Mutex<HashMap<i64, PeerRef>>,
     titles: Mutex<HashMap<i64, String>>,
@@ -98,6 +103,8 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
     };
 
     while let Some(cmd) = cmds.recv().await {
+        // Auth commands mutate Backend and run serially; everything else is
+        // spawned with clones of (Client, Arc<Ctx>).
         match cmd {
             Command::Start(tx) => {
                 let _ = tx.send(be.start().await);
@@ -111,31 +118,63 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
             Command::SubmitPassword(password, tx) => {
                 let _ = tx.send(be.submit_password(&password).await);
             }
-            Command::GetDialogs(tx) => {
-                let _ = tx.send(be.get_dialogs().await);
-            }
-            Command::GetHistory { chat_id, before_id, respond } => {
-                let _ = respond.send(be.get_history(chat_id, before_id).await);
-            }
-            Command::DownloadMedia { chat_id, msg_id, respond } => {
-                let _ = respond.send(be.download_media(chat_id, msg_id).await);
-            }
-            Command::SendText { chat_id, text, reply_to, respond } => {
-                let _ = respond.send(be.send_text(chat_id, &text, reply_to).await);
-            }
-            Command::SendFile { chat_id, path, caption, respond } => {
-                let _ = respond.send(be.send_file(chat_id, &path, &caption).await);
-            }
-            Command::EditText { chat_id, msg_id, text, respond } => {
-                let _ = respond.send(be.edit_text(chat_id, msg_id, &text).await);
-            }
-            Command::DeleteMessage { chat_id, msg_id, respond } => {
-                let _ = respond.send(be.delete_message(chat_id, msg_id).await);
-            }
-            Command::MarkRead { chat_id, respond } => {
-                let _ = respond.send(be.mark_read(chat_id).await);
+            data_cmd => {
+                let Some(client) = be.client.clone() else {
+                    respond_not_connected(data_cmd);
+                    continue;
+                };
+                let ctx = be.ctx.clone();
+                tokio::spawn(handle_data(client, ctx, data_cmd));
             }
         }
+    }
+}
+
+/// Answer a data command received before the backend connected.
+fn respond_not_connected(cmd: Command) {
+    const E: &str = "not connected";
+    match cmd {
+        Command::GetDialogs(tx) => drop(tx.send(Err(E.into()))),
+        Command::GetHistory { respond, .. } => drop(respond.send(Err(E.into()))),
+        Command::DownloadMedia { respond, .. } => drop(respond.send(Err(E.into()))),
+        Command::SendText { respond, .. } => drop(respond.send(Err(E.into()))),
+        Command::SendFile { respond, .. } => drop(respond.send(Err(E.into()))),
+        Command::EditText { respond, .. } => drop(respond.send(Err(E.into()))),
+        Command::DeleteMessage { respond, .. } => drop(respond.send(Err(E.into()))),
+        Command::MarkRead { respond, .. } => drop(respond.send(Err(E.into()))),
+        Command::Start(_) | Command::SubmitPhone(..) | Command::SubmitCode(..)
+        | Command::SubmitPassword(..) => unreachable!("auth commands handled serially"),
+    }
+}
+
+async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
+    match cmd {
+        Command::GetDialogs(tx) => {
+            let _ = tx.send(get_dialogs(&client, &ctx).await);
+        }
+        Command::GetHistory { chat_id, before_id, respond } => {
+            let _ = respond.send(get_history(&client, &ctx, chat_id, before_id).await);
+        }
+        Command::DownloadMedia { chat_id, msg_id, respond } => {
+            let _ = respond.send(download_media(&client, &ctx, chat_id, msg_id).await);
+        }
+        Command::SendText { chat_id, text, reply_to, respond } => {
+            let _ = respond.send(send_text(&client, &ctx, chat_id, &text, reply_to).await);
+        }
+        Command::SendFile { chat_id, path, caption, respond } => {
+            let _ = respond.send(send_file(&client, &ctx, chat_id, &path, &caption).await);
+        }
+        Command::EditText { chat_id, msg_id, text, respond } => {
+            let _ = respond.send(edit_text(&client, &ctx, chat_id, msg_id, &text).await);
+        }
+        Command::DeleteMessage { chat_id, msg_id, respond } => {
+            let _ = respond.send(delete_message(&client, &ctx, chat_id, msg_id).await);
+        }
+        Command::MarkRead { chat_id, respond } => {
+            let _ = respond.send(mark_read(&client, &ctx, chat_id).await);
+        }
+        Command::Start(_) | Command::SubmitPhone(..) | Command::SubmitCode(..)
+        | Command::SubmitPassword(..) => unreachable!("auth commands handled serially"),
     }
 }
 
@@ -237,197 +276,206 @@ impl Backend {
             Err(e) => Err(format!("password check failed: {e}")),
         }
     }
+}
 
-    async fn get_dialogs(&mut self) -> Result<Vec<ChatSummary>, TgError> {
-        let client = self.client()?.clone();
-        let mut iter = client.iter_dialogs().limit(50);
-        let mut out = Vec::new();
-        while let Some(dialog) = iter.next().await.map_err(|e| e.to_string())? {
-            let chat_id = dialog.peer_id().bot_api_dialog_id_unchecked();
-            let title = dialog.peer().name().unwrap_or("Unknown").to_string();
-            self.ctx.remember(chat_id, dialog.peer_ref(), Some(&title));
-            let last = dialog.last_message.as_ref();
-            let preview = last
-                .map(|m| {
-                    if m.text().is_empty() {
-                        media_placeholder(m.media().as_ref()).to_string()
-                    } else {
-                        m.text().to_string()
-                    }
-                })
-                .unwrap_or_default();
-            let unread = match &dialog.raw {
-                tl::enums::Dialog::Dialog(d) => d.unread_count,
-                tl::enums::Dialog::Folder(_) => 0,
-            };
-            if let Some(m) = last {
-                register_media(&self.ctx, m, chat_id);
-            }
-            out.push(ChatSummary {
-                id: chat_id,
-                title,
-                last_message: preview,
-                last_time: last.map(|m| m.date().with_timezone(&Local)),
-                unread,
-            });
-        }
-        Ok(out)
-    }
-
-    async fn get_history(
-        &mut self,
-        chat_id: i64,
-        before_id: Option<i32>,
-    ) -> Result<Vec<Msg>, TgError> {
-        let peer = self.ctx.peer(chat_id)?;
-        let client = self.client()?.clone();
-        let mut iter = client.iter_messages(peer).limit(50);
-        if let Some(before) = before_id {
-            iter = iter.offset_id(before);
-        }
-        let mut out = Vec::new();
-        while let Some(m) = iter.next().await.map_err(|e| e.to_string())? {
-            out.push(convert(&self.ctx, &m, chat_id));
-            if out.len() >= 50 {
-                break;
-            }
-        }
-        out.reverse(); // newest last (display order)
-        Ok(out)
-    }
-
-    async fn download_media(
-        &mut self,
-        chat_id: i64,
-        msg_id: i32,
-    ) -> Result<Option<PathBuf>, TgError> {
-        let media = { self.ctx.media.lock().unwrap().get(&(chat_id, msg_id)).cloned() };
-        let Some(media) = media else {
-            return Ok(None);
-        };
-        let dir = paths::media_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let stem = format!("{chat_id}_{msg_id}");
-
-        // Serve from cache when already downloaded (webp never survives; see below).
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&format!("{stem}.")) && !name.ends_with(".webp") {
-                    return Ok(Some(entry.path()));
+async fn get_dialogs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<ChatSummary>, TgError> {
+    let mut iter = client.iter_dialogs().limit(50);
+    let mut out = Vec::new();
+    while let Some(dialog) = iter.next().await.map_err(|e| e.to_string())? {
+        let chat_id = dialog.peer_id().bot_api_dialog_id_unchecked();
+        let title = dialog.peer().name().unwrap_or("Unknown").to_string();
+        ctx.remember(chat_id, dialog.peer_ref(), Some(&title));
+        let last = dialog.last_message.as_ref();
+        let preview = last
+            .map(|m| {
+                if m.text().is_empty() {
+                    media_placeholder(m.media().as_ref()).to_string()
+                } else {
+                    m.text().to_string()
                 }
+            })
+            .unwrap_or_default();
+        let unread = match &dialog.raw {
+            tl::enums::Dialog::Dialog(d) => d.unread_count,
+            tl::enums::Dialog::Folder(_) => 0,
+        };
+        if let Some(m) = last {
+            register_media(ctx, m, chat_id);
+        }
+        out.push(ChatSummary {
+            id: chat_id,
+            title,
+            last_message: preview,
+            last_time: last.map(|m| m.date().with_timezone(&Local)),
+            unread,
+        });
+    }
+    Ok(out)
+}
+
+async fn get_history(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    chat_id: i64,
+    before_id: Option<i32>,
+) -> Result<Vec<Msg>, TgError> {
+    let peer = ctx.peer(chat_id)?;
+    let mut iter = client.iter_messages(peer).limit(50);
+    if let Some(before) = before_id {
+        iter = iter.offset_id(before);
+    }
+    let mut out = Vec::new();
+    while let Some(m) = iter.next().await.map_err(|e| e.to_string())? {
+        out.push(convert(ctx, &m, chat_id));
+        if out.len() >= 50 {
+            break;
+        }
+    }
+    out.reverse(); // newest last (display order)
+    Ok(out)
+}
+
+async fn download_media(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    chat_id: i64,
+    msg_id: i32,
+) -> Result<Option<PathBuf>, TgError> {
+    let media = { ctx.media.lock().unwrap().get(&(chat_id, msg_id)).cloned() };
+    let Some(media) = media else {
+        return Ok(None);
+    };
+    let dir = paths::media_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stem = format!("{chat_id}_{msg_id}");
+
+    // Serve from cache when already downloaded (webp never survives; see below).
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&format!("{stem}.")) && !name.ends_with(".webp") {
+                return Ok(Some(entry.path()));
             }
         }
-
-        let ext = match &media {
-            Media::Photo(_) => "jpg".to_string(),
-            Media::Sticker(_) => "webp".to_string(),
-            Media::Document(d) => d
-                .name()
-                .and_then(|n| std::path::Path::new(n).extension())
-                .map(|e| e.to_string_lossy().to_string())
-                .unwrap_or_else(|| "bin".to_string()),
-            _ => "bin".to_string(),
-        };
-        let path = dir.join(format!("{stem}.{ext}"));
-        self.client()?
-            .download_media(&media, &path)
-            .await
-            .map_err(|e| format!("download failed: {e}"))?;
-
-        // GdkPixbuf on this system has no webp loader; convert stickers to png.
-        // (Animated .tgs stickers fail to decode; the UI shows them as unavailable.)
-        if ext == "webp" {
-            let png = dir.join(format!("{stem}.png"));
-            let img = image::open(&path).map_err(|e| format!("sticker decode failed: {e}"))?;
-            img.save(&png).map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_file(&path);
-            return Ok(Some(png));
-        }
-        Ok(Some(path))
     }
 
-    async fn send_text(
-        &mut self,
-        chat_id: i64,
-        text: &str,
-        reply_to: Option<i32>,
-    ) -> Result<Msg, TgError> {
-        let peer = self.ctx.peer(chat_id)?;
-        let input = InputMessage::new().text(text).reply_to(reply_to);
-        let sent = self
-            .client()?
-            .send_message(peer, input)
-            .await
-            .map_err(|e| format!("send failed: {e}"))?;
-        Ok(convert(&self.ctx, &sent, chat_id))
-    }
+    let ext = match &media {
+        Media::Photo(_) => "jpg".to_string(),
+        Media::Sticker(_) => "webp".to_string(),
+        Media::Document(d) => d
+            .name()
+            .and_then(|n| std::path::Path::new(n).extension())
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_else(|| "bin".to_string()),
+        _ => "bin".to_string(),
+    };
+    let path = dir.join(format!("{stem}.{ext}"));
+    client
+        .download_media(&media, &path)
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
 
-    async fn send_file(
-        &mut self,
-        chat_id: i64,
-        path: &std::path::Path,
-        caption: &str,
-    ) -> Result<Msg, TgError> {
-        let peer = self.ctx.peer(chat_id)?;
-        let client = self.client()?.clone();
-        let uploaded = client
-            .upload_file(path)
-            .await
-            .map_err(|e| format!("upload failed: {e}"))?;
-        let is_image = path.extension().is_some_and(|e| {
-            ["png", "jpg", "jpeg", "webp"]
-                .iter()
-                .any(|ext| e.eq_ignore_ascii_case(ext))
-        });
-        let input = if is_image {
-            InputMessage::new().text(caption).photo(uploaded)
-        } else {
-            InputMessage::new().text(caption).document(uploaded)
-        };
-        let sent = client
-            .send_message(peer, input)
-            .await
-            .map_err(|e| format!("send failed: {e}"))?;
-        Ok(convert(&self.ctx, &sent, chat_id))
+    // GdkPixbuf on this system has no webp loader; convert stickers to png.
+    // (Animated .tgs stickers fail to decode; the UI shows them as unavailable.)
+    if ext == "webp" {
+        let png = dir.join(format!("{stem}.png"));
+        let img = image::open(&path).map_err(|e| format!("sticker decode failed: {e}"))?;
+        img.save(&png).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&path);
+        return Ok(Some(png));
     }
+    Ok(Some(path))
+}
 
-    async fn edit_text(&mut self, chat_id: i64, msg_id: i32, text: &str) -> Result<Msg, TgError> {
-        let peer = self.ctx.peer(chat_id)?;
-        let client = self.client()?.clone();
-        client
-            .edit_message(peer, msg_id, InputMessage::new().text(text))
-            .await
-            .map_err(|e| format!("edit failed: {e}"))?;
-        // Re-fetch so the returned Msg carries the server's view (edited flag).
-        let fresh = client
-            .get_messages_by_id(peer, &[msg_id])
-            .await
-            .map_err(|e| e.to_string())?;
-        match fresh.into_iter().flatten().next() {
-            Some(m) => Ok(convert(&self.ctx, &m, chat_id)),
-            None => Err("edited message vanished".into()),
-        }
-    }
+async fn send_text(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    chat_id: i64,
+    text: &str,
+    reply_to: Option<i32>,
+) -> Result<Msg, TgError> {
+    let peer = ctx.peer(chat_id)?;
+    let input = InputMessage::new().text(text).reply_to(reply_to);
+    let sent = client
+        .send_message(peer, input)
+        .await
+        .map_err(|e| format!("send failed: {e}"))?;
+    Ok(convert(ctx, &sent, chat_id))
+}
 
-    async fn delete_message(&mut self, chat_id: i64, msg_id: i32) -> Result<(), TgError> {
-        let peer = self.ctx.peer(chat_id)?;
-        self.client()?
-            .delete_messages(peer, &[msg_id])
-            .await
-            .map_err(|e| format!("delete failed: {e}"))?;
-        Ok(())
-    }
+async fn send_file(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    chat_id: i64,
+    path: &std::path::Path,
+    caption: &str,
+) -> Result<Msg, TgError> {
+    let peer = ctx.peer(chat_id)?;
+    let uploaded = client
+        .upload_file(path)
+        .await
+        .map_err(|e| format!("upload failed: {e}"))?;
+    let is_image = path.extension().is_some_and(|e| {
+        ["png", "jpg", "jpeg", "webp"]
+            .iter()
+            .any(|ext| e.eq_ignore_ascii_case(ext))
+    });
+    let input = if is_image {
+        InputMessage::new().text(caption).photo(uploaded)
+    } else {
+        InputMessage::new().text(caption).document(uploaded)
+    };
+    let sent = client
+        .send_message(peer, input)
+        .await
+        .map_err(|e| format!("send failed: {e}"))?;
+    Ok(convert(ctx, &sent, chat_id))
+}
 
-    async fn mark_read(&mut self, chat_id: i64) -> Result<(), TgError> {
-        let peer = self.ctx.peer(chat_id)?;
-        let client = self.client()?.clone();
-        let mut iter = client.iter_messages(peer).limit(1);
-        if let Some(latest) = iter.next().await.map_err(|e| e.to_string())? {
-            latest.mark_as_read().await.map_err(|e| e.to_string())?;
-        }
-        Ok(())
+async fn edit_text(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    chat_id: i64,
+    msg_id: i32,
+    text: &str,
+) -> Result<Msg, TgError> {
+    let peer = ctx.peer(chat_id)?;
+    client
+        .edit_message(peer, msg_id, InputMessage::new().text(text))
+        .await
+        .map_err(|e| format!("edit failed: {e}"))?;
+    // Re-fetch so the returned Msg carries the server's view (edited flag).
+    let fresh = client
+        .get_messages_by_id(peer, &[msg_id])
+        .await
+        .map_err(|e| e.to_string())?;
+    match fresh.into_iter().flatten().next() {
+        Some(m) => Ok(convert(ctx, &m, chat_id)),
+        None => Err("edited message vanished".into()),
     }
+}
+
+async fn delete_message(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    chat_id: i64,
+    msg_id: i32,
+) -> Result<(), TgError> {
+    let peer = ctx.peer(chat_id)?;
+    client
+        .delete_messages(peer, &[msg_id])
+        .await
+        .map_err(|e| format!("delete failed: {e}"))?;
+    Ok(())
+}
+
+async fn mark_read(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<(), TgError> {
+    let peer = ctx.peer(chat_id)?;
+    let mut iter = client.iter_messages(peer).limit(1);
+    if let Some(latest) = iter.next().await.map_err(|e| e.to_string())? {
+        latest.mark_as_read().await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn media_placeholder(media: Option<&Media>) -> &'static str {
@@ -495,9 +543,17 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
             .to_string()
     };
 
+    let chat_title = {
+        let known = ctx.titles.lock().unwrap().get(&chat_id).cloned();
+        known
+            .or_else(|| m.peer().and_then(|p| p.name()).map(str::to_string))
+            .unwrap_or_default()
+    };
+
     Msg {
         id: m.id(),
         chat_id,
+        chat_title,
         sender,
         text: m.text().to_string(),
         ts: m.date().with_timezone(&Local),

@@ -39,7 +39,11 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
     unsafe { window.set_data("theme-manager", manager) };
 
     let tg = if smoke { tg::Tg::spawn_mock() } else { tg::Tg::spawn_real() };
-    let shell = Rc::new(ui::shell::Shell::new(tg));
+    // In smoke mode, --probe runs a scripted UI traversal (see specs/spec-ui.md)
+    // that quits the app on success; a failsafe below fails the run instead of
+    // hanging. Without --smoke there is nothing scriptable, so just flash-run.
+    let probe_traversal = probe && smoke;
+    let shell = Rc::new(ui::shell::Shell::new(tg, probe_traversal));
     window.set_child(Some(&shell.widget));
     window.present();
 
@@ -50,7 +54,9 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
     // Keep the shell alive with the window.
     unsafe { window.set_data("shell", shell) };
 
-    if probe {
+    if probe_traversal {
+        glib::timeout_add_seconds_local_once(20, || std::process::exit(1));
+    } else if probe {
         let app = app.clone();
         glib::timeout_add_seconds_local_once(2, move || app.quit());
     }

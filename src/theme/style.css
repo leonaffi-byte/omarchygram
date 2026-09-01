@@ -164,6 +164,44 @@ window.omg-window {
   font-size: 9pt;
 }
 
+button.omg-attach,
+button.omg-bar-close {
+  background-color: var(--bg-dark);
+  color: var(--muted);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 2px 8px;
+}
+
+button.omg-attach:hover,
+button.omg-bar-close:hover {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+popover.omg-menu > contents {
+  background-color: var(--bg-dark);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 4px;
+}
+
+button.omg-menu-item {
+  background-color: transparent;
+  color: var(--fg);
+  border: none;
+  border-radius: 4px;
+  padding: 4px 12px;
+}
+
+button.omg-menu-item:hover {
+  background-color: var(--bg-lighter);
+}
+
+button.omg-menu-item.omg-danger {
+  color: var(--red);
+}
+
 /* ---- chat switcher overlay (Ctrl+K) ---- */
 
 .omg-switcher {
