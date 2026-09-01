@@ -13,7 +13,7 @@ grammers-tl-types = "0.10.0"
 gtk4 = { version = "0.11.4", features = ["v4_12"] }
 image = "0.25.10"
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "multipart"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "io-util"] }
