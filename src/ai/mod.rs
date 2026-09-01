@@ -61,6 +61,21 @@ pub enum Task {
     Transcribe,
 }
 
+impl Task {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Task::Chat => "chat",
+            Task::Transcribe => "transcribe",
+        }
+    }
+}
+
+/// `OMG_MOCK_AI=1` (set by --smoke) answers offline with canned replies so
+/// the UI's AI paths can be traversed without keys or network.
+fn mock_ai() -> bool {
+    std::env::var("OMG_MOCK_AI").is_ok_and(|v| !v.is_empty())
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderInfo {
     pub id: &'static str,
@@ -174,6 +189,13 @@ fn shellexpand(s: &str) -> String {
 /// What can run right now, with reasons — for the settings page and the
 /// Assistant's "status" answer.
 pub async fn detect(prefs: &Prefs) -> Vec<ProviderInfo> {
+    if mock_ai() {
+        return vec![
+            ProviderInfo { id: "mock", task: Task::Chat, available: true, detail: "offline stand-in (OMG_MOCK_AI)".into() },
+            ProviderInfo { id: "ollama", task: Task::Chat, available: false, detail: "not probed in mock mode".into() },
+            ProviderInfo { id: "mock", task: Task::Transcribe, available: true, detail: "offline stand-in (OMG_MOCK_AI)".into() },
+        ];
+    }
     let keys = load_keys();
     let mut out = Vec::new();
     let key_info = |id: &'static str, task: Task, key: &Option<String>| ProviderInfo {
@@ -249,6 +271,20 @@ async fn pick_chat(prefs: &Prefs, keys: &Keys) -> Result<(&'static str, String),
 pub async fn chat(prefs: &Prefs, system: &str, messages: &[ChatMessage]) -> Result<ChatReply, String> {
     if messages.is_empty() {
         return Err("nothing to send".into());
+    }
+    if mock_ai() {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let last = messages.last().map(|m| m.content.as_str()).unwrap_or("");
+        let text = if system.contains("summarize what happened") {
+            "(mock ai) Marta asked whether Thursday is still on — that needs a reply.".to_string()
+        } else if system.contains("draft a reply") {
+            "(mock ai) Thursday works for me, see you at 7.".to_string()
+        } else if system.contains("translate") {
+            format!("(mock ai) translation: {last}")
+        } else {
+            format!("(mock ai) You said: {}", last.chars().take(80).collect::<String>())
+        };
+        return Ok(ChatReply { text, provider: "mock".into(), model: "mock".into() });
     }
     let keys = load_keys();
     let (provider, model) = pick_chat(prefs, &keys).await?;
@@ -416,6 +452,13 @@ async fn ollama_chat(prefs: &Prefs, model: &str, system: &str, messages: &[ChatM
 
 /// Transcribe an audio file (Telegram voice notes are .oga/.ogg opus).
 pub async fn transcribe(prefs: &Prefs, path: &Path) -> Result<Transcript, String> {
+    if mock_ai() {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        return Ok(Transcript {
+            text: format!("(mock transcript of {})", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+            provider: "mock".into(),
+        });
+    }
     let keys = load_keys();
     let pinned = prefs.transcribe_provider.trim().to_lowercase();
     let candidates: Vec<&str> = if pinned.is_empty() { vec!["whisper", "groq", "openai"] } else { vec![pinned.as_str()] };

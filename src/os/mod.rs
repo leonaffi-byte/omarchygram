@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -139,8 +140,10 @@ pub enum Parsed {
     List { filter: String },
     Run { name: String, args: Vec<String> },
     /// `run <command line>` — only with os.shell, and only after the UI's
-    /// confirmation dialog.
+    /// confirmation dialog (see `request_shell`).
     Shell(String),
+    /// Malformed input; show the text.
+    Error(String),
     Empty,
 }
 
@@ -155,7 +158,14 @@ pub fn parse(line: &str) -> Parsed {
     match head.as_str() {
         "help" | "?" => Parsed::Help,
         "list" | "actions" | "ls" => Parsed::List { filter: words.collect::<Vec<_>>().join(" ") },
-        "run" | "sh" | "$" => Parsed::Shell(line[head.len()..].trim().to_string()),
+        "run" | "sh" | "$" => {
+            let rest = line[head.len()..].trim().to_string();
+            if rest.is_empty() {
+                Parsed::Error("run needs a command, e.g. `run uptime`".into())
+            } else {
+                Parsed::Shell(rest)
+            }
+        }
         _ => Parsed::Run { name: head, args: words.collect() },
     }
 }
@@ -255,11 +265,51 @@ pub async fn run_action(action: &Action, args: &[String]) -> Result<String, Stri
     result
 }
 
-/// Arbitrary shell. The UI MUST only call this when `os.shell` is on AND the
-/// user confirmed this exact command line in a dialog.
-pub async fn run_shell(cmdline: &str) -> Result<String, String> {
-    let result = exec("sh", &["-c".to_string(), cmdline.to_string()]).await;
-    audit("shell", cmdline, &[], &result);
+/// A single-use permission to run one exact shell command line. Obtained via
+/// `request_shell`, consumed by `run_shell` or `cancel_shell`. Not Clone, so
+/// one request can execute at most once; at most one may be pending at a
+/// time, so duplicate confirmation dialogs cannot pile up.
+#[derive(Debug)]
+pub struct ShellTicket {
+    cmd: String,
+    _private: (),
+}
+
+impl ShellTicket {
+    pub fn command(&self) -> &str {
+        &self.cmd
+    }
+}
+
+static SHELL_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Ask for a ticket to run `cmd`. The UI shows its confirmation dialog for
+/// exactly `ticket.command()`, then calls `run_shell(ticket)` on Run or
+/// `cancel_shell(ticket)` on anything else. Err while another request is
+/// pending or the command is empty.
+pub fn request_shell(cmd: &str) -> Result<ShellTicket, String> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return Err("run needs a command".into());
+    }
+    if SHELL_PENDING.swap(true, Ordering::SeqCst) {
+        return Err("a shell command is already waiting for confirmation".into());
+    }
+    Ok(ShellTicket { cmd: cmd.to_string(), _private: () })
+}
+
+pub fn cancel_shell(ticket: ShellTicket) {
+    SHELL_PENDING.store(false, Ordering::SeqCst);
+    audit("shell-cancelled", &ticket.cmd, &[], &Ok(String::new()));
+}
+
+/// Arbitrary shell. Callable only with a ticket, i.e. after `request_shell`
+/// and the UI's confirmation for this exact command line; the UI must ALSO
+/// re-check `os.enabled && os.shell` at the moment of confirmation.
+pub async fn run_shell(ticket: ShellTicket) -> Result<String, String> {
+    SHELL_PENDING.store(false, Ordering::SeqCst);
+    let result = exec("sh", &["-c".to_string(), ticket.cmd.clone()]).await;
+    audit("shell", &ticket.cmd, &[], &result);
     result
 }
 
@@ -298,6 +348,10 @@ async fn exec(program: &str, argv: &[String]) -> Result<String, String> {
 }
 
 fn audit_path() -> PathBuf {
+    // Smoke/probe runs keep their audit log next to the throwaway settings.
+    if let Some(p) = std::env::var_os("OMG_SETTINGS_PATH") {
+        return PathBuf::from(p).with_extension("audit.log");
+    }
     dirs::state_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/state"))
         .join("omarchygram/os-audit.log")
@@ -343,7 +397,19 @@ mod tests {
             Parsed::Run { name: "notify".into(), args: vec!["build done".into(), "now".into()] }
         );
         assert_eq!(parse("run ls -la /tmp"), Parsed::Shell("ls -la /tmp".into()));
+        assert!(matches!(parse("run"), Parsed::Error(_)));
         assert_eq!(parse("list omarchy-"), Parsed::List { filter: "omarchy-".into() });
+    }
+
+    #[test]
+    fn shell_tickets_are_single_pending_and_single_use() {
+        let t = request_shell("echo hi").expect("first ticket");
+        assert!(request_shell("echo again").is_err(), "second pending must be refused");
+        cancel_shell(t);
+        let t2 = request_shell("echo hi").expect("after cancel a new ticket is allowed");
+        assert_eq!(t2.command(), "echo hi");
+        cancel_shell(t2);
+        assert!(request_shell("   ").is_err());
     }
 
     #[test]

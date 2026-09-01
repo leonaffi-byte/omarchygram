@@ -120,7 +120,7 @@ impl MockState {
         // Deni already deleted one message and edited another — anti-delete
         // and edit-history have something to show without a live event.
         let mut deleted = HashMap::new();
-        deleted.insert(2, vec![Msg { deleted: true, ..msg(200, 2, "Deni", "never mind, wrong chat", t(345), false) }]);
+        deleted.insert(2, vec![Msg { deleted: true, ..msg(205, 2, "Deni", "never mind, wrong chat", t(329), false) }]);
         let mut versions = HashMap::new();
         versions.insert(
             (2, 203),
@@ -158,6 +158,23 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
     let st = Arc::new(Mutex::new(MockState::new()));
 
     while let Some(cmd) = cmds.recv().await {
+        // Mirror the real backend: every command runs concurrently, so the
+        // UI's ordering rules get exercised offline too. OMG_MOCK_LATENCY_MS
+        // adds a delay before each data command to force out-of-order
+        // completions in tests.
+        let st = st.clone();
+        let events = events.clone();
+        tokio::spawn(async move { handle(cmd, st, events).await });
+    }
+}
+
+async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::Sender<Event>) {
+    if !matches!(cmd, Command::Start(_) | Command::SubmitPhone(..) | Command::SubmitCode(..) | Command::SubmitPassword(..)) {
+        if let Some(ms) = std::env::var("OMG_MOCK_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+    }
+    {
         match cmd {
             Command::Start(tx) => {
                 // OMG_MOCK_AUTH=1 lets the auth screens be walked offline.
@@ -219,9 +236,16 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                         }
                     }
                 };
-                if st.flags.anti_delete && before_id.is_none() {
+                if st.flags.anti_delete {
+                    // Same window as the real backend: [oldest returned, before_id).
+                    let min_id = result.first().map(|m| m.id).unwrap_or(1);
+                    let max_id = before_id.map(|b| b - 1).unwrap_or(i32::MAX);
                     if let Some(del) = st.deleted.get(&chat_id) {
-                        result.extend(del.iter().cloned());
+                        for d in del.iter().filter(|d| d.id >= min_id && d.id <= max_id) {
+                            if !result.iter().any(|m| m.id == d.id) {
+                                result.push(d.clone());
+                            }
+                        }
                         result.sort_by_key(|m| m.id);
                     }
                 }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::ai::{self, ChatMessage, ChatReply, Prefs, ProviderInfo, Transcript};
-use crate::os::{self, Action};
+use crate::os::{self, Action, ShellTicket};
 
 enum Cmd {
     Detect(Prefs, oneshot::Sender<Vec<ProviderInfo>>),
@@ -27,9 +27,9 @@ enum Cmd {
         args: Vec<String>,
         respond: oneshot::Sender<Result<String, String>>,
     },
-    /// Only after the UI's confirmation dialog (see os::run_shell).
+    /// Only with a ticket from `os::request_shell` + the UI's confirmation.
     OsShell {
-        cmdline: String,
+        ticket: ShellTicket,
         respond: oneshot::Sender<Result<String, String>>,
     },
 }
@@ -62,8 +62,8 @@ impl Local {
                             Cmd::OsRun { action, args, respond } => {
                                 let _ = respond.send(os::run_action(&action, &args).await);
                             }
-                            Cmd::OsShell { cmdline, respond } => {
-                                let _ = respond.send(os::run_shell(&cmdline).await);
+                            Cmd::OsShell { ticket, respond } => {
+                                let _ = respond.send(os::run_shell(ticket).await);
                             }
                         }
                     });
@@ -103,12 +103,13 @@ impl Local {
         rx.await.map_err(|_| "local services dropped the request".to_string())?
     }
 
-    /// Caller contract: `os.shell` enabled AND the user confirmed this exact
-    /// command line in a dialog.
-    pub async fn os_shell_confirmed(&self, cmdline: String) -> Result<String, String> {
+    /// Caller contract: the ticket came from `os::request_shell`, the user
+    /// confirmed exactly `ticket.command()` in a dialog, and `os.enabled &&
+    /// os.shell` were re-checked at that moment.
+    pub async fn os_shell_confirmed(&self, ticket: ShellTicket) -> Result<String, String> {
         let (respond, rx) = oneshot::channel();
         self.tx
-            .send(Cmd::OsShell { cmdline, respond })
+            .send(Cmd::OsShell { ticket, respond })
             .map_err(|_| "local services are gone".to_string())?;
         rx.await.map_err(|_| "local services dropped the request".to_string())?
     }

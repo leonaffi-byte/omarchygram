@@ -18,6 +18,8 @@ fn main() -> glib::ExitCode {
         let tmp = std::env::temp_dir().join(format!("omarchygram-smoke-{}.toml", std::process::id()));
         // SAFETY: called before any thread is spawned (GTK/backends start below).
         unsafe { std::env::set_var("OMG_SETTINGS_PATH", &tmp) };
+        // Offline AI stand-ins so probes can traverse the Assistant paths.
+        unsafe { std::env::set_var("OMG_MOCK_AI", "1") };
     }
 
     let app = gtk::Application::builder().application_id(APP_ID).build();
@@ -62,7 +64,9 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
     unsafe { window.set_data("shell", shell) };
 
     if probe_traversal {
-        glib::timeout_add_seconds_local_once(20, || std::process::exit(1));
+        // The traversal grows with every wave (delete/edit demos wait 2.5s
+        // each); 45s is the hard ceiling before a run counts as hung.
+        glib::timeout_add_seconds_local_once(45, || std::process::exit(1));
     } else if probe {
         let app = app.clone();
         glib::timeout_add_seconds_local_once(2, move || app.quit());
