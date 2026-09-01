@@ -1,7 +1,9 @@
 # Omarchygram feature roadmap
 
 Beyond-vanilla-Telegram features the user wants (decided 2026-09-01). Ordered
-by build wave. This is the plan; nothing here is built yet unless noted.
+by build wave. Status (2026-09-02): wave 0 foundations + wave 3 core (AI/OS
+modules) are merged; wave 1 UI is in review; waves 2, 3-UI, 4 are specced in
+`specs/` and queued.
 
 ## Design decisions (orchestrator-owned)
 
