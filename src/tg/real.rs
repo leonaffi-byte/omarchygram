@@ -148,6 +148,21 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
             Command::SubmitPassword(password, tx) => {
                 let _ = tx.send(be.submit_password(&password).await);
             }
+            Command::SetFlags(flags, tx) => {
+                // Flags take effect HERE, in the serial loop, before any later
+                // MarkRead is even spawned — ghost mode can never race a
+                // receipt. The status RPC (offline on/off) runs in the background.
+                let previous = std::mem::replace(&mut *be.ctx.flags.lock().unwrap(), flags);
+                match be.client.clone() {
+                    Some(client) => {
+                        let ctx = be.ctx.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send(apply_ghost_status(&client, &ctx, previous.ghost_mode, flags.ghost_mode).await);
+                        });
+                    }
+                    None => drop(tx.send(Ok(()))),
+                }
+            }
             data_cmd => {
                 let Some(client) = be.client.clone() else {
                     respond_not_connected(data_cmd);
@@ -206,9 +221,7 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
         Command::MarkRead { chat_id, up_to, respond } => {
             let _ = respond.send(mark_read(&client, &ctx, chat_id, up_to).await);
         }
-        Command::SetFlags(flags, tx) => {
-            let _ = tx.send(set_flags(&client, &ctx, flags).await);
-        }
+        Command::SetFlags(..) => unreachable!("flags are applied in the serial loop"),
         Command::GetHistoryAtDate { chat_id, date, respond } => {
             let _ = respond.send(get_history_at_date(&client, &ctx, chat_id, date).await);
         }
@@ -385,7 +398,9 @@ async fn get_dialogs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<ChatSummary>
             tl::enums::Dialog::Folder(_) => 0,
         };
         if let Some(m) = last {
-            register_media(ctx, m, chat_id);
+            // convert() registers media AND records the message in the archive,
+            // so a message deleted before its chat is ever opened is recoverable.
+            let _ = convert(ctx, m, chat_id);
         }
         out.push(ChatSummary {
             id: chat_id,
@@ -434,9 +449,14 @@ async fn merge_deleted(ctx: &Ctx, chat_id: i64, before_id: Option<i32>, page: &m
     if max_id < min_id {
         return;
     }
-    let deleted = archive.deleted_between(chat_id, min_id, max_id).await;
+    let mut deleted = archive.deleted_between(chat_id, min_id, max_id).await;
     if deleted.is_empty() {
         return;
+    }
+    // Keep the newest 200 on an unbounded first page; older ones come with paging.
+    if deleted.len() > 200 {
+        let cut = deleted.len() - 200;
+        deleted.drain(..cut);
     }
     let title = ctx.titles.lock().unwrap().get(&chat_id).cloned().unwrap_or_default();
     for mut d in deleted {
@@ -472,14 +492,30 @@ async fn get_history_at_date(
     Ok(out)
 }
 
-async fn set_flags(client: &Client, ctx: &Arc<Ctx>, flags: BackendFlags) -> Result<(), TgError> {
-    let was_ghost = { std::mem::replace(&mut *ctx.flags.lock().unwrap(), flags).ghost_mode };
-    if flags.ghost_mode && !was_ghost {
-        // Appear offline now; ghost mark_read is a no-op from here on.
-        client
-            .invoke(&tl::functions::account::UpdateStatus { offline: true })
-            .await
-            .map_err(|e| format!("could not set offline status: {e}"))?;
+/// Ghost on: tell Telegram we're offline now and keep re-asserting it every
+/// minute (sending a message or fetching can flip us online). Ghost off:
+/// send `offline: false` once. Read receipts are already suppressed by the
+/// flag itself; this only covers presence.
+async fn apply_ghost_status(client: &Client, ctx: &Arc<Ctx>, was: bool, now: bool) -> Result<(), TgError> {
+    if now == was {
+        return Ok(());
+    }
+    client
+        .invoke(&tl::functions::account::UpdateStatus { offline: now })
+        .await
+        .map_err(|e| format!("could not update online status: {e}"))?;
+    if now {
+        let client = client.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                if !ctx.flags.lock().unwrap().ghost_mode {
+                    return;
+                }
+                let _ = client.invoke(&tl::functions::account::UpdateStatus { offline: true }).await;
+            }
+        });
     }
     Ok(())
 }
@@ -757,7 +793,10 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
         chat_id,
         chat_title,
         sender,
-        sender_id: m.sender_id().map(|p| p.bot_api_dialog_id_unchecked()),
+        sender_id: m
+            .sender_id()
+            .filter(|p| p.kind() == grammers_client::session::types::PeerKind::User)
+            .and_then(|p| p.bot_api_dialog_id()),
         text: m.text().to_string(),
         ts: m.date().with_timezone(&Local),
         outgoing: m.outgoing(),
@@ -810,7 +849,10 @@ async fn consume_updates(
                     // Without an archive only channel deletions are attributable.
                     None => match channel_chat {
                         Some(c) => d.messages().iter().map(|&id| (c, id)).collect(),
-                        None => vec![],
+                        None => {
+                            eprintln!("omarchygram: archive disabled — cannot attribute a deletion of {} message(s)", d.messages().len());
+                            vec![]
+                        }
                     },
                 };
                 let mut by_chat: HashMap<i64, Vec<i32>> = HashMap::new();

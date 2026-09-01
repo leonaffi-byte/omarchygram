@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 const OMARCHY_BIN: &str = "/usr/share/omarchy/bin";
@@ -40,7 +41,20 @@ pub struct Action {
     /// For User actions the command line runs through `sh -c` with args as $@.
     shell_line: Option<String>,
     pub source: Source,
+    /// Launches a terminal/shell: never accepts arguments through `run_action`
+    /// (that would bypass the `run` confirmation gate) — `run` is the path.
+    pub shell_capable: bool,
 }
+
+/// What the caller is allowed to do right now (from settings, re-read at
+/// dispatch time by the UI and enforced here too).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OsPolicy {
+    pub enabled: bool,
+    pub shell: bool,
+}
+
+const RESERVED: &[&str] = &["help", "?", "list", "actions", "ls", "run", "sh", "$"];
 
 /// Curated builtins: (name, summary, args hint, argv).
 const BUILTINS: &[(&str, &str, &str, &[&str])] = &[
@@ -51,7 +65,7 @@ const BUILTINS: &[(&str, &str, &str, &[&str])] = &[
     ("theme", "Apply an Omarchy theme", "<theme-name>", &["omarchy-theme-set"]),
     ("themes", "List available themes", "", &["omarchy-theme-list"]),
     ("theme-current", "Show the active theme", "", &["omarchy-theme-current"]),
-    ("terminal", "Open a terminal (optionally running a command)", "[command...]", &["omarchy-launch-terminal"]),
+    ("terminal", "Open a terminal", "", &["omarchy-launch-terminal"]),
     ("transparency", "Toggle transparency of the focused window", "", &["omarchy-hyprland-window-transparency-toggle"]),
     ("status", "Uptime, memory and disk at a glance", "", &["sh", "-c", "uptime; echo; free -h; echo; df -h ~ | tail -1"]),
 ];
@@ -68,19 +82,30 @@ pub fn catalog(user_actions: &BTreeMap<String, String>) -> Vec<Action> {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             shell_line: None,
             source: Source::Builtin,
+            shell_capable: *name == "terminal",
         })
         .collect();
     for (name, line) in user_actions {
-        if name.trim().is_empty() || line.trim().is_empty() {
+        let n = name.trim();
+        if n.is_empty() || line.trim().is_empty() {
+            continue;
+        }
+        let lower = n.to_lowercase();
+        if RESERVED.contains(&lower.as_str()) || out.iter().any(|a| a.name.eq_ignore_ascii_case(n)) {
+            eprintln!("omarchygram: ignoring user action `{n}`: name is reserved or shadows a builtin");
             continue;
         }
         out.push(Action {
-            name: name.clone(),
+            name: n.to_string(),
             summary: format!("your action: {line}"),
             args: "[args...]".into(),
             argv: vec![],
             shell_line: Some(line.clone()),
             source: Source::User,
+            // A user-defined command line is shell by construction; it is the
+            // user's own config, but args are still refused if it looks like
+            // a shell/terminal launcher.
+            shell_capable: false,
         });
     }
     let taken: Vec<String> = out.iter().map(|a| a.name.clone()).collect();
@@ -121,13 +146,20 @@ fn discover_omarchy() -> Vec<Action> {
             .find_map(|l| l.strip_prefix("# omarchy:args="))
             .unwrap_or("")
             .to_string();
+        let lname = name.to_lowercase();
+        let shell_capable = lname.contains("terminal")
+            || lname.contains("shell")
+            || lname.contains("-tui")
+            || args.to_lowercase().contains("command");
         out.push(Action {
             name: name.to_string(),
             summary: summary.trim().to_string(),
             args,
-            argv: vec![name.to_string()],
+            // Run by the known absolute path, never by PATH lookup.
+            argv: vec![p.to_string_lossy().to_string()],
             shell_line: None,
             source: Source::Omarchy,
+            shell_capable,
         });
     }
     out
@@ -153,25 +185,37 @@ pub fn parse(line: &str) -> Parsed {
     if line.is_empty() {
         return Parsed::Empty;
     }
-    let mut words = shell_words(line).into_iter();
-    let Some(head) = words.next() else { return Parsed::Empty };
-    match head.as_str() {
-        "help" | "?" => Parsed::Help,
-        "list" | "actions" | "ls" => Parsed::List { filter: words.collect::<Vec<_>>().join(" ") },
+    // The keyword is matched on the RAW first token (so a quoted "run" is not
+    // a keyword) and the shell remainder is the raw text after it.
+    let raw_head_len = line.find(char::is_whitespace).unwrap_or(line.len());
+    let raw_head = &line[..raw_head_len];
+    match raw_head {
+        "help" | "?" => return Parsed::Help,
         "run" | "sh" | "$" => {
-            let rest = line[head.len()..].trim().to_string();
-            if rest.is_empty() {
+            let rest = line[raw_head_len..].trim().to_string();
+            return if rest.is_empty() {
                 Parsed::Error("run needs a command, e.g. `run uptime`".into())
             } else {
                 Parsed::Shell(rest)
-            }
+            };
         }
+        _ => {}
+    }
+    let words = match shell_words(line) {
+        Ok(w) => w,
+        Err(e) => return Parsed::Error(e),
+    };
+    let mut words = words.into_iter();
+    let Some(head) = words.next() else { return Parsed::Empty };
+    match head.as_str() {
+        "list" | "actions" | "ls" => Parsed::List { filter: words.collect::<Vec<_>>().join(" ") },
         _ => Parsed::Run { name: head, args: words.collect() },
     }
 }
 
 /// Minimal POSIX-ish word splitting with single/double quotes and backslash.
-fn shell_words(s: &str) -> Vec<String> {
+/// Unterminated quotes and a trailing backslash are errors, not guesses.
+fn shell_words(s: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -180,16 +224,19 @@ fn shell_words(s: &str) -> Vec<String> {
     while let Some(c) = chars.next() {
         match (quote, c) {
             (Some(q), ch) if ch == q => quote = None,
+            (Some('"'), '\\') => match chars.next() {
+                Some(n) => cur.push(n),
+                None => return Err("trailing backslash".into()),
+            },
             (Some(_), ch) => cur.push(ch),
             (None, '\'') | (None, '"') => {
                 quote = Some(c);
                 had = true;
             }
-            (None, '\\') => {
-                if let Some(n) = chars.next() {
-                    cur.push(n);
-                }
-            }
+            (None, '\\') => match chars.next() {
+                Some(n) => cur.push(n),
+                None => return Err("trailing backslash".into()),
+            },
             (None, ch) if ch.is_whitespace() => {
                 if !cur.is_empty() || had {
                     out.push(std::mem::take(&mut cur));
@@ -199,10 +246,13 @@ fn shell_words(s: &str) -> Vec<String> {
             (None, ch) => cur.push(ch),
         }
     }
+    if quote.is_some() {
+        return Err("unterminated quote".into());
+    }
     if !cur.is_empty() || had {
         out.push(cur);
     }
-    out
+    Ok(out)
 }
 
 pub fn help_text(actions: &[Action]) -> String {
@@ -241,9 +291,29 @@ pub fn list_text(actions: &[Action], filter: &str) -> String {
     s
 }
 
-/// Execute a catalog action with user args. Output is stdout+stderr,
-/// truncated; a non-zero exit is reported in the text, not as Err.
-pub async fn run_action(action: &Action, args: &[String]) -> Result<String, String> {
+/// Execute a catalog action with user args under `policy`. Output is
+/// stdout+stderr, bounded; a non-zero exit is reported in the text, not as Err.
+pub async fn run_action(action: &Action, args: &[String], policy: OsPolicy) -> Result<String, String> {
+    if !policy.enabled {
+        return Err("Omarchy actions are off — enable them in Settings".into());
+    }
+    if action.shell_capable && !args.is_empty() {
+        return Err(format!(
+            "`{}` launches a shell; it takes no arguments here. Use `run <command>` (needs 'Allow shell commands').",
+            action.name
+        ));
+    }
+    // Arguments starting with '-' are options for the target program; only
+    // allow them when the action documents options in its args hint.
+    let allows_options = action.args.contains('-');
+    if !allows_options {
+        if let Some(bad) = args.iter().find(|a| a.starts_with('-')) {
+            return Err(format!("`{}` does not take options (got `{bad}`)", action.name));
+        }
+    }
+    if action.name == "notify" && args.is_empty() {
+        return Err("notify needs some text".into());
+    }
     let (program, argv): (String, Vec<String>) = match &action.shell_line {
         Some(line) => {
             let mut v = vec!["-c".to_string(), format!("{line} \"$@\""), "omarchygram".to_string()];
@@ -251,15 +321,20 @@ pub async fn run_action(action: &Action, args: &[String]) -> Result<String, Stri
             ("sh".to_string(), v)
         }
         None => {
+            debug_assert!(!action.argv.is_empty(), "catalog actions always carry a program");
             let mut v = action.argv.clone();
-            let program = v.remove(0);
+            let mut program = v.remove(0);
+            // Builtins name Omarchy tools bare; pin them to the trusted dir.
+            if !program.contains('/') {
+                let pinned = Path::new(OMARCHY_BIN).join(&program);
+                if pinned.is_file() {
+                    program = pinned.to_string_lossy().to_string();
+                }
+            }
             v.extend(args.iter().cloned());
             (program, v)
         }
     };
-    if action.name == "notify" && args.is_empty() {
-        return Err("notify needs some text".into());
-    }
     let result = exec(&program, &argv).await;
     audit("action", &action.name, args, &result);
     result
@@ -313,17 +388,46 @@ pub async fn run_shell(ticket: ShellTicket) -> Result<String, String> {
     result
 }
 
+const MAX_PIPE_BYTES: u64 = 64 * 1024;
+
 async fn exec(program: &str, argv: &[String]) -> Result<String, String> {
     let mut cmd = Command::new(program);
-    cmd.args(argv).kill_on_drop(true).stdin(std::process::Stdio::null());
-    let child = cmd.output();
-    let out = match tokio::time::timeout(TIMEOUT, child).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(format!("could not start `{program}`: {e}")),
-        Err(_) => return Err(format!("`{program}` timed out after {}s", TIMEOUT.as_secs())),
+    cmd.args(argv)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Own process group so a timeout can take down grandchildren too.
+        .process_group(0);
+    let mut child = cmd.spawn().map_err(|e| format!("could not start `{program}`: {e}"))?;
+    let pid = child.id();
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    // Read at most MAX_PIPE_BYTES from each pipe — a chatty process cannot
+    // exhaust memory; past the cap its writes block until the timeout kills it.
+    let read_all = async {
+        let mut ob = Vec::new();
+        let mut eb = Vec::new();
+        let mut so = (&mut stdout).take(MAX_PIPE_BYTES);
+        let mut se = (&mut stderr).take(MAX_PIPE_BYTES);
+        let _ = tokio::join!(so.read_to_end(&mut ob), se.read_to_end(&mut eb));
+        (ob, eb)
     };
-    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let run = async {
+        let (ob, eb) = read_all.await;
+        let status = child.wait().await;
+        (ob, eb, status)
+    };
+    let (ob, eb, status) = match tokio::time::timeout(TIMEOUT, run).await {
+        Ok(r) => r,
+        Err(_) => {
+            kill_group(pid);
+            return Err(format!("`{program}` timed out after {}s", TIMEOUT.as_secs()));
+        }
+    };
+    let status = status.map_err(|e| format!("`{program}`: {e}"))?;
+    let mut text = String::from_utf8_lossy(&ob).to_string();
+    let err = String::from_utf8_lossy(&eb);
     if !err.trim().is_empty() {
         if !text.is_empty() {
             text.push('\n');
@@ -334,8 +438,8 @@ async fn exec(program: &str, argv: &[String]) -> Result<String, String> {
     if text.chars().count() > MAX_OUTPUT {
         text = text.chars().take(MAX_OUTPUT).collect::<String>() + "\n…(truncated)";
     }
-    if !out.status.success() {
-        let code = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+    if !status.success() {
+        let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
         if text.is_empty() {
             text = format!("exited with status {code}");
         } else {
@@ -345,6 +449,17 @@ async fn exec(program: &str, argv: &[String]) -> Result<String, String> {
         text = "done".into();
     }
     Ok(text)
+}
+
+/// Best-effort kill of the whole process group (the child is its leader).
+fn kill_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 fn audit_path() -> PathBuf {
@@ -362,6 +477,8 @@ fn audit(kind: &str, what: &str, args: &[String], result: &Result<String, String
     let p = audit_path();
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
     let outcome = match result {
         Ok(t) => format!("ok: {}", t.lines().next().unwrap_or("").chars().take(200).collect::<String>()),
@@ -372,10 +489,10 @@ fn audit(kind: &str, what: &str, args: &[String], result: &Result<String, String
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
         args.join(" ")
     );
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Private from the first byte (mode applies at creation).
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&p) {
         let _ = f.write_all(line.as_bytes());
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
     }
 }
 
@@ -399,6 +516,26 @@ mod tests {
         assert_eq!(parse("run ls -la /tmp"), Parsed::Shell("ls -la /tmp".into()));
         assert!(matches!(parse("run"), Parsed::Error(_)));
         assert_eq!(parse("list omarchy-"), Parsed::List { filter: "omarchy-".into() });
+        assert!(matches!(parse("notify \"unterminated"), Parsed::Error(_)));
+        // A quoted keyword is not a keyword, and the shell remainder is raw text.
+        assert_eq!(parse("run \"echo hi\" | cat"), Parsed::Shell("\"echo hi\" | cat".into()));
+    }
+
+    #[test]
+    fn terminal_refuses_args_and_user_actions_cannot_shadow() {
+        let mut user = BTreeMap::new();
+        user.insert("run".to_string(), "echo pwned".to_string());
+        user.insert("Screenshot".to_string(), "echo pwned".to_string());
+        let c = catalog(&user);
+        assert!(!c.iter().any(|a| a.source == Source::User), "reserved/shadowing names are dropped");
+        let term = c.iter().find(|a| a.name == "terminal").unwrap();
+        assert!(term.shell_capable);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let policy = OsPolicy { enabled: true, shell: false };
+        let r = rt.block_on(run_action(term, &["bash".into()], policy));
+        assert!(r.is_err(), "terminal with args must be refused");
+        let off = rt.block_on(run_action(term, &[], OsPolicy::default()));
+        assert!(off.unwrap_err().contains("off"));
     }
 
     #[test]

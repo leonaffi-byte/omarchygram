@@ -139,14 +139,26 @@ pub fn load() -> Settings {
 }
 
 pub fn save(settings: &Settings) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let p = path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
     let text = toml::to_string_pretty(settings).map_err(std::io::Error::other)?;
-    // Write-then-rename so a reader never sees a half-written file.
+    // Private temp file (holds user command lines), fsync, then rename so a
+    // reader never sees a half-written file and a crash never truncates it.
     let tmp = p.with_extension("toml.tmp");
-    std::fs::write(&tmp, text)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
     std::fs::rename(&tmp, &p)
 }
 
@@ -175,18 +187,26 @@ impl SettingsStore {
         self.current.borrow().clone()
     }
 
-    /// Mutate, persist, and notify listeners. Listeners run synchronously
-    /// after the borrow is released.
+    /// Mutate, persist, and notify listeners. The change is committed to the
+    /// live state ONLY if it could be saved, so controls and backend flags
+    /// never diverge from disk. Failures are logged; see `try_update`.
     pub fn update(&self, f: impl FnOnce(&mut Settings)) {
-        let snapshot = {
-            let mut s = self.current.borrow_mut();
-            f(&mut s);
-            s.clone()
-        };
-        if let Err(e) = save(&snapshot) {
+        if let Err(e) = self.try_update(f) {
             eprintln!("omarchygram: could not save settings: {e}");
         }
-        self.notify(&snapshot);
+    }
+
+    /// Like `update` but reports a save failure (nothing changes on Err).
+    pub fn try_update(&self, f: impl FnOnce(&mut Settings)) -> Result<(), String> {
+        let candidate = {
+            let mut c = self.current.borrow().clone();
+            f(&mut c);
+            c
+        };
+        save(&candidate).map_err(|e| e.to_string())?;
+        *self.current.borrow_mut() = candidate.clone();
+        self.notify(&candidate);
+        Ok(())
     }
 
     pub fn on_change(&self, f: impl Fn(&Settings) + 'static) {

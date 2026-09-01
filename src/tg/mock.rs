@@ -292,10 +292,11 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     st.next_id += 1; // reserve the reply's id
                     sent
                 };
-                let lower = text.to_lowercase();
-                let demo = if lower.contains("delete") {
+                // Whole-word triggers only ("editor"/"undeleted" don't count).
+                let words: Vec<String> = text.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()).collect();
+                let demo = if words.iter().any(|w| w == "delete") {
                     Demo::DeleteReply
-                } else if lower.contains("edit") {
+                } else if words.iter().any(|w| w == "edit") {
                     Demo::EditReply
                 } else {
                     Demo::None

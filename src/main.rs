@@ -15,7 +15,9 @@ fn main() -> glib::ExitCode {
 
     if smoke {
         // Never let offline demo/probe runs touch the user's real settings.
-        let tmp = std::env::temp_dir().join(format!("omarchygram-smoke-{}.toml", std::process::id()));
+        // $XDG_RUNTIME_DIR is per-user 0700; /tmp only as a last resort.
+        let base = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
+        let tmp = base.join(format!("omarchygram-smoke-{}.toml", std::process::id()));
         // SAFETY: called before any thread is spawned (GTK/backends start below).
         unsafe { std::env::set_var("OMG_SETTINGS_PATH", &tmp) };
         // Offline AI stand-ins so probes can traverse the Assistant paths.

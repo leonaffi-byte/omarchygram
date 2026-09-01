@@ -54,6 +54,22 @@ fn media_kind(s: &Option<String>) -> Option<MediaKind> {
     }
 }
 
+/// 0600 on the db and any -wal/-shm/-journal sidecar that exists.
+fn restrict(db: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut targets = vec![db.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut os = db.as_os_str().to_owned();
+        os.push(suffix);
+        targets.push(PathBuf::from(os));
+    }
+    for t in targets {
+        if t.exists() {
+            let _ = std::fs::set_permissions(&t, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
 fn opt_text(v: Value) -> Option<String> {
     match v {
         Value::Text(s) => Some(s),
@@ -75,16 +91,17 @@ impl Archive {
         let p = path();
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            use std::os::unix::fs::PermissionsExt;
+            // The 0700 dir is the primary barrier around message text.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("archive dir permissions: {e}"))?;
         }
         let db = libsql::Builder::new_local(&p)
             .build()
             .await
             .map_err(|e| format!("archive open: {e}"))?;
         let conn = db.connect().map_err(|e| format!("archive connect: {e}"))?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-        }
+        restrict(&p);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages(
                chat_id INTEGER NOT NULL, msg_id INTEGER NOT NULL,
@@ -102,8 +119,13 @@ impl Archive {
         )
         .await
         .map_err(|e| format!("archive schema: {e}"))?;
+        restrict(&p); // sidecars may have appeared during schema setup
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(writer(conn, rx));
+        let p2 = p.clone();
+        tokio::spawn(async move {
+            writer(conn, rx).await;
+            restrict(&p2);
+        });
         Ok(Archive { tx })
     }
 
@@ -138,11 +160,25 @@ impl Archive {
 }
 
 async fn writer(conn: Connection, mut rx: mpsc::UnboundedReceiver<Op>) {
+    let mut writes: u64 = 0;
     while let Some(op) = rx.recv().await {
         match op {
             Op::Upsert(m) => {
-                if let Err(e) = upsert(&conn, &m).await {
-                    eprintln!("omarchygram: archive write failed: {e}");
+                // Version + upsert in ONE transaction: a crash between them
+                // can't leave a stale current text or duplicate a version.
+                let _ = conn.execute("BEGIN", ()).await;
+                match upsert(&conn, &m).await {
+                    Ok(()) => {
+                        let _ = conn.execute("COMMIT", ()).await;
+                    }
+                    Err(e) => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        eprintln!("omarchygram: archive write failed: {e}");
+                    }
+                }
+                writes += 1;
+                if writes == 1 || writes % 200 == 0 {
+                    restrict(&path()); // sidecars appear lazily
                 }
             }
             Op::MarkDeleted { chat_id, ids, respond } => {

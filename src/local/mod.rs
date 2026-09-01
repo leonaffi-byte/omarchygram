@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::ai::{self, ChatMessage, ChatReply, Prefs, ProviderInfo, Transcript};
-use crate::os::{self, Action, ShellTicket};
+use crate::os::{self, Action, OsPolicy, ShellTicket};
 
 enum Cmd {
     Detect(Prefs, oneshot::Sender<Vec<ProviderInfo>>),
@@ -25,6 +25,7 @@ enum Cmd {
     OsRun {
         action: Action,
         args: Vec<String>,
+        policy: OsPolicy,
         respond: oneshot::Sender<Result<String, String>>,
     },
     /// Only with a ticket from `os::request_shell` + the UI's confirmation.
@@ -59,8 +60,8 @@ impl Local {
                             Cmd::Transcribe { prefs, path, respond } => {
                                 let _ = respond.send(ai::transcribe(&prefs, &path).await);
                             }
-                            Cmd::OsRun { action, args, respond } => {
-                                let _ = respond.send(os::run_action(&action, &args).await);
+                            Cmd::OsRun { action, args, policy, respond } => {
+                                let _ = respond.send(os::run_action(&action, &args, policy).await);
                             }
                             Cmd::OsShell { ticket, respond } => {
                                 let _ = respond.send(os::run_shell(ticket).await);
@@ -95,10 +96,12 @@ impl Local {
         rx.await.map_err(|_| "local services dropped the request".to_string())?
     }
 
-    pub async fn os_run(&self, action: Action, args: Vec<String>) -> Result<String, String> {
+    /// `policy` is the CURRENT settings (re-read at dispatch), enforced here
+    /// as well as in the UI.
+    pub async fn os_run(&self, action: Action, args: Vec<String>, policy: OsPolicy) -> Result<String, String> {
         let (respond, rx) = oneshot::channel();
         self.tx
-            .send(Cmd::OsRun { action, args, respond })
+            .send(Cmd::OsRun { action, args, policy, respond })
             .map_err(|_| "local services are gone".to_string())?;
         rx.await.map_err(|_| "local services dropped the request".to_string())?
     }

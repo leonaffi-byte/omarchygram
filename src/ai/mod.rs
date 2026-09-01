@@ -144,8 +144,20 @@ async fn ollama_models(prefs: &Prefs) -> Option<Vec<String>> {
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .filter(|d| !d.as_os_str().is_empty()) // an empty component means cwd — never
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file() && std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0))
+}
+
+/// True when local whisper can actually run (binary + model + ffmpeg).
+fn whisper_ready(keys: &Keys) -> Option<(PathBuf, PathBuf)> {
+    let bin = whisper_binary()?;
+    let model = whisper_model(keys)?;
+    which("ffmpeg")?;
+    Some((bin, model))
 }
 
 fn whisper_binary() -> Option<PathBuf> {
@@ -288,8 +300,13 @@ pub async fn chat(prefs: &Prefs, system: &str, messages: &[ChatMessage]) -> Resu
     }
     let keys = load_keys();
     let (provider, model) = pick_chat(prefs, &keys).await?;
+    let mut model = model;
     let text = match provider {
-        "anthropic" => anthropic_chat(keys.anthropic.as_deref().unwrap(), &model, system, messages).await?,
+        "anthropic" => {
+            let (text, served) = anthropic_chat(keys.anthropic.as_deref().unwrap(), &model, system, messages).await?;
+            model = served;
+            text
+        }
         "openai" => openai_compat_chat("https://api.openai.com/v1", keys.openai.as_deref().unwrap(), &model, system, messages).await?,
         "groq" => openai_compat_chat("https://api.groq.com/openai/v1", keys.groq.as_deref().unwrap(), &model, system, messages).await?,
         "gemini" => gemini_chat(keys.gemini.as_deref().unwrap(), &model, system, messages).await?,
@@ -312,7 +329,7 @@ fn http_err(provider: &str, status: reqwest::StatusCode, body: &str) -> String {
     format!("{provider}: HTTP {status}: {msg}")
 }
 
-async fn anthropic_chat(key: &str, model: &str, system: &str, messages: &[ChatMessage]) -> Result<String, String> {
+async fn anthropic_chat(key: &str, model: &str, system: &str, messages: &[ChatMessage]) -> Result<(String, String), String> {
     let msgs: Vec<Value> = messages
         .iter()
         .map(|m| json!({"role": if m.role == Role::User {"user"} else {"assistant"}, "content": m.content}))
@@ -362,7 +379,9 @@ async fn anthropic_chat(key: &str, model: &str, system: &str, messages: &[ChatMe
     if out.trim().is_empty() {
         return Err("anthropic: empty response".into());
     }
-    Ok(out)
+    // With server-side fallback the served model can differ from the requested one.
+    let served = v.get("model").and_then(|m| m.as_str()).unwrap_or(model).to_string();
+    Ok((out, served))
 }
 
 async fn openai_compat_chat(base: &str, key: &str, model: &str, system: &str, messages: &[ChatMessage]) -> Result<String, String> {
@@ -462,35 +481,48 @@ pub async fn transcribe(prefs: &Prefs, path: &Path) -> Result<Transcript, String
     let keys = load_keys();
     let pinned = prefs.transcribe_provider.trim().to_lowercase();
     let candidates: Vec<&str> = if pinned.is_empty() { vec!["whisper", "groq", "openai"] } else { vec![pinned.as_str()] };
+    // Unpinned: a failing provider falls through to the next; pinned: its
+    // error is the answer.
+    let mut last_err: Option<String> = None;
     for id in candidates {
-        match id {
-            "whisper" => {
-                if let (Some(bin), Some(model)) = (whisper_binary(), whisper_model(&keys)) {
-                    let text = whisper_local(&bin, &model, path).await?;
-                    return Ok(Transcript { text, provider: "whisper".into() });
+        let result: Option<Result<String, String>> = match id {
+            "whisper" => match whisper_ready(&keys) {
+                Some((bin, model)) => Some(whisper_local(&bin, &model, path).await),
+                None => None,
+            },
+            "groq" if keys.groq.is_some() => Some(
+                audio_api("groq", "https://api.groq.com/openai/v1", keys.groq.as_deref().unwrap(), "whisper-large-v3-turbo", path).await,
+            ),
+            "openai" if keys.openai.is_some() => Some(
+                audio_api("openai", "https://api.openai.com/v1", keys.openai.as_deref().unwrap(), "whisper-1", path).await,
+            ),
+            _ => None,
+        };
+        match result {
+            Some(Ok(text)) => return Ok(Transcript { text, provider: id.to_string() }),
+            Some(Err(e)) => {
+                if !pinned.is_empty() {
+                    return Err(e);
                 }
+                last_err = Some(e);
             }
-            "groq" if keys.groq.is_some() => {
-                let text = audio_api("groq", "https://api.groq.com/openai/v1", keys.groq.as_deref().unwrap(), "whisper-large-v3-turbo", path).await?;
-                return Ok(Transcript { text, provider: "groq".into() });
-            }
-            "openai" if keys.openai.is_some() => {
-                let text = audio_api("openai", "https://api.openai.com/v1", keys.openai.as_deref().unwrap(), "whisper-1", path).await?;
-                return Ok(Transcript { text, provider: "openai".into() });
-            }
-            _ => {}
+            None => {}
         }
     }
-    Err(if pinned.is_empty() {
-        "no transcription provider available — install whisper.cpp (+ a ggml model) or add a groq/openai key".into()
-    } else {
-        format!("transcription provider '{pinned}' is not available")
+    Err(match last_err {
+        Some(e) => e,
+        None if pinned.is_empty() => {
+            "no transcription provider available — install whisper.cpp (+ a ggml model + ffmpeg) or add a groq/openai key".into()
+        }
+        None => format!("transcription provider '{pinned}' is not available"),
     })
 }
 
 async fn audio_api(name: &str, base: &str, key: &str, model: &str, path: &Path) -> Result<String, String> {
     let bytes = tokio::fs::read(path).await.map_err(|e| format!("read audio: {e}"))?;
-    let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "audio.ogg".into());
+    // Never leak chat/message ids (the cache filename) to a vendor.
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("ogg");
+    let fname = format!("audio.{ext}");
     let mime = match path.extension().and_then(|e| e.to_str()) {
         Some("oga") | Some("ogg") | Some("opus") => "audio/ogg",
         Some("mp3") => "audio/mpeg",
@@ -516,17 +548,39 @@ async fn audio_api(name: &str, base: &str, key: &str, model: &str, path: &Path) 
     v.get("text").and_then(|t| t.as_str()).map(|s| s.trim().to_string()).ok_or_else(|| format!("{name}: no text in response"))
 }
 
+/// Removes the temp wav on every exit path.
+struct TempWav(PathBuf);
+impl Drop for TempWav {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 async fn whisper_local(bin: &Path, model: &Path, path: &Path) -> Result<String, String> {
-    // whisper.cpp wants 16 kHz mono wav; ffmpeg converts anything Telegram sends.
-    let wav = std::env::temp_dir().join(format!("omarchygram-{}-{}.wav", std::process::id(), chrono::Local::now().timestamp_millis()));
-    let ff = tokio::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-i"])
-        .arg(path)
-        .args(["-ar", "16000", "-ac", "1", "-f", "wav"])
-        .arg(&wav)
-        .output()
-        .await
-        .map_err(|e| format!("ffmpeg: {e}"))?;
+    // whisper.cpp wants 16 kHz mono wav; ffmpeg converts anything Telegram
+    // sends. The wav lives in the 0700 media cache, never in /tmp.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = crate::tg::paths::media_dir().join("tmp");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let wav = TempWav(dir.join(format!("transcribe-{}-{seq}.wav", std::process::id())));
+    let ff = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-y", "-loglevel", "error", "-i"])
+            .arg(path)
+            .args(["-ar", "16000", "-ac", "1", "-f", "wav"])
+            .arg(&wav.0)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "ffmpeg timed out".to_string())?
+    .map_err(|e| format!("ffmpeg: {e}"))?;
     if !ff.status.success() {
         return Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&ff.stderr).trim()));
     }
@@ -534,14 +588,14 @@ async fn whisper_local(bin: &Path, model: &Path, path: &Path) -> Result<String, 
         Duration::from_secs(300),
         tokio::process::Command::new(bin)
             .arg("-m").arg(model)
-            .arg("-f").arg(&wav)
+            .arg("-f").arg(&wav.0)
             .args(["-nt", "-np"])
+            .kill_on_drop(true)
             .output(),
     )
     .await
     .map_err(|_| "whisper timed out".to_string())?
     .map_err(|e| format!("whisper: {e}"))?;
-    let _ = tokio::fs::remove_file(&wav).await;
     if !out.status.success() {
         return Err(format!("whisper failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
