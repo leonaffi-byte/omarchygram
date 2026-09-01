@@ -1,0 +1,194 @@
+/* Omarchygram design system. Dollar-placeholders are filled from the active Omarchy theme
+   (~/.local/state/omarchy/current/theme/colors.toml) — see theme/omarchy.py.
+   Widgets opt in via the omg-* classes below; colors ONLY via var(). */
+
+:root {
+  --bg: $background;
+  --bg-dark: $dark_background;
+  --bg-darker: $darker_background;
+  --bg-lighter: $lighter_background;
+  --fg: $foreground;
+  --fg-light: $light_foreground;
+  --muted: $muted;
+  --accent: $accent;
+  --selection: $selection;
+  --red: $red;
+}
+
+window.omg-window {
+  background-color: var(--bg);
+  color: var(--fg);
+  font-family: "JetBrainsMono Nerd Font", monospace;
+  font-size: 10.5pt;
+}
+
+.omg-window selection {
+  background-color: var(--selection);
+  color: var(--fg);
+}
+
+/* ---- sidebar / chat list ---- */
+
+.omg-sidebar {
+  background-color: var(--bg-dark);
+  border-right: 1px solid var(--bg-lighter);
+}
+
+.omg-chat-row {
+  padding: 8px 12px;
+  background-color: transparent;
+  border-left: 2px solid transparent;
+}
+
+.omg-chat-row:hover {
+  background-color: var(--bg-lighter);
+}
+
+.omg-chat-row:selected {
+  background-color: var(--bg-lighter);
+  border-left: 2px solid var(--accent);
+}
+
+.omg-chat-title {
+  color: var(--fg);
+}
+
+.omg-chat-preview,
+.omg-chat-time {
+  color: var(--muted);
+  font-size: 9pt;
+}
+
+.omg-unread {
+  background-color: var(--accent);
+  color: var(--bg-darker);
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 8.5pt;
+  font-weight: bold;
+}
+
+/* ---- message pane ---- */
+
+.omg-messages {
+  background-color: var(--bg);
+}
+
+.omg-chat-header {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--bg-lighter);
+  color: var(--fg);
+}
+
+.omg-msg {
+  padding: 6px 10px;
+  border-radius: 4px;
+  margin: 2px 0;
+}
+
+.omg-msg-in {
+  background-color: var(--bg-lighter);
+}
+
+.omg-msg-out {
+  background-color: var(--bg-dark);
+  border-left: 2px solid var(--accent);
+}
+
+.omg-msg-sender {
+  color: var(--accent);
+  font-size: 9pt;
+  font-weight: bold;
+}
+
+.omg-msg-time {
+  color: var(--muted);
+  font-size: 8pt;
+}
+
+.omg-empty-state {
+  color: var(--muted);
+}
+
+/* ---- composer ---- */
+
+.omg-composer {
+  padding: 8px;
+  border-top: 1px solid var(--bg-lighter);
+  background-color: var(--bg);
+}
+
+.omg-composer entry {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 6px 10px;
+  caret-color: var(--accent);
+}
+
+.omg-composer entry:focus-within {
+  border-color: var(--accent);
+}
+
+/* ---- auth + generic controls ---- */
+
+.omg-auth {
+  background-color: var(--bg);
+}
+
+.omg-auth-title {
+  color: var(--fg);
+  font-size: 13pt;
+  font-weight: bold;
+}
+
+.omg-auth-hint {
+  color: var(--muted);
+}
+
+.omg-auth entry {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 6px 10px;
+  caret-color: var(--accent);
+}
+
+.omg-auth entry:focus-within {
+  border-color: var(--accent);
+}
+
+.omg-error {
+  color: var(--red);
+}
+
+button.omg-primary {
+  background-color: var(--accent);
+  color: var(--bg-darker);
+  border: none;
+  border-radius: 4px;
+  padding: 6px 14px;
+  font-weight: bold;
+}
+
+button.omg-primary:hover {
+  background-color: var(--accent);
+  opacity: 0.9;
+}
+
+button.omg-primary:focus-visible {
+  outline: 1px solid var(--fg);
+  outline-offset: 1px;
+}
+
+scrollbar slider {
+  background-color: var(--bg-lighter);
+  border-radius: 0;
+  min-width: 6px;
+}
+
+scrollbar slider:hover {
+  background-color: var(--muted);
+}
