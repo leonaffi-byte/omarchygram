@@ -30,8 +30,8 @@ use tokio::sync::mpsc;
 
 use super::archive::Archive;
 use super::{
-    paths, AuthState, BackendFlags, ChatSummary, Command, Event, MediaKind, Msg, Reaction,
-    TgError,
+    paths, to_markdown, AuthState, BackendFlags, ChatSummary, Command, Event, Me, MediaKind, Msg, Reaction,
+    Span, SpanKind, TgError,
 };
 
 /// Shared between the command loop, spawned data tasks, and the update loop.
@@ -75,11 +75,7 @@ struct Backend {
 }
 
 fn load_credentials() -> Option<(i32, String)> {
-    let text = std::fs::read_to_string(paths::config_file()).ok()?;
-    let parsed = text.parse::<toml::Table>().ok()?;
-    let api_id = parsed.get("api_id")?.as_integer()? as i32;
-    let api_hash = parsed.get("api_hash")?.as_str()?.to_string();
-    Some((api_id, api_hash))
+    crate::config::credentials()
 }
 
 fn chmod_600(path: &std::path::Path) {
@@ -148,6 +144,16 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
             Command::SubmitPassword(password, tx) => {
                 let _ = tx.send(be.submit_password(&password).await);
             }
+            Command::SubmitCredentials { api_id, api_hash, respond } => {
+                let r = match crate::config::set_credentials(api_id, &api_hash) {
+                    Ok(()) => be.start().await,
+                    Err(e) => Err(e),
+                };
+                let _ = respond.send(r);
+            }
+            Command::LogOut(tx) => {
+                let _ = tx.send(be.log_out().await);
+            }
             Command::SetFlags(flags, tx) => {
                 // Flags take effect HERE, in the serial loop, before any later
                 // MarkRead is even spawned — ghost mode can never race a
@@ -177,21 +183,60 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
 
 /// Answer a data command received before the backend connected.
 fn respond_not_connected(cmd: Command) {
-    const E: &str = "not connected";
+    reject(cmd, "not connected");
+}
+
+/// Reply to any command with an error.
+fn reject(cmd: Command, e: &str) {
+    let e = e.to_string();
     match cmd {
-        Command::GetDialogs(tx) => drop(tx.send(Err(E.into()))),
-        Command::GetHistory { respond, .. } => drop(respond.send(Err(E.into()))),
-        Command::DownloadMedia { respond, .. } => drop(respond.send(Err(E.into()))),
-        Command::SendText { respond, .. } => drop(respond.send(Err(E.into()))),
-        Command::SendFile { respond, .. } => drop(respond.send(Err(E.into()))),
-        Command::EditText { respond, .. } => drop(respond.send(Err(E.into()))),
-        Command::DeleteMessage { respond, .. } => drop(respond.send(Err(E.into()))),
-        Command::MarkRead { respond, .. } => drop(respond.send(Err(E.into()))),
-        Command::SetFlags(_, tx) => drop(tx.send(Err(E.into()))),
-        Command::GetHistoryAtDate { respond, .. } => drop(respond.send(Err(E.into()))),
-        Command::GetEditHistory { respond, .. } => drop(respond.send(Err(E.into()))),
-        Command::Start(_) | Command::SubmitPhone(..) | Command::SubmitCode(..)
-        | Command::SubmitPassword(..) => unreachable!("auth commands handled serially"),
+        Command::Start(tx) | Command::SubmitPhone(_, tx) | Command::SubmitCode(_, tx) | Command::SubmitPassword(_, tx) | Command::LogOut(tx) => {
+            drop(tx.send(Err(e)))
+        }
+        Command::SubmitCredentials { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetMe(tx) => drop(tx.send(Err(e))),
+        Command::GetDialogs(tx) => drop(tx.send(Err(e))),
+        Command::GetHistory { respond, .. }
+        | Command::GetMessages { respond, .. }
+        | Command::GetHistoryAtDate { respond, .. }
+        | Command::SearchMessages { respond, .. }
+        | Command::SearchGlobal { respond, .. }
+        | Command::ForwardMessages { respond, .. }
+        | Command::GetSharedMedia { respond, .. } => drop(respond.send(Err(e))),
+        Command::DownloadMedia { respond, .. }
+        | Command::DownloadAvatar { respond, .. }
+        | Command::DownloadSticker { respond, .. }
+        | Command::DownloadGif { respond, .. } => drop(respond.send(Err(e))),
+        Command::SendText { respond, .. }
+        | Command::SendFile { respond, .. }
+        | Command::SendVoice { respond, .. }
+        | Command::SendSticker { respond, .. }
+        | Command::SendGif { respond, .. }
+        | Command::EditText { respond, .. } => drop(respond.send(Err(e))),
+        Command::DeleteMessages { respond, .. }
+        | Command::MarkRead { respond, .. }
+        | Command::PinMessage { respond, .. }
+        | Command::SendReaction { respond, .. }
+        | Command::SetPinned { respond, .. }
+        | Command::SetMuted { respond, .. }
+        | Command::SetArchived { respond, .. }
+        | Command::MarkUnread { respond, .. }
+        | Command::DeleteChat { respond, .. }
+        | Command::ClearHistory { respond, .. }
+        | Command::SaveDraft { respond, .. } => drop(respond.send(Err(e))),
+        Command::SetFlags(_, tx) => drop(tx.send(Err(e))),
+        Command::GetEditHistory { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetPinnedMessage { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetAvailableReactions(tx) => drop(tx.send(Err(e))),
+        Command::SearchChats { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetChatInfo { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetMembers { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetContacts(tx) => drop(tx.send(Err(e))),
+        Command::OpenUser { respond, .. } | Command::CreateGroup { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetFolders(tx) => drop(tx.send(Err(e))),
+        Command::GetStickerPacks(tx) => drop(tx.send(Err(e))),
+        Command::GetStickers { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetSavedGifs(tx) => drop(tx.send(Err(e))),
     }
 }
 
@@ -215,13 +260,19 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
         Command::EditText { chat_id, msg_id, text, respond } => {
             let _ = respond.send(edit_text(&client, &ctx, chat_id, msg_id, &text).await);
         }
-        Command::DeleteMessage { chat_id, msg_id, respond } => {
-            let _ = respond.send(delete_message(&client, &ctx, chat_id, msg_id).await);
+        Command::DeleteMessages { chat_id, ids, respond } => {
+            let mut r = Ok(());
+            for id in ids {
+                if let Err(e) = delete_message(&client, &ctx, chat_id, id).await {
+                    r = Err(e);
+                    break;
+                }
+            }
+            let _ = respond.send(r);
         }
         Command::MarkRead { chat_id, up_to, respond } => {
             let _ = respond.send(mark_read(&client, &ctx, chat_id, up_to).await);
         }
-        Command::SetFlags(..) => unreachable!("flags are applied in the serial loop"),
         Command::GetHistoryAtDate { chat_id, date, respond } => {
             let _ = respond.send(get_history_at_date(&client, &ctx, chat_id, date).await);
         }
@@ -232,9 +283,23 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             };
             let _ = respond.send(Ok(versions));
         }
-        Command::Start(_) | Command::SubmitPhone(..) | Command::SubmitCode(..)
-        | Command::SubmitPassword(..) => unreachable!("auth commands handled serially"),
+        Command::GetMe(tx) => {
+            let _ = tx.send(get_me(&client).await);
+        }
+        // Wave 5 commands not yet implemented for the real backend.
+        other => reject(other, "not available yet in this build"),
     }
+}
+
+async fn get_me(client: &Client) -> Result<Me, TgError> {
+    let me = client.get_me().await.map_err(|e| e.to_string())?;
+    Ok(Me {
+        id: me.id().bot_api_dialog_id_unchecked(),
+        name: me.full_name(),
+        username: me.username().unwrap_or_default().to_string(),
+        phone: me.phone().unwrap_or_default().to_string(),
+        has_photo: me.photo().is_some(),
+    })
 }
 
 impl Backend {
@@ -311,6 +376,32 @@ impl Backend {
         } else {
             Ok(AuthState::NeedPhone)
         }
+    }
+
+    /// Sign out, drop the client and delete the local session so the next
+    /// `start()` begins a fresh login. The old sender pool is left to die
+    /// with the process (a rare action; a restart is cheap).
+    async fn log_out(&mut self) -> Result<AuthState, TgError> {
+        if let Some(client) = self.client.take() {
+            if let Err(e) = client.sign_out().await {
+                eprintln!("omarchygram: sign out: {e}");
+            }
+        }
+        self.login_token = None;
+        self.password_token = None;
+        self.updates_rx = None;
+        self.update_loop_started = false;
+        self.ctx.peers.lock().unwrap().clear();
+        self.ctx.titles.lock().unwrap().clear();
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let mut os = self.session_path.as_os_str().to_owned();
+            os.push(suffix);
+            let p = PathBuf::from(os);
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        Ok(AuthState::NeedPhone)
     }
 
     async fn submit_phone(&mut self, phone: &str) -> Result<AuthState, TgError> {
@@ -407,7 +498,10 @@ async fn get_dialogs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<ChatSummary>
             title,
             last_message: preview,
             last_time: last.map(|m| m.date().with_timezone(&Local)),
+            last_msg_id: last.map(|m| m.id()).unwrap_or(0),
+            last_outgoing: last.is_some_and(|m| m.outgoing()),
             unread,
+            ..ChatSummary::default()
         });
     }
     Ok(out)
@@ -764,7 +858,7 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
                             tl::enums::Reaction::Paid => "⭐".to_string(),
                             tl::enums::Reaction::Empty => return None,
                         };
-                        Some(Reaction { emoji, count: rc.count })
+                        Some(Reaction { emoji, count: rc.count, chosen: rc.chosen_order.is_some() })
                     })
                     .collect()
             })
@@ -788,6 +882,9 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
             .unwrap_or_default()
     };
 
+    let text = m.text().to_string();
+    let spans = spans_from_entities(&text, m.fmt_entities().map(|v| v.as_slice()).unwrap_or(&[]));
+    let markdown = to_markdown(&text, &spans);
     let msg = Msg {
         id: m.id(),
         chat_id,
@@ -797,7 +894,9 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
             .sender_id()
             .filter(|p| p.kind() == grammers_client::session::types::PeerKind::User)
             .and_then(|p| p.bot_api_dialog_id()),
-        text: m.text().to_string(),
+        text,
+        spans,
+        markdown,
         ts: m.date().with_timezone(&Local),
         outgoing: m.outgoing(),
         media: media_kind,
@@ -806,11 +905,61 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
         reactions,
         edited: m.edit_date().is_some() && !m.edit_hide(),
         deleted: false,
+        pinned: m.pinned(),
+        ..Msg::default()
     };
     if let Some(archive) = &ctx.archive {
         archive.record(msg.clone());
     }
     msg
+}
+
+/// Telegram entity offsets are UTF-16 code units; `Span`s use char indices.
+fn spans_from_entities(text: &str, entities: &[tl::enums::MessageEntity]) -> Vec<Span> {
+    use tl::enums::MessageEntity as E;
+    if entities.is_empty() {
+        return vec![];
+    }
+    // utf16 offset -> char index
+    let mut map: Vec<usize> = Vec::with_capacity(text.len() + 1);
+    let mut chars = 0usize;
+    for c in text.chars() {
+        for _ in 0..c.len_utf16() {
+            map.push(chars);
+        }
+        chars += 1;
+    }
+    map.push(chars);
+    let at = |u: i32| -> usize { map.get(u.max(0) as usize).copied().unwrap_or(chars) };
+    let mut out = Vec::new();
+    for e in entities {
+        let (offset, length, kind) = match e {
+            E::Bold(x) => (x.offset, x.length, SpanKind::Bold),
+            E::Italic(x) => (x.offset, x.length, SpanKind::Italic),
+            E::Underline(x) => (x.offset, x.length, SpanKind::Underline),
+            E::Strike(x) => (x.offset, x.length, SpanKind::Strike),
+            E::Code(x) => (x.offset, x.length, SpanKind::Code),
+            E::Pre(x) => (x.offset, x.length, SpanKind::Pre(x.language.clone())),
+            E::TextUrl(x) => (x.offset, x.length, SpanKind::Link(x.url.clone())),
+            E::Url(x) => {
+                let s = at(x.offset);
+                let e2 = at(x.offset + x.length);
+                let url: String = text.chars().skip(s).take(e2 - s).collect();
+                (x.offset, x.length, SpanKind::Link(url))
+            }
+            E::MentionName(x) => (x.offset, x.length, SpanKind::Mention(x.user_id)),
+            E::Spoiler(x) => (x.offset, x.length, SpanKind::Spoiler),
+            E::Blockquote(x) => (x.offset, x.length, SpanKind::Blockquote),
+            _ => continue,
+        };
+        let start = at(offset);
+        let end = at(offset + length);
+        if end > start {
+            out.push(Span { start, end, kind });
+        }
+    }
+    out.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
+    out
 }
 
 async fn consume_updates(

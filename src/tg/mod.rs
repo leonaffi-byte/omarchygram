@@ -5,8 +5,12 @@
 //! types. All `Tg` methods are async and safe to await on the GLib main
 //! context (`glib::MainContext::spawn_local`); `Event`s are read from
 //! `Tg::events` the same way. Both mock and real backends behave identically.
+//!
+//! Wave 5 (specs/spec-wave5.md §1) is the contract for the fields and
+//! methods below; the UI must compile against nothing else.
 
 mod archive;
+mod markdown;
 mod mock;
 mod real;
 
@@ -14,6 +18,8 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Local};
 use tokio::sync::{mpsc, oneshot};
+
+pub use markdown::{parse_markdown, to_markdown};
 
 pub mod paths {
     use std::path::PathBuf;
@@ -38,25 +44,24 @@ pub mod paths {
             .expect("cannot determine XDG cache dir — is HOME set?")
             .join("omarchygram/media")
     }
+
+    pub fn avatar_dir() -> PathBuf {
+        dirs::cache_dir()
+            .expect("cannot determine XDG cache dir — is HOME set?")
+            .join("omarchygram/avatars")
+    }
 }
 
 pub const SETUP_HELP: &str = "Omarchygram needs Telegram API credentials (one-time setup):
 
   1. Log in at https://my.telegram.org/apps with your Telegram account
   2. Create an application (any name, platform \"Desktop\")
-  3. Save the credentials (umask keeps the file private from the first byte):
-
-     mkdir -p ~/.config/omarchygram
-     (umask 077; cat > ~/.config/omarchygram/config.toml <<EOF
-     api_id = <your api_id>
-     api_hash = \"<your api_hash>\"
-     EOF
-     )
+  3. Enter the api_id and api_hash below.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthState {
-    /// config.toml missing/invalid
+    /// config.toml missing/invalid — the UI shows the credentials form.
     NeedCredentials,
     NeedPhone,
     NeedCode,
@@ -65,13 +70,67 @@ pub enum AuthState {
     Ready,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatKind {
+    #[default]
+    User,
+    Bot,
+    Group,
+    Channel,
+    /// The user's own "Saved Messages" chat.
+    Saved,
+}
+
+/// Online state of a user. Groups/channels/bots are always `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Presence {
+    #[default]
+    Unknown,
+    Online,
+    LastSeen(DateTime<Local>),
+    Recently,
+    LastWeek,
+    LastMonth,
+    LongAgo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuteMode {
+    Unmute,
+    Forever,
+    Hours(u32),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChatSummary {
     pub id: i64,
     pub title: String,
+    pub kind: ChatKind,
+    /// Public @username without the "@"; empty when none.
+    pub username: String,
+    /// Preview text of the last message (media → "[photo]" etc.).
     pub last_message: String,
+    /// "" for 1:1 chats and channels, "You" or the sender's first name in groups.
+    pub last_sender: String,
     pub last_time: Option<DateTime<Local>>,
+    pub last_msg_id: i32,
+    pub last_outgoing: bool,
     pub unread: i32,
+    /// Unread messages mentioning me.
+    pub mentions: i32,
+    /// Manually marked unread (no unread messages, but shows a badge).
+    pub unread_mark: bool,
+    pub read_inbox_max_id: i32,
+    /// The other side has read my messages up to this id (→ ✓✓).
+    pub read_outbox_max_id: i32,
+    pub pinned: bool,
+    pub muted: bool,
+    pub archived: bool,
+    pub presence: Presence,
+    /// `download_avatar` may return a photo. False → initials only.
+    pub has_photo: bool,
+    /// Server-side draft text (Telegram syncs it between devices).
+    pub draft: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,15 +139,56 @@ pub enum MediaKind {
     Sticker,
     Voice,
     Document,
+    Video,
+    Gif,
+    Audio,
+    VideoNote,
+    /// Polls, locations, contacts, games… rendered as a "[unsupported]" card.
+    Unsupported,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Reaction {
     pub emoji: String,
     pub count: i32,
+    /// I reacted with this emoji.
+    pub chosen: bool,
 }
 
-#[derive(Debug, Clone)]
+/// Text formatting. Offsets are CHAR indices into `Msg::text`, half-open.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpanKind {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Code,
+    /// Code block with an optional language.
+    Pre(String),
+    /// Link with the target url (explicit urls in the text also get one).
+    Link(String),
+    /// @mention of a user (Bot-API user id).
+    Mention(i64),
+    Spoiler,
+    Blockquote,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub kind: SpanKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WebPreview {
+    pub url: String,
+    pub site_name: String,
+    pub title: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Msg {
     pub id: i32,
     pub chat_id: i64,
@@ -103,7 +203,7 @@ pub struct Msg {
     pub ts: DateTime<Local>,
     pub outgoing: bool,
     pub media: Option<MediaKind>,
-    /// Filename for MediaKind::Document.
+    /// Filename for document-like media.
     pub doc_name: Option<String>,
     /// Id of the replied-to message in the same chat.
     pub reply_to: Option<i32>,
@@ -111,6 +211,54 @@ pub struct Msg {
     pub edited: bool,
     /// Deleted on Telegram but kept by the local archive (anti-delete).
     pub deleted: bool,
+    /// Formatting of `text`.
+    pub spans: Vec<Span>,
+    /// `text` with Telegram-style markers (**bold** etc.) — for the edit buffer.
+    pub markdown: String,
+    pub webpage: Option<WebPreview>,
+    /// "Forwarded from" display name.
+    pub forwarded_from: Option<String>,
+    /// View count (channels).
+    pub views: Option<i32>,
+    /// Seconds, for voice/audio/video/video notes.
+    pub duration: Option<u32>,
+    pub doc_size: Option<u64>,
+    /// Photo/video dimensions, for pre-sizing.
+    pub photo_size: Option<(i32, i32)>,
+    pub sticker_emoji: Option<String>,
+    /// Pinned in its chat.
+    pub pinned: bool,
+}
+
+impl Default for Msg {
+    fn default() -> Self {
+        Msg {
+            id: 0,
+            chat_id: 0,
+            chat_title: String::new(),
+            sender: String::new(),
+            sender_id: None,
+            text: String::new(),
+            ts: Local::now(),
+            outgoing: false,
+            media: None,
+            doc_name: None,
+            reply_to: None,
+            reactions: Vec::new(),
+            edited: false,
+            deleted: false,
+            spans: Vec::new(),
+            markdown: String::new(),
+            webpage: None,
+            forwarded_from: None,
+            views: None,
+            duration: None,
+            doc_size: None,
+            photo_size: None,
+            sticker_emoji: None,
+            pinned: false,
+        }
+    }
 }
 
 /// A previous text of an edited message (edit history).
@@ -118,6 +266,98 @@ pub struct Msg {
 pub struct MsgVersion {
     pub text: String,
     pub replaced_at: DateTime<Local>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChatInfo {
+    pub id: i64,
+    pub title: String,
+    pub kind: ChatKind,
+    pub username: String,
+    pub phone: String,
+    /// Bio (users) or description (groups/channels).
+    pub about: String,
+    pub members: Option<i32>,
+    pub presence: Presence,
+    pub has_photo: bool,
+    pub muted: bool,
+    pub is_contact: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemberRole {
+    Creator,
+    Admin,
+    #[default]
+    Member,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Member {
+    pub user_id: i64,
+    pub name: String,
+    pub username: String,
+    pub presence: Presence,
+    pub role: MemberRole,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Contact {
+    pub user_id: i64,
+    pub name: String,
+    pub username: String,
+    pub phone: String,
+    pub presence: Presence,
+    pub has_photo: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedKind {
+    Photos,
+    Files,
+    Links,
+    Voice,
+    Music,
+}
+
+/// A Telegram chat folder with its membership already resolved.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Folder {
+    pub id: i32,
+    pub title: String,
+    pub chats: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StickerPack {
+    /// "recent", "favorites", or a numeric set id.
+    pub id: String,
+    pub title: String,
+    pub count: i32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Sticker {
+    pub id: i64,
+    pub emoji: String,
+    /// .tgs/.webm — not renderable here; shown as a muted cell, not sendable.
+    pub animated: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Gif {
+    pub id: i64,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Me {
+    pub id: i64,
+    pub name: String,
+    pub username: String,
+    pub phone: String,
+    pub has_photo: bool,
 }
 
 /// Behavior flags the UI forwards from settings.
@@ -145,68 +385,79 @@ pub enum Event {
     /// Messages deleted on Telegram. With anti-delete the UI keeps the rows
     /// struck through (msg.deleted); otherwise it removes them.
     MessageDeleted { chat_id: i64, msg_ids: Vec<i32> },
+    /// The other side read my messages up to `max_id` (→ ✓✓).
+    ReadOutbox { chat_id: i64, max_id: i32 },
+    /// I read up to `max_id` on another device (→ drop the unread badge).
+    ReadInbox { chat_id: i64, max_id: i32 },
+    Presence { user_id: i64, presence: Presence },
+    /// Pin/mute/archive/draft/new dialog: reload `get_dialogs` (coalesce 300ms).
+    DialogsChanged,
+    /// Refetch `get_pinned_message` for this chat.
+    PinnedChanged { chat_id: i64 },
 }
 
 /// User-facing error text; show it, don't parse it.
 pub type TgError = String;
 
+type Reply<T> = oneshot::Sender<Result<T, TgError>>;
+
 enum Command {
-    Start(oneshot::Sender<Result<AuthState, TgError>>),
-    SubmitPhone(String, oneshot::Sender<Result<AuthState, TgError>>),
-    SubmitCode(String, oneshot::Sender<Result<AuthState, TgError>>),
-    SubmitPassword(String, oneshot::Sender<Result<AuthState, TgError>>),
-    GetDialogs(oneshot::Sender<Result<Vec<ChatSummary>, TgError>>),
-    GetHistory {
-        chat_id: i64,
-        before_id: Option<i32>,
-        respond: oneshot::Sender<Result<Vec<Msg>, TgError>>,
-    },
-    DownloadMedia {
-        chat_id: i64,
-        msg_id: i32,
-        respond: oneshot::Sender<Result<Option<PathBuf>, TgError>>,
-    },
-    SendText {
-        chat_id: i64,
-        text: String,
-        reply_to: Option<i32>,
-        respond: oneshot::Sender<Result<Msg, TgError>>,
-    },
-    SendFile {
-        chat_id: i64,
-        path: PathBuf,
-        caption: String,
-        respond: oneshot::Sender<Result<Msg, TgError>>,
-    },
-    EditText {
-        chat_id: i64,
-        msg_id: i32,
-        text: String,
-        respond: oneshot::Sender<Result<Msg, TgError>>,
-    },
-    DeleteMessage {
-        chat_id: i64,
-        msg_id: i32,
-        respond: oneshot::Sender<Result<(), TgError>>,
-    },
+    Start(Reply<AuthState>),
+    SubmitCredentials { api_id: i32, api_hash: String, respond: Reply<AuthState> },
+    SubmitPhone(String, Reply<AuthState>),
+    SubmitCode(String, Reply<AuthState>),
+    SubmitPassword(String, Reply<AuthState>),
+    LogOut(Reply<AuthState>),
+    GetMe(Reply<Me>),
+    GetDialogs(Reply<Vec<ChatSummary>>),
+    GetHistory { chat_id: i64, before_id: Option<i32>, respond: Reply<Vec<Msg>> },
+    GetMessages { chat_id: i64, ids: Vec<i32>, respond: Reply<Vec<Msg>> },
+    DownloadMedia { chat_id: i64, msg_id: i32, respond: Reply<Option<PathBuf>> },
+    DownloadAvatar { chat_id: i64, respond: Reply<Option<PathBuf>> },
+    SendText { chat_id: i64, text: String, reply_to: Option<i32>, respond: Reply<Msg> },
+    SendFile { chat_id: i64, path: PathBuf, caption: String, respond: Reply<Msg> },
+    SendVoice { chat_id: i64, path: PathBuf, duration: u32, respond: Reply<Msg> },
+    SendSticker { chat_id: i64, sticker_id: i64, respond: Reply<Msg> },
+    SendGif { chat_id: i64, gif_id: i64, respond: Reply<Msg> },
+    EditText { chat_id: i64, msg_id: i32, text: String, respond: Reply<Msg> },
+    DeleteMessages { chat_id: i64, ids: Vec<i32>, respond: Reply<()> },
+    ForwardMessages { from_chat: i64, ids: Vec<i32>, to_chat: i64, respond: Reply<Vec<Msg>> },
     MarkRead {
         chat_id: i64,
         /// Highest message id the UI has actually shown — nothing newer is
         /// marked read, so a message racing the request stays unread.
         up_to: i32,
-        respond: oneshot::Sender<Result<(), TgError>>,
+        respond: Reply<()>,
     },
-    SetFlags(BackendFlags, oneshot::Sender<Result<(), TgError>>),
-    GetHistoryAtDate {
-        chat_id: i64,
-        date: DateTime<Local>,
-        respond: oneshot::Sender<Result<Vec<Msg>, TgError>>,
-    },
-    GetEditHistory {
-        chat_id: i64,
-        msg_id: i32,
-        respond: oneshot::Sender<Result<Vec<MsgVersion>, TgError>>,
-    },
+    SetFlags(BackendFlags, Reply<()>),
+    GetHistoryAtDate { chat_id: i64, date: DateTime<Local>, respond: Reply<Vec<Msg>> },
+    GetEditHistory { chat_id: i64, msg_id: i32, respond: Reply<Vec<MsgVersion>> },
+    SearchMessages { chat_id: i64, query: String, before_id: Option<i32>, respond: Reply<Vec<Msg>> },
+    SearchGlobal { query: String, respond: Reply<Vec<Msg>> },
+    SearchChats { query: String, respond: Reply<Vec<ChatSummary>> },
+    GetPinnedMessage { chat_id: i64, respond: Reply<Option<Msg>> },
+    PinMessage { chat_id: i64, msg_id: i32, pinned: bool, respond: Reply<()> },
+    SendReaction { chat_id: i64, msg_id: i32, emoji: Option<String>, respond: Reply<()> },
+    GetAvailableReactions(Reply<Vec<String>>),
+    SetPinned { chat_id: i64, pinned: bool, respond: Reply<()> },
+    SetMuted { chat_id: i64, mode: MuteMode, respond: Reply<()> },
+    SetArchived { chat_id: i64, archived: bool, respond: Reply<()> },
+    MarkUnread { chat_id: i64, unread: bool, respond: Reply<()> },
+    DeleteChat { chat_id: i64, respond: Reply<()> },
+    ClearHistory { chat_id: i64, respond: Reply<()> },
+    SaveDraft { chat_id: i64, text: String, reply_to: Option<i32>, respond: Reply<()> },
+    GetChatInfo { chat_id: i64, respond: Reply<ChatInfo> },
+    GetMembers { chat_id: i64, offset: i32, limit: i32, respond: Reply<Vec<Member>> },
+    GetSharedMedia { chat_id: i64, kind: SharedKind, before_id: Option<i32>, respond: Reply<Vec<Msg>> },
+    GetContacts(Reply<Vec<Contact>>),
+    OpenUser { user_id: i64, respond: Reply<ChatSummary> },
+    CreateGroup { title: String, user_ids: Vec<i64>, respond: Reply<ChatSummary> },
+    GetFolders(Reply<Vec<Folder>>),
+    GetStickerPacks(Reply<Vec<StickerPack>>),
+    GetStickers { pack_id: String, respond: Reply<Vec<Sticker>> },
+    DownloadSticker { sticker_id: i64, respond: Reply<Option<PathBuf>> },
+    GetSavedGifs(Reply<Vec<Gif>>),
+    DownloadGif { gif_id: i64, respond: Reply<Option<PathBuf>> },
 }
 
 /// UI-side handle to the backend thread. Cheap to clone.
@@ -256,8 +507,17 @@ impl Tg {
         }
     }
 
+    // ----- auth -----
+
     pub async fn start(&self) -> Result<AuthState, TgError> {
         roundtrip!(self, Command::Start)
+    }
+
+    /// Stores the Telegram API credentials (config.toml, 0600) and continues
+    /// the login. Values are never logged.
+    pub async fn submit_credentials(&self, api_id: i32, api_hash: &str) -> Result<AuthState, TgError> {
+        let api_hash = api_hash.trim().to_string();
+        roundtrip!(self, |tx| Command::SubmitCredentials { api_id, api_hash, respond: tx })
     }
 
     pub async fn submit_phone(&self, phone: &str) -> Result<AuthState, TgError> {
@@ -275,99 +535,112 @@ impl Tg {
         roundtrip!(self, |tx| Command::SubmitPassword(password, tx))
     }
 
+    /// Signs out and deletes the local session; returns `NeedPhone`.
+    pub async fn log_out(&self) -> Result<AuthState, TgError> {
+        roundtrip!(self, Command::LogOut)
+    }
+
+    pub async fn get_me(&self) -> Result<Me, TgError> {
+        roundtrip!(self, Command::GetMe)
+    }
+
+    // ----- dialogs & history -----
+
+    /// Up to 200 dialogs, pinned first then newest first; archived ones are
+    /// included and flagged.
     pub async fn get_dialogs(&self) -> Result<Vec<ChatSummary>, TgError> {
         roundtrip!(self, Command::GetDialogs)
     }
 
     /// Newest last (display order). `before_id` pages older messages; an empty
     /// page means there is nothing older.
-    pub async fn get_history(
-        &self,
-        chat_id: i64,
-        before_id: Option<i32>,
-    ) -> Result<Vec<Msg>, TgError> {
-        roundtrip!(self, |tx| Command::GetHistory {
-            chat_id,
-            before_id,
-            respond: tx
-        })
+    pub async fn get_history(&self, chat_id: i64, before_id: Option<i32>) -> Result<Vec<Msg>, TgError> {
+        roundtrip!(self, |tx| Command::GetHistory { chat_id, before_id, respond: tx })
     }
+
+    /// Specific messages by id (reply quotes, jump targets). Missing ids are
+    /// simply absent from the result.
+    pub async fn get_messages(&self, chat_id: i64, ids: Vec<i32>) -> Result<Vec<Msg>, TgError> {
+        roundtrip!(self, |tx| Command::GetMessages { chat_id, ids, respond: tx })
+    }
+
+    /// Up to 50 messages at or before `date`, newest last (jump-to-date).
+    /// Empty when the chat has nothing that old.
+    pub async fn get_history_at_date(&self, chat_id: i64, date: DateTime<Local>) -> Result<Vec<Msg>, TgError> {
+        roundtrip!(self, |tx| Command::GetHistoryAtDate { chat_id, date, respond: tx })
+    }
+
+    /// Previous texts of an edited message, oldest first. Empty when the
+    /// archive never saw an earlier version.
+    pub async fn get_edit_history(&self, chat_id: i64, msg_id: i32) -> Result<Vec<MsgVersion>, TgError> {
+        roundtrip!(self, |tx| Command::GetEditHistory { chat_id, msg_id, respond: tx })
+    }
+
+    // ----- media -----
 
     /// Downloads to the media cache and returns a GTK-renderable path
     /// (stickers are converted webp -> png). Cached across calls.
-    /// None when the message has no media.
-    pub async fn download_media(
-        &self,
-        chat_id: i64,
-        msg_id: i32,
-    ) -> Result<Option<PathBuf>, TgError> {
-        roundtrip!(self, |tx| Command::DownloadMedia {
-            chat_id,
-            msg_id,
-            respond: tx
-        })
+    /// None when the message has no media or it cannot be rendered.
+    pub async fn download_media(&self, chat_id: i64, msg_id: i32) -> Result<Option<PathBuf>, TgError> {
+        roundtrip!(self, |tx| Command::DownloadMedia { chat_id, msg_id, respond: tx })
     }
 
-    pub async fn send_text(
-        &self,
-        chat_id: i64,
-        text: &str,
-        reply_to: Option<i32>,
-    ) -> Result<Msg, TgError> {
+    /// Small profile photo of a chat or user (Bot-API id), cached. None when
+    /// there is no photo — render initials.
+    pub async fn download_avatar(&self, chat_id: i64) -> Result<Option<PathBuf>, TgError> {
+        roundtrip!(self, |tx| Command::DownloadAvatar { chat_id, respond: tx })
+    }
+
+    // ----- sending -----
+
+    /// `text` may contain Telegram-style markers: **bold**, __italic__,
+    /// ~~strike~~, `code`, ```pre```, ||spoiler||, [text](url). Plain text
+    /// without markers is sent unchanged.
+    pub async fn send_text(&self, chat_id: i64, text: &str, reply_to: Option<i32>) -> Result<Msg, TgError> {
         let text = text.to_string();
-        roundtrip!(self, |tx| Command::SendText {
-            chat_id,
-            text,
-            reply_to,
-            respond: tx
-        })
+        roundtrip!(self, |tx| Command::SendText { chat_id, text, reply_to, respond: tx })
     }
 
-    pub async fn send_file(
-        &self,
-        chat_id: i64,
-        path: PathBuf,
-        caption: &str,
-    ) -> Result<Msg, TgError> {
+    pub async fn send_file(&self, chat_id: i64, path: PathBuf, caption: &str) -> Result<Msg, TgError> {
         let caption = caption.to_string();
-        roundtrip!(self, |tx| Command::SendFile {
-            chat_id,
-            path,
-            caption,
-            respond: tx
-        })
+        roundtrip!(self, |tx| Command::SendFile { chat_id, path, caption, respond: tx })
     }
 
-    pub async fn edit_text(
-        &self,
-        chat_id: i64,
-        msg_id: i32,
-        text: &str,
-    ) -> Result<Msg, TgError> {
+    /// OGG/Opus voice note (see `Local::record_*`).
+    pub async fn send_voice(&self, chat_id: i64, path: PathBuf, duration: u32) -> Result<Msg, TgError> {
+        roundtrip!(self, |tx| Command::SendVoice { chat_id, path, duration, respond: tx })
+    }
+
+    pub async fn send_sticker(&self, chat_id: i64, sticker_id: i64) -> Result<Msg, TgError> {
+        roundtrip!(self, |tx| Command::SendSticker { chat_id, sticker_id, respond: tx })
+    }
+
+    pub async fn send_gif(&self, chat_id: i64, gif_id: i64) -> Result<Msg, TgError> {
+        roundtrip!(self, |tx| Command::SendGif { chat_id, gif_id, respond: tx })
+    }
+
+    /// Same markdown rules as `send_text`.
+    pub async fn edit_text(&self, chat_id: i64, msg_id: i32, text: &str) -> Result<Msg, TgError> {
         let text = text.to_string();
-        roundtrip!(self, |tx| Command::EditText {
-            chat_id,
-            msg_id,
-            text,
-            respond: tx
-        })
+        roundtrip!(self, |tx| Command::EditText { chat_id, msg_id, text, respond: tx })
     }
 
     pub async fn delete_message(&self, chat_id: i64, msg_id: i32) -> Result<(), TgError> {
-        roundtrip!(self, |tx| Command::DeleteMessage {
-            chat_id,
-            msg_id,
-            respond: tx
-        })
+        self.delete_messages(chat_id, vec![msg_id]).await
+    }
+
+    pub async fn delete_messages(&self, chat_id: i64, ids: Vec<i32>) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::DeleteMessages { chat_id, ids, respond: tx })
+    }
+
+    /// Returns the forwarded copies as they appear in `to_chat`.
+    pub async fn forward_messages(&self, from_chat: i64, ids: Vec<i32>, to_chat: i64) -> Result<Vec<Msg>, TgError> {
+        roundtrip!(self, |tx| Command::ForwardMessages { from_chat, ids, to_chat, respond: tx })
     }
 
     /// Marks messages up to and including `up_to` as read (never newer ones).
     pub async fn mark_read(&self, chat_id: i64, up_to: i32) -> Result<(), TgError> {
-        roundtrip!(self, |tx| Command::MarkRead {
-            chat_id,
-            up_to,
-            respond: tx
-        })
+        roundtrip!(self, |tx| Command::MarkRead { chat_id, up_to, respond: tx })
     }
 
     /// Forward ghost-mode / anti-delete from settings. Call at startup and
@@ -376,31 +649,136 @@ impl Tg {
         roundtrip!(self, |tx| Command::SetFlags(flags, tx))
     }
 
-    /// Up to 50 messages at or before `date`, newest last (jump-to-date).
-    /// Empty when the chat has nothing that old.
-    pub async fn get_history_at_date(
-        &self,
-        chat_id: i64,
-        date: DateTime<Local>,
-    ) -> Result<Vec<Msg>, TgError> {
-        roundtrip!(self, |tx| Command::GetHistoryAtDate {
-            chat_id,
-            date,
-            respond: tx
-        })
+    // ----- search -----
+
+    /// Newest first, 50 per page; `before_id` pages older hits.
+    pub async fn search_messages(&self, chat_id: i64, query: &str, before_id: Option<i32>) -> Result<Vec<Msg>, TgError> {
+        let query = query.to_string();
+        roundtrip!(self, |tx| Command::SearchMessages { chat_id, query, before_id, respond: tx })
     }
 
-    /// Previous texts of an edited message, oldest first. Empty when the
-    /// archive never saw an earlier version.
-    pub async fn get_edit_history(
-        &self,
-        chat_id: i64,
-        msg_id: i32,
-    ) -> Result<Vec<MsgVersion>, TgError> {
-        roundtrip!(self, |tx| Command::GetEditHistory {
-            chat_id,
-            msg_id,
-            respond: tx
-        })
+    /// Newest first, up to 50, across all chats.
+    pub async fn search_global(&self, query: &str) -> Result<Vec<Msg>, TgError> {
+        let query = query.to_string();
+        roundtrip!(self, |tx| Command::SearchGlobal { query, respond: tx })
+    }
+
+    /// Chats/users matching a name or @username that are NOT necessarily in
+    /// the dialog list (contacts, public usernames). The UI filters loaded
+    /// dialogs itself.
+    pub async fn search_chats(&self, query: &str) -> Result<Vec<ChatSummary>, TgError> {
+        let query = query.to_string();
+        roundtrip!(self, |tx| Command::SearchChats { query, respond: tx })
+    }
+
+    // ----- pins & reactions -----
+
+    pub async fn get_pinned_message(&self, chat_id: i64) -> Result<Option<Msg>, TgError> {
+        roundtrip!(self, |tx| Command::GetPinnedMessage { chat_id, respond: tx })
+    }
+
+    pub async fn pin_message(&self, chat_id: i64, msg_id: i32, pinned: bool) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::PinMessage { chat_id, msg_id, pinned, respond: tx })
+    }
+
+    /// `None` removes my reaction. The updated message arrives as `MessageChanged`.
+    pub async fn send_reaction(&self, chat_id: i64, msg_id: i32, emoji: Option<String>) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::SendReaction { chat_id, msg_id, emoji, respond: tx })
+    }
+
+    /// Emoji the account may react with, most common first.
+    pub async fn get_available_reactions(&self) -> Result<Vec<String>, TgError> {
+        roundtrip!(self, Command::GetAvailableReactions)
+    }
+
+    // ----- chat actions (each is followed by Event::DialogsChanged) -----
+
+    pub async fn set_pinned(&self, chat_id: i64, pinned: bool) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::SetPinned { chat_id, pinned, respond: tx })
+    }
+
+    pub async fn set_muted(&self, chat_id: i64, mode: MuteMode) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::SetMuted { chat_id, mode, respond: tx })
+    }
+
+    pub async fn set_archived(&self, chat_id: i64, archived: bool) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::SetArchived { chat_id, archived, respond: tx })
+    }
+
+    pub async fn mark_unread(&self, chat_id: i64, unread: bool) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::MarkUnread { chat_id, unread, respond: tx })
+    }
+
+    /// Deletes the dialog (leaves groups/channels).
+    pub async fn delete_chat(&self, chat_id: i64) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::DeleteChat { chat_id, respond: tx })
+    }
+
+    pub async fn clear_history(&self, chat_id: i64) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::ClearHistory { chat_id, respond: tx })
+    }
+
+    /// Empty text clears the draft. The UI debounces (rule D4).
+    pub async fn save_draft(&self, chat_id: i64, text: &str, reply_to: Option<i32>) -> Result<(), TgError> {
+        let text = text.to_string();
+        roundtrip!(self, |tx| Command::SaveDraft { chat_id, text, reply_to, respond: tx })
+    }
+
+    // ----- info -----
+
+    pub async fn get_chat_info(&self, chat_id: i64) -> Result<ChatInfo, TgError> {
+        roundtrip!(self, |tx| Command::GetChatInfo { chat_id, respond: tx })
+    }
+
+    pub async fn get_members(&self, chat_id: i64, offset: i32, limit: i32) -> Result<Vec<Member>, TgError> {
+        roundtrip!(self, |tx| Command::GetMembers { chat_id, offset, limit, respond: tx })
+    }
+
+    /// Newest first, 50 per page.
+    pub async fn get_shared_media(&self, chat_id: i64, kind: SharedKind, before_id: Option<i32>) -> Result<Vec<Msg>, TgError> {
+        roundtrip!(self, |tx| Command::GetSharedMedia { chat_id, kind, before_id, respond: tx })
+    }
+
+    pub async fn get_contacts(&self) -> Result<Vec<Contact>, TgError> {
+        roundtrip!(self, Command::GetContacts)
+    }
+
+    /// Opens (or creates) the 1:1 chat with a user; `me.id` opens Saved Messages.
+    pub async fn open_user(&self, user_id: i64) -> Result<ChatSummary, TgError> {
+        roundtrip!(self, |tx| Command::OpenUser { user_id, respond: tx })
+    }
+
+    pub async fn create_group(&self, title: &str, user_ids: Vec<i64>) -> Result<ChatSummary, TgError> {
+        let title = title.trim().to_string();
+        roundtrip!(self, |tx| Command::CreateGroup { title, user_ids, respond: tx })
+    }
+
+    pub async fn get_folders(&self) -> Result<Vec<Folder>, TgError> {
+        roundtrip!(self, Command::GetFolders)
+    }
+
+    // ----- stickers & gifs -----
+
+    pub async fn get_sticker_packs(&self) -> Result<Vec<StickerPack>, TgError> {
+        roundtrip!(self, Command::GetStickerPacks)
+    }
+
+    pub async fn get_stickers(&self, pack_id: &str) -> Result<Vec<Sticker>, TgError> {
+        let pack_id = pack_id.to_string();
+        roundtrip!(self, |tx| Command::GetStickers { pack_id, respond: tx })
+    }
+
+    /// PNG path (webp converted), cached. None for animated stickers.
+    pub async fn download_sticker(&self, sticker_id: i64) -> Result<Option<PathBuf>, TgError> {
+        roundtrip!(self, |tx| Command::DownloadSticker { sticker_id, respond: tx })
+    }
+
+    pub async fn get_saved_gifs(&self) -> Result<Vec<Gif>, TgError> {
+        roundtrip!(self, Command::GetSavedGifs)
+    }
+
+    /// MP4 path, cached. None when unavailable.
+    pub async fn download_gif(&self, gif_id: i64) -> Result<Option<PathBuf>, TgError> {
+        roundtrip!(self, |tx| Command::DownloadGif { gif_id, respond: tx })
     }
 }

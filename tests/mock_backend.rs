@@ -34,15 +34,18 @@ async fn dialogs_are_the_mock_chats_newest_first() {
 
     let chats = tg.get_dialogs().await.expect("get_dialogs()");
 
-    assert_eq!(chats.len(), 4, "expected the four mock chats: {chats:?}");
+    assert_eq!(chats.len(), 7, "expected the seven mock chats: {chats:?}");
+    // Pinned chats first, then newest first within each group.
     for pair in chats.windows(2) {
         assert!(
-            pair[0].last_time >= pair[1].last_time,
-            "chats are not sorted by last_time descending: {:?} before {:?}",
+            (pair[0].pinned, pair[0].last_time) >= (pair[1].pinned, pair[1].last_time)
+                || (pair[0].pinned && !pair[1].pinned),
+            "chats are not sorted pinned-first then by last_time descending: {:?} before {:?}",
             pair[0],
             pair[1]
         );
     }
+    assert!(chats[0].pinned, "the pinned chat (Mom) must come first: {chats:?}");
 }
 
 #[tokio::test]
@@ -102,10 +105,24 @@ async fn send_text_appends_to_history_and_emits_typing_then_message() {
         "the sent message is missing from the history: {history:?}"
     );
 
-    // One deadline for the whole sequence, not one per event.
+    // One deadline for the whole sequence, not one per event. Read-state,
+    // presence and dialog-list events may interleave; only the typing →
+    // reply order matters here.
+    let is_noise = |e: &Event| {
+        matches!(
+            e,
+            Event::ReadOutbox { .. } | Event::ReadInbox { .. } | Event::Presence { .. } | Event::DialogsChanged | Event::PinnedChanged { .. }
+        )
+    };
     let (typing, incoming) = tokio::time::timeout(EVENT_WAIT, async {
-        let typing = tg.events.recv().await.expect("event channel closed");
-        let incoming = tg.events.recv().await.expect("event channel closed");
+        let mut typing = tg.events.recv().await.expect("event channel closed");
+        while is_noise(&typing) {
+            typing = tg.events.recv().await.expect("event channel closed");
+        }
+        let mut incoming = tg.events.recv().await.expect("event channel closed");
+        while is_noise(&incoming) {
+            incoming = tg.events.recv().await.expect("event channel closed");
+        }
         (typing, incoming)
     })
     .await

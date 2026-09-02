@@ -9,6 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::ai::{self, ChatMessage, ChatReply, Prefs, ProviderInfo, Transcript};
 use crate::os::{self, Action, OsPolicy, ShellTicket};
 
+pub mod record;
+
 enum Cmd {
     Detect(Prefs, oneshot::Sender<Vec<ProviderInfo>>),
     Chat {
@@ -33,6 +35,9 @@ enum Cmd {
         ticket: ShellTicket,
         respond: oneshot::Sender<Result<String, String>>,
     },
+    RecordStart(oneshot::Sender<Result<(), String>>),
+    RecordStop(oneshot::Sender<Result<(PathBuf, u32), String>>),
+    RecordCancel(oneshot::Sender<()>),
 }
 
 #[derive(Clone)]
@@ -65,6 +70,16 @@ impl Local {
                             }
                             Cmd::OsShell { ticket, respond } => {
                                 let _ = respond.send(os::run_shell(ticket).await);
+                            }
+                            Cmd::RecordStart(tx) => {
+                                let _ = tx.send(record::start().await);
+                            }
+                            Cmd::RecordStop(tx) => {
+                                let _ = tx.send(record::stop().await);
+                            }
+                            Cmd::RecordCancel(tx) => {
+                                record::cancel().await;
+                                let _ = tx.send(());
                             }
                         }
                     });
@@ -115,5 +130,26 @@ impl Local {
             .send(Cmd::OsShell { ticket, respond })
             .map_err(|_| "local services are gone".to_string())?;
         rx.await.map_err(|_| "local services dropped the request".to_string())?
+    }
+
+    /// Start recording a voice note (ffmpeg → OGG Opus). One at a time.
+    pub async fn record_start(&self) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Cmd::RecordStart(tx)).map_err(|_| "local services are gone".to_string())?;
+        rx.await.map_err(|_| "local services dropped the request".to_string())?
+    }
+
+    /// Stop and get the file plus its duration in seconds.
+    pub async fn record_stop(&self) -> Result<(PathBuf, u32), String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Cmd::RecordStop(tx)).map_err(|_| "local services are gone".to_string())?;
+        rx.await.map_err(|_| "local services dropped the request".to_string())?
+    }
+
+    pub async fn record_cancel(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Cmd::RecordCancel(tx)).is_ok() {
+            let _ = rx.await;
+        }
     }
 }

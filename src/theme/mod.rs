@@ -25,6 +25,12 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("accent", "#7a9464"),
     ("selection", "#383838"),
     ("red", "#a05442"),
+    ("green", "#7a9464"),
+    ("cyan", "#6a9a9a"),
+    ("blue", "#6a86a8"),
+    ("magenta", "#9a6a9a"),
+    ("yellow", "#b8a05a"),
+    ("orange", "#b87a4a"),
 ];
 
 fn omarchy_state_dir() -> PathBuf {

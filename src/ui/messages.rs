@@ -1038,7 +1038,7 @@ impl MessagesView {
                     *media_loading_source.borrow_mut() = Some(source);
                 }
             }
-            Some(MediaKind::Document | MediaKind::Voice) => {
+            Some(MediaKind::Document | MediaKind::Voice | MediaKind::Video | MediaKind::Gif | MediaKind::Audio | MediaKind::VideoNote | MediaKind::Unsupported) => {
                 let label = match message.media {
                     Some(MediaKind::Voice) => "voice message".to_string(),
                     _ => message
@@ -1977,7 +1977,7 @@ impl MessagesView {
                 label.add_css_class("omg-media-placeholder");
                 media_slot.append(&label);
             }
-            Some(MediaKind::Document | MediaKind::Voice) => {
+            Some(MediaKind::Document | MediaKind::Voice | MediaKind::Video | MediaKind::Gif | MediaKind::Audio | MediaKind::VideoNote | MediaKind::Unsupported) => {
                 if let (Some(button), Some(base)) = (button, base) {
                     button.set_label(&format!("{base} (unavailable)"));
                     button.set_sensitive(retryable);

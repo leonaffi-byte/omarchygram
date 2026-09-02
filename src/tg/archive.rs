@@ -40,6 +40,11 @@ fn media_str(m: Option<MediaKind>) -> Option<&'static str> {
         Some(MediaKind::Sticker) => Some("sticker"),
         Some(MediaKind::Voice) => Some("voice"),
         Some(MediaKind::Document) => Some("document"),
+        Some(MediaKind::Video) => Some("video"),
+        Some(MediaKind::Gif) => Some("gif"),
+        Some(MediaKind::Audio) => Some("audio"),
+        Some(MediaKind::VideoNote) => Some("video_note"),
+        Some(MediaKind::Unsupported) => Some("unsupported"),
         None => None,
     }
 }
@@ -48,6 +53,11 @@ fn media_kind(s: &Option<String>) -> Option<MediaKind> {
     match s.as_deref() {
         Some("photo") => Some(MediaKind::Photo),
         Some("sticker") => Some(MediaKind::Sticker),
+        Some("video") => Some(MediaKind::Video),
+        Some("gif") => Some(MediaKind::Gif),
+        Some("audio") => Some(MediaKind::Audio),
+        Some("video_note") => Some(MediaKind::VideoNote),
+        Some("unsupported") => Some(MediaKind::Unsupported),
         Some("voice") => Some(MediaKind::Voice),
         Some("document") => Some(MediaKind::Document),
         _ => None,
@@ -319,6 +329,7 @@ async fn deleted_between(conn: &Connection, chat_id: i64, min_id: i32, max_id: i
             reactions: vec![],
             edited: get_i(9) != 0,
             deleted: true,
+            ..Msg::default()
         });
     }
     out

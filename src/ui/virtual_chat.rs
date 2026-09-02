@@ -45,6 +45,7 @@ impl VirtualStore {
             reactions: Vec::new(),
             edited: false,
             deleted: false,
+            ..Msg::default()
         };
         if monospace {
             self.mono_ids.insert(id);

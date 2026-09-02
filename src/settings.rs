@@ -33,6 +33,65 @@ pub struct Settings {
     pub os: OsSettings,
     /// Animation toggles by id (see the Motion Lab); missing = off.
     pub animations: BTreeMap<String, bool>,
+    pub ui: UiSettings,
+    /// Keyboard overrides: action id -> GTK accelerator name (see `key_actions`).
+    /// Missing = the action's default; "" = unbound.
+    pub keys: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UiSettings {
+    /// Parse **bold** etc. when sending (off = send literally).
+    pub markdown_send: bool,
+    /// Enter sends (off = Ctrl+Enter sends, Enter inserts a newline).
+    pub send_on_enter: bool,
+    pub show_avatars: bool,
+    /// 56px chat rows instead of 64px.
+    pub compact_list: bool,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        UiSettings { markdown_send: true, send_on_enter: true, show_avatars: true, compact_list: false }
+    }
+}
+
+/// A rebindable keyboard action. `group` is "Global" or "Composer" (composer
+/// bindings apply only while the composer has focus). Accelerators use GTK
+/// names (`gtk::accelerator_parse`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyAction {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub group: &'static str,
+    pub default: &'static str,
+}
+
+const KEY_ACTIONS: &[KeyAction] = &[
+    KeyAction { id: "switcher", label: "Chat switcher", group: "Global", default: "<Control>k" },
+    KeyAction { id: "settings", label: "Settings", group: "Global", default: "<Control>comma" },
+    KeyAction { id: "next_chat", label: "Next chat", group: "Global", default: "<Alt>Down" },
+    KeyAction { id: "prev_chat", label: "Previous chat", group: "Global", default: "<Alt>Up" },
+    KeyAction { id: "search", label: "Search chats and messages", group: "Global", default: "<Control>f" },
+    KeyAction { id: "search_in_chat", label: "Search in this chat", group: "Global", default: "<Control><Shift>f" },
+    KeyAction { id: "chat_info", label: "Chat info", group: "Global", default: "<Control><Shift>i" },
+    KeyAction { id: "toggle_sidebar", label: "Collapse sidebar", group: "Global", default: "<Control><Shift>b" },
+    KeyAction { id: "jump_to_date", label: "Jump to date", group: "Global", default: "<Control>j" },
+    KeyAction { id: "reply_last", label: "Reply to last message", group: "Global", default: "<Control>Up" },
+    KeyAction { id: "saved", label: "Saved messages", group: "Global", default: "<Control>0" },
+    KeyAction { id: "contacts", label: "Contacts", group: "Global", default: "<Control><Shift>c" },
+    KeyAction { id: "bold", label: "Bold", group: "Composer", default: "<Control>b" },
+    KeyAction { id: "italic", label: "Italic", group: "Composer", default: "<Control>i" },
+    KeyAction { id: "underline", label: "Underline", group: "Composer", default: "<Control>u" },
+    KeyAction { id: "strike", label: "Strikethrough", group: "Composer", default: "<Control><Shift>x" },
+    KeyAction { id: "mono", label: "Monospace", group: "Composer", default: "<Control><Shift>m" },
+    KeyAction { id: "link", label: "Link", group: "Composer", default: "<Control><Shift>k" },
+    KeyAction { id: "spoiler", label: "Spoiler", group: "Composer", default: "<Control><Shift>p" },
+];
+
+pub fn key_actions() -> &'static [KeyAction] {
+    KEY_ACTIONS
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -73,6 +132,8 @@ impl Default for Settings {
             ai: AiSettings::default(),
             os: OsSettings::default(),
             animations: BTreeMap::new(),
+            ui: UiSettings::default(),
+            keys: BTreeMap::new(),
         }
     }
 }
@@ -110,6 +171,14 @@ impl Settings {
 
     pub fn animation(&self, id: &str) -> bool {
         self.animations.get(id).copied().unwrap_or(false)
+    }
+
+    /// Accelerator for an action id ("" = unbound; unknown id = "").
+    pub fn key(&self, id: &str) -> String {
+        if let Some(k) = self.keys.get(id) {
+            return k.clone();
+        }
+        KEY_ACTIONS.iter().find(|a| a.id == id).map(|a| a.default.to_string()).unwrap_or_default()
     }
 }
 

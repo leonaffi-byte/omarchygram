@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use omarchygram::{theme, tg, ui};
+use omarchygram::{config, theme, tg, ui, uistate};
 
 use gtk4 as gtk;
 use gtk4::glib;
@@ -22,7 +22,10 @@ fn main() -> glib::ExitCode {
         unsafe { std::env::set_var("OMG_SETTINGS_PATH", &tmp) };
         // Offline AI stand-ins so probes can traverse the Assistant paths.
         unsafe { std::env::set_var("OMG_MOCK_AI", "1") };
+        let ui_tmp = base.join(format!("omarchygram-smoke-{}-ui.toml", std::process::id()));
+        unsafe { std::env::set_var("OMG_UISTATE_PATH", &ui_tmp) };
     }
+    config::enforce_permissions();
 
     let app = gtk::Application::builder().application_id(APP_ID).build();
     app.connect_activate(move |app| build(app, smoke, probe));
@@ -36,13 +39,30 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
         return;
     }
 
+    let state = uistate::UiState::load();
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Omarchygram")
-        .default_width(960)
-        .default_height(640)
+        .default_width(state.window_w)
+        .default_height(state.window_h)
+        .maximized(state.maximized)
         .build();
     window.add_css_class("omg-window");
+    if !smoke {
+        // Remember the window geometry; pane widths are saved by the shell.
+        window.connect_close_request(|w| {
+            let mut s = uistate::UiState::load();
+            s.maximized = w.is_maximized();
+            if !s.maximized {
+                s.window_w = w.width();
+                s.window_h = w.height();
+            }
+            if let Err(e) = s.save() {
+                eprintln!("omarchygram: could not save ui-state: {e}");
+            }
+            glib::Propagation::Proceed
+        });
+    }
 
     let display = gtk::prelude::WidgetExt::display(&window);
     // Leak-free: the manager lives as long as the app; keep it alive via the window.

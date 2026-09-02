@@ -746,6 +746,13 @@ impl ShellInner {
 
     fn handle_event(self: &Rc<Self>, event: Event) {
         match event {
+            // Wave 5: read state, presence, dialog/pin changes are consumed by
+            // packages 5A/5C (specs/spec-wave5.md); until then they are inert.
+            Event::ReadOutbox { .. }
+            | Event::ReadInbox { .. }
+            | Event::Presence { .. }
+            | Event::DialogsChanged
+            | Event::PinnedChanged { .. } => {}
             Event::NewMessage(message) => self.handle_new_message(message),
             Event::MessageChanged(message) => {
                 let message = self.apply_tombstone(message);
@@ -3388,6 +3395,11 @@ fn message_preview(message: &Msg) -> String {
         Some(MediaKind::Sticker) => "[sticker]".to_string(),
         Some(MediaKind::Voice) => "[voice message]".to_string(),
         Some(MediaKind::Document) => "[file]".to_string(),
+        Some(MediaKind::Video) => "[video]".to_string(),
+        Some(MediaKind::Gif) => "[GIF]".to_string(),
+        Some(MediaKind::Audio) => "[audio]".to_string(),
+        Some(MediaKind::VideoNote) => "[video message]".to_string(),
+        Some(MediaKind::Unsupported) => "[unsupported]".to_string(),
         None => String::new(),
     }
 }

@@ -814,3 +814,19 @@ scrollbar slider:hover {
 .omg-window.omg-anim-unreadcomet {
   outline-color: var(--accent);
 }
+
+/* ---- wave 5: name/avatar palette (user_id % 7) ---- */
+.omg-c0 { color: $accent; }
+.omg-c1 { color: $green; }
+.omg-c2 { color: $cyan; }
+.omg-c3 { color: $blue; }
+.omg-c4 { color: $magenta; }
+.omg-c5 { color: $yellow; }
+.omg-c6 { color: $orange; }
+.omg-avatar-c0 { background-color: $accent; color: $darker_background; }
+.omg-avatar-c1 { background-color: $green; color: $darker_background; }
+.omg-avatar-c2 { background-color: $cyan; color: $darker_background; }
+.omg-avatar-c3 { background-color: $blue; color: $darker_background; }
+.omg-avatar-c4 { background-color: $magenta; color: $darker_background; }
+.omg-avatar-c5 { background-color: $yellow; color: $darker_background; }
+.omg-avatar-c6 { background-color: $orange; color: $darker_background; }

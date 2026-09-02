@@ -1067,6 +1067,7 @@ dependencies = [
  "md5",
  "mime_guess",
  "pin-project-lite",
+ "pulldown-cmark",
  "tokio",
 ]
 
@@ -2230,6 +2231,7 @@ dependencies = [
  "grammers-tl-types",
  "gtk4",
  "image",
+ "libc",
  "libsql",
  "reqwest",
  "serde",
@@ -2445,6 +2447,17 @@ checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
