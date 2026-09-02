@@ -27,7 +27,11 @@ fn main() -> glib::ExitCode {
     }
     config::enforce_permissions();
 
-    let app = gtk::Application::builder().application_id(APP_ID).build();
+    // Smoke/probe runs must never collapse into an already-running instance
+    // (GTK would forward "activate" over D-Bus and exit 0 without running
+    // anything), so they register as non-unique.
+    let flags = if smoke { gtk::gio::ApplicationFlags::NON_UNIQUE } else { gtk::gio::ApplicationFlags::default() };
+    let app = gtk::Application::builder().application_id(APP_ID).flags(flags).build();
     app.connect_activate(move |app| build(app, smoke, probe));
     // GTK must not see our flags.
     app.run_with_args::<&str>(&[])
