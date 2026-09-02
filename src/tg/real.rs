@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 
 use super::archive::Archive;
 use super::{
-    paths, to_markdown, AuthState, BackendFlags, ChatSummary, Command, Event, Me, MediaKind, Msg, Reaction,
+    paths, reject, to_markdown, AuthState, BackendFlags, ChatSummary, Command, Event, Me, MediaKind, Msg, Reaction,
     Span, SpanKind, TgError,
 };
 
@@ -184,60 +184,6 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
 /// Answer a data command received before the backend connected.
 fn respond_not_connected(cmd: Command) {
     reject(cmd, "not connected");
-}
-
-/// Reply to any command with an error.
-fn reject(cmd: Command, e: &str) {
-    let e = e.to_string();
-    match cmd {
-        Command::Start(tx) | Command::SubmitPhone(_, tx) | Command::SubmitCode(_, tx) | Command::SubmitPassword(_, tx) | Command::LogOut(tx) => {
-            drop(tx.send(Err(e)))
-        }
-        Command::SubmitCredentials { respond, .. } => drop(respond.send(Err(e))),
-        Command::GetMe(tx) => drop(tx.send(Err(e))),
-        Command::GetDialogs(tx) => drop(tx.send(Err(e))),
-        Command::GetHistory { respond, .. }
-        | Command::GetMessages { respond, .. }
-        | Command::GetHistoryAtDate { respond, .. }
-        | Command::SearchMessages { respond, .. }
-        | Command::SearchGlobal { respond, .. }
-        | Command::ForwardMessages { respond, .. }
-        | Command::GetSharedMedia { respond, .. } => drop(respond.send(Err(e))),
-        Command::DownloadMedia { respond, .. }
-        | Command::DownloadAvatar { respond, .. }
-        | Command::DownloadSticker { respond, .. }
-        | Command::DownloadGif { respond, .. } => drop(respond.send(Err(e))),
-        Command::SendText { respond, .. }
-        | Command::SendFile { respond, .. }
-        | Command::SendVoice { respond, .. }
-        | Command::SendSticker { respond, .. }
-        | Command::SendGif { respond, .. }
-        | Command::EditText { respond, .. } => drop(respond.send(Err(e))),
-        Command::DeleteMessages { respond, .. }
-        | Command::MarkRead { respond, .. }
-        | Command::PinMessage { respond, .. }
-        | Command::SendReaction { respond, .. }
-        | Command::SetPinned { respond, .. }
-        | Command::SetMuted { respond, .. }
-        | Command::SetArchived { respond, .. }
-        | Command::MarkUnread { respond, .. }
-        | Command::DeleteChat { respond, .. }
-        | Command::ClearHistory { respond, .. }
-        | Command::SaveDraft { respond, .. } => drop(respond.send(Err(e))),
-        Command::SetFlags(_, tx) => drop(tx.send(Err(e))),
-        Command::GetEditHistory { respond, .. } => drop(respond.send(Err(e))),
-        Command::GetPinnedMessage { respond, .. } => drop(respond.send(Err(e))),
-        Command::GetAvailableReactions(tx) => drop(tx.send(Err(e))),
-        Command::SearchChats { respond, .. } => drop(respond.send(Err(e))),
-        Command::GetChatInfo { respond, .. } => drop(respond.send(Err(e))),
-        Command::GetMembers { respond, .. } => drop(respond.send(Err(e))),
-        Command::GetContacts(tx) => drop(tx.send(Err(e))),
-        Command::OpenUser { respond, .. } | Command::CreateGroup { respond, .. } => drop(respond.send(Err(e))),
-        Command::GetFolders(tx) => drop(tx.send(Err(e))),
-        Command::GetStickerPacks(tx) => drop(tx.send(Err(e))),
-        Command::GetStickers { respond, .. } => drop(respond.send(Err(e))),
-        Command::GetSavedGifs(tx) => drop(tx.send(Err(e))),
-    }
 }
 
 async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {

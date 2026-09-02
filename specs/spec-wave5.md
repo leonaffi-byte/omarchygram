@@ -507,3 +507,58 @@ failsafe stays; if the traversal exceeds ~35s, split it behind
   quota at the time.
 - Each package: verifier → cross-reviewer (grok for codex, codex for kimi) →
   fix round → orchestrator screenshot review → merge --no-ff.
+
+---
+
+## 10. Review amendments (binding — from the codex adversarial spec review, 2026-09-02)
+
+These override anything above that they contradict.
+
+**Session & auth**
+- A1 (log out): the UI keeps a `session_epoch`. Log out first blocks new mutations, cancels any recording, waits for in-flight mutations to settle, then increments `session_epoch` and calls `log_out`. Every async completion captures the epoch and is dropped if stale. There is ONE event loop for the `Tg` lifetime; events are ignored while the session is not Ready. Keep separate `event_loop_started` and `session_ready` flags.
+- A2 (credentials): the login form uses `Tg::submit_credentials`. The authenticated Settings → Account → "Change…" dialog uses `config::set_credentials` only, then shows "Restart Omarchygram to use the new credentials"; it never calls `submit_credentials` or changes auth state.
+- A3 (credentials retry): `NeedCredentials` has its own `AuthAction::SubmitCredentials` with one in-flight guard; on error both fields keep their values and are re-enabled once. Startup Retry calls `tg.start()` exactly once and routes the returned state.
+- A4 (secrecy check): the auth probe submits a known 32-char sentinel api_hash and the gate asserts the sentinel is absent from captured stdout/stderr; review every `println!/eprintln!/dbg!` that can receive a credential or key.
+
+**Drafts & composer**
+- A5: C13 is amended: on chat switch, edit mode restores the complete pre-edit draft; reply mode is hidden but its target is stored in the departing chat's `Draft` and restored on switch-back. Edit buffers are never stored or sent as drafts.
+- A6 (D4 precise): each chat owns a monotonically increasing draft revision, one in-flight `save_draft` and one replaceable queued snapshot. Completion of revision N never mutates newer local state; on completion the latest queued revision is sent. A successful message send queues an empty draft after every older save. Errors keep the dirty state and expose Retry (a small "draft not saved — retry" line in the banner slot).
+- A7 (C5 extended): composer single-operation covers text, edit, file, voice, sticker and GIF sends. Each snapshots `(chat_id, epoch)` and reconciles its snapshot chat regardless of epoch; only the current view's widgets are touched. Reactions and forwarding have separate per-message / per-dialog guards.
+- A8 (recorder): states Idle → Starting → Recording → Stopping/Sending; commands serialized; Cancel during Starting sets `cancel_requested` and calls `record_cancel` after start resolves. Chat switch and log out always cancel. Stop/send snapshots `(chat_id, epoch)` and never affects the new composer.
+
+**Sidebar & dialogs**
+- A9 (modes): sidebar mode is exactly one of `Dialogs(folder_id)`, `Archived`, `Search(query)`. Search covers all dialogs plus remote results regardless of folder/archive; clearing returns to the prior mode. Folder tabs are hidden in Archived and Search. The archived count is global.
+- A10 (D5 precise): the shell keeps `dialogs_revision`; every event/upsert increments it. A `get_dialogs` reload captures it at request time; if it changed meanwhile, the reload must not overwrite newer per-row fields (last message, unread, draft) and schedules one trailing reload. Reconcile by id; preserve the selected id and the sidebar scroll anchor; never touch the message-pane scroll.
+- A11: while sidebar search is active a reload updates only the backing dialog model, recomputes the local "Chats" section for the current query, keeps remote results until their query generation completes, and never swaps the results widget for the dialog list.
+- A12 (chat actions): on successful Clear history, clear the open message store (epoch-guarded). On Delete chat, close the pane and cancel all modes. Manual Mark-unread persists until the user leaves and reopens the chat or a newer incoming message is explicitly marked read (C11 does not undo it while the chat stays open).
+- A13 (Paned): effective collapse = `user_collapsed || window_width < 640`. Collapsed presentation: 64px natural/minimum width; expanded: 220px minimum. Clamp the Paned position to `min(saved_width, floor(window_width × 0.45))` on every resize. Persist only the expanded user width and the explicit choice, never the auto position. `shrink_start_child` may be true while collapsed.
+- A14 (read state): keep a monotonic `read_outbox_max_id` per chat = `max(known, event, summary)`. Every inserted or updated row (pagination included) derives its ticks from it. A stale dialogs response never lowers it.
+- A15 (mute intent): a mute/unmute action records a pending intent immediately; notification checks consult the intent before the cached summary; backend failure rolls it back and reports the error.
+- A16 (colors): sender names use `sender_id.rem_euclid(7)`; fallback avatars use the user/chat id with `rem_euclid(7)`; a missing sender id uses a stable hash of the name.
+
+**Messages**
+- A17 (in-chat search jump): for a hit outside the loaded store, call `get_history_at_date(chat_id, hit.ts)`, ensure the hit via `get_messages`, and enter the existing detached-anchor mode; "Jump to latest" (▼) restores the newest page. Never imply newer surrounding messages were fetched.
+- A18 (search generations): every text edit, clear, close and chat switch increments the search generation; `<3` chars cancels remote results; "N of M" counts the loaded page; up/down do not wrap; a "Load older" action pages with `before_id`; errors keep prior hits and show Retry.
+- A19 (forward): snapshot source chat, ids, targets and the overlay generation; call the backend once per target in dialog order; continue after individual failures; report partial results ("2 of 3 forwarded"); switch only to the last successful target and only if the originating generation is still current.
+- A20 (D6 precise): deleted ids leave the selection set immediately, before animation or row mutation; count/actions update idempotently. Tombstoned rows stay visible but unselected and non-selectable. Delete is enabled only when every selected message is outgoing. Forward/Copy operate on surviving ids in display order.
+- A21 (reactions): per-message reaction mutation generation; revert on failure only if that generation is still the latest and no newer `MessageChanged` was merged.
+- A22 (grouping): after every insert/remove/update recompute sender-name/spacing grouping for the changed row and its immediate neighbours. Day separators derive from adjacent store entries, keyed by date boundary, and update without rebuilding rows.
+- A23 (bubble width): clamp the bubble's natural width from the message-pane allocation (a width-clamping container or `measure` override); `set_size_request` is never used as a maximum. The probe asserts rendered bubble width ≤ 520px and ≤ 67% of the pane after a resize.
+- A24 (markup): escape text and attribute values first; convert char offsets safely; discard out-of-range spans; overlapping spans nest by (start asc, end desc). Link/Mention activation only through explicit `<a>` targets; message text is never interpreted as raw markup.
+- A25 (viewer): snapshot the loaded photo ids in display order on open; `MessageDeleted` removes ids, and if the current one is deleted advance or close. Close returns focus to the source row if it still exists, else to the composer.
+- A26 (popovers): emoji/reaction choosers occupy the owner's single popover slot, are parented to a stable button right before popup, and are popdown+unparented before owner teardown. Opening the reaction chooser first closes the message context popover.
+
+**Info panel, settings, keys**
+- A27 (info panel): the sole D7 exception — persisted `info_panel_open` is desired-open state; chat switch cancels old fills and rebinds the open panel to the new chat. At ≥ 1000px it is a nested horizontal Paned (width persisted in `UiState.info_width`, default 320); below 1000px it is unparented and reparented into the overlay.
+- A28 (keys): replace all rebindable hard-coded key handling in the shell/composer with two owned `gtk::ShortcutController`s (Global on the window, Composer on the TextView), rebuilt atomically on settings change. Only fixed Escape and the capture widget may stay in `EventControllerKey`. Conflicts are compared after `gtk::accelerator_parse` canonicalization; same-group duplicates block Save; cross-group duplicates are allowed (Composer wins while the composer has focus). Capture mode stops all app shortcuts; modifier-only and invalid keys are rejected.
+- A29 (secrets UI): `gtk::PasswordEntry` (`show_peek_icon = true`) via `Editable`; fields start empty even when a key is set; an empty Save leaves the stored key unchanged; only Clear removes it; stored secrets are never prefilled.
+- A30 (settings nav): a real `gtk::StackSidebar` bound to a `gtk::Stack`; each page has the exact listed title and a stable name; the selected page persists while Settings stays open.
+- A31 (window persistence): while maximized only `maximized = true` is saved; the last non-maximized size is what `window_w/h` hold (already implemented in `src/main.rs`).
+- A32 (fills, D8 precise): every async fill captures `(logical key, generation, weak widget)` and applies only if the widget still exists and still advertises that key. Changing `has_photo`, tab, pack, chat or `show_avatars` increments the generation and restores the placeholder immediately.
+- A33 (list states): each independently awaited list/section owns its loading/empty/error+Retry/populated state; paging errors keep existing rows and put Retry at the failed edge; initial errors replace only that section.
+- A34: D1–D3 are the "Behaviors" rules of `specs/spec-wave2.md` and apply unchanged.
+
+**Acceptance additions (all packages)**
+- A35 (races): the mock honours `OMG_MOCK_SLOW=<Cmd,Cmd,…>` (those commands are delayed 1500ms) and `OMG_MOCK_FAIL_ONCE=<Cmd,…>` (the first call of each listed command fails with "mock: transient failure"). Command names are the `Command` variant names (`GetDialogs`, `SearchGlobal`, `ForwardMessages`, `DownloadAvatar`, `SaveDraft`, `SendReaction`, `GetMembers`, `GetSharedMedia`, `SubmitCredentials`, `LogOut`, …). Each package adds probe variants to the gate that switch chats while the relevant command is slow, inject a delete during selection and a `ReadOutbox` during pagination (mock triggers already exist), and assert no stale widget/state change; and variants with FAIL_ONCE that assert the designated error, retained user input, an enabled Retry, and a successful retry.
+- A36 (persisted state): a gate run pre-seeds `OMG_UISTATE_PATH` with a known file and the probe asserts window size, sidebar width/collapsed, folder and info-panel restoration; the probe resizes 639→640 and 999→1000 px and asserts the transitions; explicit collapse survives auto-collapse.
+- A37: `BackendFlags` gained `markdown_send` (default true); 5B forwards `settings.ui.markdown_send` into it next to ghost/anti-delete. When false, the real backend sends text literally.

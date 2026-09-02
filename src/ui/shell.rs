@@ -469,6 +469,7 @@ impl ShellInner {
         let flags = BackendFlags {
             ghost_mode: settings.ghost_mode,
             anti_delete: settings.anti_delete,
+            markdown_send: settings.ui.markdown_send,
         };
         let previous = self.desired_flags.replace(flags);
         let initialized = self.flags_initialized.replace(true);

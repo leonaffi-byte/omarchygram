@@ -361,12 +361,20 @@ pub struct Me {
 }
 
 /// Behavior flags the UI forwards from settings.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendFlags {
     /// No read receipts, no online status.
     pub ghost_mode: bool,
     /// get_history merges archived deleted messages (struck through).
     pub anti_delete: bool,
+    /// Parse **bold** etc. on send/edit (false = send literally).
+    pub markdown_send: bool,
+}
+
+impl Default for BackendFlags {
+    fn default() -> Self {
+        BackendFlags { ghost_mode: false, anti_delete: false, markdown_send: true }
+    }
 }
 
 /// Pushed by the backend; read via `Tg::events`. Arrive on whatever context
@@ -458,6 +466,119 @@ enum Command {
     DownloadSticker { sticker_id: i64, respond: Reply<Option<PathBuf>> },
     GetSavedGifs(Reply<Vec<Gif>>),
     DownloadGif { gif_id: i64, respond: Reply<Option<PathBuf>> },
+}
+
+impl Command {
+    /// Variant name, for the mock's OMG_MOCK_SLOW / OMG_MOCK_FAIL_ONCE hooks.
+    fn name(&self) -> &'static str {
+        match self {
+            Command::Start(_) => "Start",
+            Command::SubmitCredentials { .. } => "SubmitCredentials",
+            Command::SubmitPhone(..) => "SubmitPhone",
+            Command::SubmitCode(..) => "SubmitCode",
+            Command::SubmitPassword(..) => "SubmitPassword",
+            Command::LogOut(_) => "LogOut",
+            Command::GetMe(_) => "GetMe",
+            Command::GetDialogs(_) => "GetDialogs",
+            Command::GetHistory { .. } => "GetHistory",
+            Command::GetMessages { .. } => "GetMessages",
+            Command::DownloadMedia { .. } => "DownloadMedia",
+            Command::DownloadAvatar { .. } => "DownloadAvatar",
+            Command::SendText { .. } => "SendText",
+            Command::SendFile { .. } => "SendFile",
+            Command::SendVoice { .. } => "SendVoice",
+            Command::SendSticker { .. } => "SendSticker",
+            Command::SendGif { .. } => "SendGif",
+            Command::EditText { .. } => "EditText",
+            Command::DeleteMessages { .. } => "DeleteMessages",
+            Command::ForwardMessages { .. } => "ForwardMessages",
+            Command::MarkRead { .. } => "MarkRead",
+            Command::SetFlags(..) => "SetFlags",
+            Command::GetHistoryAtDate { .. } => "GetHistoryAtDate",
+            Command::GetEditHistory { .. } => "GetEditHistory",
+            Command::SearchMessages { .. } => "SearchMessages",
+            Command::SearchGlobal { .. } => "SearchGlobal",
+            Command::SearchChats { .. } => "SearchChats",
+            Command::GetPinnedMessage { .. } => "GetPinnedMessage",
+            Command::PinMessage { .. } => "PinMessage",
+            Command::SendReaction { .. } => "SendReaction",
+            Command::GetAvailableReactions(_) => "GetAvailableReactions",
+            Command::SetPinned { .. } => "SetPinned",
+            Command::SetMuted { .. } => "SetMuted",
+            Command::SetArchived { .. } => "SetArchived",
+            Command::MarkUnread { .. } => "MarkUnread",
+            Command::DeleteChat { .. } => "DeleteChat",
+            Command::ClearHistory { .. } => "ClearHistory",
+            Command::SaveDraft { .. } => "SaveDraft",
+            Command::GetChatInfo { .. } => "GetChatInfo",
+            Command::GetMembers { .. } => "GetMembers",
+            Command::GetSharedMedia { .. } => "GetSharedMedia",
+            Command::GetContacts(_) => "GetContacts",
+            Command::OpenUser { .. } => "OpenUser",
+            Command::CreateGroup { .. } => "CreateGroup",
+            Command::GetFolders(_) => "GetFolders",
+            Command::GetStickerPacks(_) => "GetStickerPacks",
+            Command::GetStickers { .. } => "GetStickers",
+            Command::DownloadSticker { .. } => "DownloadSticker",
+            Command::GetSavedGifs(_) => "GetSavedGifs",
+            Command::DownloadGif { .. } => "DownloadGif",
+        }
+    }
+}
+
+/// Reply to any command with an error (used before connect, for
+/// unimplemented commands, and by the mock's failure injection).
+fn reject(cmd: Command, e: &str) {
+    let e = e.to_string();
+    match cmd {
+        Command::Start(tx) | Command::SubmitPhone(_, tx) | Command::SubmitCode(_, tx) | Command::SubmitPassword(_, tx) | Command::LogOut(tx) => {
+            drop(tx.send(Err(e)))
+        }
+        Command::SubmitCredentials { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetMe(tx) => drop(tx.send(Err(e))),
+        Command::GetDialogs(tx) => drop(tx.send(Err(e))),
+        Command::GetHistory { respond, .. }
+        | Command::GetMessages { respond, .. }
+        | Command::GetHistoryAtDate { respond, .. }
+        | Command::SearchMessages { respond, .. }
+        | Command::SearchGlobal { respond, .. }
+        | Command::ForwardMessages { respond, .. }
+        | Command::GetSharedMedia { respond, .. } => drop(respond.send(Err(e))),
+        Command::DownloadMedia { respond, .. }
+        | Command::DownloadAvatar { respond, .. }
+        | Command::DownloadSticker { respond, .. }
+        | Command::DownloadGif { respond, .. } => drop(respond.send(Err(e))),
+        Command::SendText { respond, .. }
+        | Command::SendFile { respond, .. }
+        | Command::SendVoice { respond, .. }
+        | Command::SendSticker { respond, .. }
+        | Command::SendGif { respond, .. }
+        | Command::EditText { respond, .. } => drop(respond.send(Err(e))),
+        Command::DeleteMessages { respond, .. }
+        | Command::MarkRead { respond, .. }
+        | Command::PinMessage { respond, .. }
+        | Command::SendReaction { respond, .. }
+        | Command::SetPinned { respond, .. }
+        | Command::SetMuted { respond, .. }
+        | Command::SetArchived { respond, .. }
+        | Command::MarkUnread { respond, .. }
+        | Command::DeleteChat { respond, .. }
+        | Command::ClearHistory { respond, .. }
+        | Command::SaveDraft { respond, .. } => drop(respond.send(Err(e))),
+        Command::SetFlags(_, tx) => drop(tx.send(Err(e))),
+        Command::GetEditHistory { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetPinnedMessage { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetAvailableReactions(tx) => drop(tx.send(Err(e))),
+        Command::SearchChats { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetChatInfo { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetMembers { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetContacts(tx) => drop(tx.send(Err(e))),
+        Command::OpenUser { respond, .. } | Command::CreateGroup { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetFolders(tx) => drop(tx.send(Err(e))),
+        Command::GetStickerPacks(tx) => drop(tx.send(Err(e))),
+        Command::GetStickers { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetSavedGifs(tx) => drop(tx.send(Err(e))),
+    }
 }
 
 /// UI-side handle to the backend thread. Cheap to clone.

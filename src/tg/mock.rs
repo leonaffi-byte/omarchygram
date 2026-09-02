@@ -7,7 +7,7 @@
 //! search, folders, stickers, presence, read state…) be exercised and
 //! screenshotted without Telegram credentials.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +15,7 @@ use chrono::{DateTime, Duration, Local};
 use tokio::sync::mpsc;
 
 use super::{
-    parse_markdown, paths, to_markdown, AuthState, BackendFlags, ChatInfo, ChatKind, ChatSummary, Command, Contact,
+    parse_markdown, paths, reject, to_markdown, AuthState, BackendFlags, ChatInfo, ChatKind, ChatSummary, Command, Contact,
     Event, Folder, Gif, Me, MediaKind, Member, MemberRole, Msg, MsgVersion, MuteMode, Presence, Reaction, SharedKind,
     Span, SpanKind, Sticker, StickerPack, WebPreview,
 };
@@ -139,6 +139,8 @@ struct MockState {
     pinned_msg: HashMap<i64, i32>,
     contacts: Vec<Contact>,
     folders: Vec<Folder>,
+    /// Commands that already failed once (OMG_MOCK_FAIL_ONCE).
+    failed_once: HashSet<&'static str>,
 }
 
 impl MockState {
@@ -312,6 +314,7 @@ impl MockState {
             pinned_msg: HashMap::from([(5, 501)]),
             contacts,
             folders,
+            failed_once: HashSet::new(),
         }
     }
 
@@ -455,6 +458,19 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
         }
     }
     let env_on = |n: &str| std::env::var(n).is_ok_and(|v| !v.is_empty());
+    // Test hooks: OMG_MOCK_SLOW=Cmd,Cmd delays those commands 1.5s;
+    // OMG_MOCK_FAIL_ONCE=Cmd,Cmd fails the first call of each listed command.
+    let listed = |var: &str, name: &str| {
+        std::env::var(var).is_ok_and(|v| v.split(',').any(|x| x.trim() == name))
+    };
+    let name = cmd.name();
+    if listed("OMG_MOCK_SLOW", name) {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+    if listed("OMG_MOCK_FAIL_ONCE", name) && st.lock().unwrap().failed_once.insert(name) {
+        reject(cmd, "mock: transient failure");
+        return;
+    }
     match cmd {
         Command::Start(tx) => {
             // OMG_MOCK_NEED_CREDS=1 starts at the credentials form;

@@ -16,6 +16,8 @@ pub struct UiState {
     /// The user's explicit choice; auto-collapse on narrow windows never writes this.
     pub sidebar_collapsed: bool,
     pub info_panel_open: bool,
+    /// Info panel width when shown as a third column.
+    pub info_width: i32,
     /// Selected folder tab; 0 = All.
     pub folder_id: i32,
 }
@@ -29,6 +31,7 @@ impl Default for UiState {
             sidebar_width: 300,
             sidebar_collapsed: false,
             info_panel_open: false,
+            info_width: 320,
             folder_id: 0,
         }
     }
@@ -54,6 +57,7 @@ impl UiState {
         s.window_w = s.window_w.clamp(480, 10000);
         s.window_h = s.window_h.clamp(360, 10000);
         s.sidebar_width = s.sidebar_width.clamp(220, 2000);
+        s.info_width = s.info_width.clamp(280, 2000);
         s
     }
 
