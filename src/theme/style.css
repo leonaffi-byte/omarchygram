@@ -48,6 +48,8 @@ window.omg-window {
   padding: 8px 12px;
   background-color: transparent;
   border-left: 2px solid transparent;
+  border-bottom: 1px solid transparent;
+  transition: border-bottom-color 180ms;
 }
 
 .omg-chat-row:hover {
@@ -446,4 +448,369 @@ scrollbar slider {
 
 scrollbar slider:hover {
   background-color: var(--muted);
+}
+
+/* ---- animations ----
+   Motion Lab classes are mirrored on window.omg-window by ui/anim. Every
+   color below is an Omarchy token; geometry/opacity are the only literals. */
+
+@keyframes omg-fadeup {
+  from { opacity: 0; margin-top: 4px; }
+  to { opacity: 1; margin-top: 0; }
+}
+
+@keyframes omg-borderdraw {
+  0% { border-top-color: var(--accent); border-right-color: var(--bg-lighter); border-bottom-color: var(--bg-lighter); border-left-color: var(--bg-lighter); }
+  25% { border-top-color: var(--accent); border-right-color: var(--accent); border-bottom-color: var(--bg-lighter); border-left-color: var(--bg-lighter); }
+  50% { border-top-color: var(--accent); border-right-color: var(--accent); border-bottom-color: var(--accent); border-left-color: var(--bg-lighter); }
+  75%, 100% { border-color: var(--accent); }
+}
+
+@keyframes omg-invert {
+  0%, 100% { background-color: var(--bg-dark); color: var(--fg); }
+  50% { background-color: var(--fg); color: var(--bg-dark); }
+}
+
+@keyframes omg-crossfade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes omg-wipe {
+  0%, 100% { background-color: var(--bg); margin-left: 0; margin-right: 0; }
+  50% { background-color: var(--bg-darker); margin-left: 48px; margin-right: 48px; }
+}
+
+@keyframes omg-pop {
+  0% { opacity: 0; margin: 4px; }
+  55% { opacity: 1; margin: 0; }
+  75% { margin: 2px; }
+  100% { margin: 0; }
+}
+
+@keyframes omg-roll {
+  0% { opacity: 1; margin-top: 0; margin-bottom: 0; }
+  45% { opacity: 0; margin-top: 0; margin-bottom: 4px; }
+  55% { opacity: 0; margin-top: 4px; margin-bottom: 0; }
+  100% { opacity: 1; margin-top: 0; margin-bottom: 0; }
+}
+
+@keyframes omg-receipt {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes omg-editripple {
+  0%, 100% { box-shadow: 0 0 0 var(--bg); }
+  50% { box-shadow: 0 0 6px var(--accent); }
+}
+
+@keyframes omg-dissolve {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes omg-badgepulse {
+  0%, 100% { box-shadow: 0 0 0 var(--accent); }
+  50% { box-shadow: 0 0 6px var(--accent); }
+}
+
+@keyframes omg-bellshake {
+  0%, 100% { margin-left: 0; }
+  20%, 60% { margin-left: 3px; }
+  40%, 80% { margin-left: 0; margin-right: 3px; }
+}
+
+@keyframes omg-jumprocket {
+  0%, 100% { opacity: 1; margin-bottom: 0; }
+  35% { opacity: 0.45; margin-bottom: 0; }
+  70% { opacity: 1; margin-bottom: 6px; }
+}
+
+@keyframes omg-divider {
+  from { opacity: 0; margin-left: 48px; margin-right: 48px; }
+  to { opacity: 1; margin-left: 0; margin-right: 0; }
+}
+
+@keyframes omg-datefloat {
+  0% { opacity: 0; margin-top: 4px; }
+  18%, 82% { opacity: 1; margin-top: 0; }
+  100% { opacity: 0; margin-top: 4px; }
+}
+
+@keyframes omg-burn {
+  0% { color: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  100% { color: var(--fg); box-shadow: 0 0 0 var(--bg); }
+}
+
+@keyframes omg-cursorcomet {
+  0%, 100% { box-shadow: 0 0 0 var(--accent); }
+  50% { box-shadow: -6px 0 6px var(--accent); }
+}
+
+@keyframes omg-cursorblink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+@keyframes omg-onlinebreathe {
+  0%, 100% { opacity: 0.45; box-shadow: 0 0 0 var(--accent); }
+  50% { opacity: 1; box-shadow: 0 0 5px var(--accent); }
+}
+
+@keyframes omg-glitch {
+  0%, 100% { color: var(--fg); }
+  33% { color: var(--accent); }
+  66% { color: var(--red); }
+}
+
+.omg-window.omg-anim-fadeup .omg-run-fadeup,
+.omg-window.omg-anim-cascade .omg-run-fadeup,
+.omg-window.omg-anim-attachunfold .omg-run-fadeup {
+  animation: omg-fadeup 160ms ease-out 1;
+}
+
+.omg-window.omg-anim-borderdraw .omg-run-borderdraw {
+  border: 1px solid var(--bg-lighter);
+  animation: omg-borderdraw 500ms linear 1;
+}
+
+.omg-window.omg-anim-invert .omg-run-invert {
+  animation: omg-invert 90ms linear 1;
+}
+
+.omg-window.omg-anim-ticksweep .omg-tick-sweep {
+  background-color: var(--accent);
+}
+
+.omg-window.omg-anim-crossfade .omg-run-crossfade {
+  animation: omg-crossfade 100ms linear 1;
+}
+
+.omg-window.omg-anim-wipe .omg-run-wipe {
+  animation: omg-wipe 260ms ease-in-out 1;
+}
+
+.omg-window.omg-anim-reactburst .omg-run-reactburst,
+.omg-window.omg-anim-badgepop .omg-run-badgepop {
+  animation: omg-pop 240ms ease-out 1;
+}
+
+.omg-window.omg-anim-reactroll .omg-run-reactroll,
+.omg-window.omg-anim-badgeroll .omg-run-badgeroll {
+  animation: omg-roll 220ms ease-in-out 1;
+}
+
+.omg-window.omg-anim-reactroll .omg-run-reactroll-in {
+  animation: omg-receipt 200ms linear 1;
+}
+
+.omg-window.omg-anim-badgeroll .omg-run-badge-old {
+  animation: omg-roll 220ms ease-in-out reverse 1;
+}
+
+.omg-window.omg-anim-receiptdraw .omg-run-receipt {
+  color: var(--accent);
+  animation: omg-receipt 400ms linear 2;
+}
+
+.omg-window.omg-anim-editripple .omg-run-editripple {
+  animation: omg-editripple 500ms ease-out 1;
+}
+
+.omg-window.omg-anim-deletedissolve .omg-run-deletedissolve {
+  animation: omg-dissolve 500ms linear 1;
+}
+
+.omg-window.omg-anim-badgepulse .omg-run-badgepulse {
+  animation: omg-badgepulse 2.4s ease-in-out infinite;
+}
+
+.omg-window.omg-anim-bellshake .omg-run-bellshake {
+  animation: omg-bellshake 400ms linear 1;
+}
+
+.omg-window.omg-anim-jumprocket .omg-run-jumprocket {
+  animation: omg-jumprocket 400ms ease-out 1;
+}
+
+.omg-window.omg-anim-unreaddivider .omg-run-unreaddivider {
+  border-top: 1px solid var(--accent);
+  animation: omg-divider 400ms ease-out 1;
+}
+
+.omg-unread-divider {
+  color: var(--accent);
+  border-top: 1px solid var(--accent);
+  padding: 2px 8px;
+}
+
+.omg-window.omg-anim-datefloat .omg-run-datefloat {
+  animation: omg-datefloat 900ms linear 1;
+}
+
+.omg-charge-fill {
+  background-color: var(--selection);
+  opacity: 0;
+}
+
+.omg-window.omg-anim-phosphorburn .omg-run-phosphorburn {
+  animation: omg-burn 1.1s ease-out 1;
+}
+
+.omg-window.omg-anim-cursorcomet .omg-run-cursorcomet {
+  color: var(--accent);
+  animation: omg-cursorcomet 1.06s steps(2) infinite;
+}
+
+.omg-window.omg-anim-composercursor .omg-composer-cursor {
+  color: var(--accent);
+  animation: omg-cursorblink 1.06s steps(2) infinite;
+}
+
+.omg-window.omg-anim-thememorph .omg-sidebar,
+.omg-window.omg-anim-thememorph .omg-messages,
+.omg-window.omg-anim-thememorph .omg-composer,
+.omg-window.omg-anim-thememorph .omg-chat-header,
+.omg-window.omg-anim-thememorph .omg-msg {
+  transition: background-color 500ms, color 500ms, border-color 500ms;
+}
+
+.omg-window.omg-anim-focusdim.omg-run-dim .omg-sidebar,
+.omg-window.omg-anim-focusdim.omg-run-dim .omg-messages,
+.omg-window.omg-anim-focusdim.omg-run-dim .omg-chat-header,
+.omg-window.omg-anim-focusdim.omg-run-dim .omg-composer {
+  opacity: 0.72;
+}
+
+.omg-window.omg-anim-hovertrace .omg-chat-row:hover {
+  border-bottom-color: var(--accent);
+}
+
+.omg-window.omg-anim-glitch .omg-chat-row:hover .omg-chat-title {
+  animation: omg-glitch 120ms steps(2) 1;
+}
+
+.omg-window.omg-anim-tsreveal .omg-msg .omg-meta {
+  opacity: 0;
+  transition: opacity 180ms;
+}
+
+.omg-window.omg-anim-tsreveal .omg-msg:hover .omg-meta {
+  opacity: 1;
+}
+
+.omg-window.omg-anim-onlinebreathe .omg-online-dot {
+  background-color: var(--accent);
+  animation: omg-onlinebreathe 2.4s ease-in-out infinite;
+}
+
+.omg-selection-bar,
+.omg-unread-comet,
+.omg-equalizer-bar {
+  background-color: var(--accent);
+}
+
+.omg-date-chip,
+.omg-anim-preview,
+.omg-bootlog {
+  background-color: var(--bg-darker);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  padding: 4px 8px;
+}
+
+.omg-anim-preview {
+  margin: 16px;
+}
+
+.omg-run-preview-pulse {
+  color: var(--accent);
+  border-bottom: 1px solid var(--accent);
+  animation: omg-receipt 1s linear 1;
+}
+
+.omg-reaction-particle {
+  color: var(--accent);
+  animation: omg-pop 320ms ease-out 1;
+}
+
+.omg-particle-0 { margin-top: 0; margin-left: 8px; }
+.omg-particle-1 { margin-top: 4px; margin-left: 4px; }
+.omg-particle-2 { margin-top: 8px; margin-left: 0; }
+.omg-particle-3 { margin-bottom: 8px; margin-right: 0; }
+.omg-particle-4 { margin-bottom: 4px; margin-right: 4px; }
+.omg-particle-5 { margin-bottom: 0; margin-right: 8px; }
+
+.omg-overlay-ink { color: var(--bg-darker); }
+.omg-overlay-accent { color: var(--accent); }
+
+.omg-flicker-overlay {
+  background-color: var(--fg);
+}
+
+.omg-wipe-shade {
+  background-color: var(--bg-darker);
+}
+
+.omg-power-beam {
+  background-color: var(--fg);
+}
+
+.omg-scan-sweep {
+  background-image: linear-gradient(to bottom, var(--bg), var(--accent), var(--bg));
+  opacity: 0.34;
+}
+
+.omg-grid-shimmer {
+  background-image: repeating-linear-gradient(to right, var(--bg), var(--bg-lighter) 1px, var(--bg) 2px, var(--bg) 16px);
+  opacity: 0.16;
+}
+
+.omg-grid-step-0 { background-position: 0 0; }
+.omg-grid-step-1 { background-position: 1px 1px; }
+.omg-grid-step-2 { background-position: 2px 2px; }
+.omg-grid-step-3 { background-position: 3px 3px; }
+.omg-grid-step-4 { background-position: 4px 4px; }
+.omg-grid-step-5 { background-position: 5px 5px; }
+.omg-grid-step-6 { background-position: 6px 6px; }
+.omg-grid-step-7 { background-position: 7px 7px; }
+.omg-grid-step-8 { background-position: 8px 8px; }
+.omg-grid-step-9 { background-position: 9px 9px; }
+.omg-grid-step-10 { background-position: 10px 10px; }
+.omg-grid-step-11 { background-position: 11px 11px; }
+.omg-grid-step-12 { background-position: 12px 12px; }
+.omg-grid-step-13 { background-position: 13px 13px; }
+.omg-grid-step-14 { background-position: 14px 14px; }
+.omg-grid-step-15 { background-position: 15px 15px; }
+
+/* Code-driven and no-op alternatives still receive their individual root
+   classes; these selectors document the full 54-effect surface. */
+.omg-window.omg-anim-typewriter,
+.omg-window.omg-anim-decode,
+.omg-window.omg-anim-lineprint,
+.omg-window.omg-anim-instantcursor,
+.omg-window.omg-anim-entrynone,
+.omg-window.omg-anim-sendspin,
+.omg-window.omg-anim-sendnone,
+.omg-window.omg-anim-cascade,
+.omg-window.omg-anim-switchnone,
+.omg-window.omg-anim-braille,
+.omg-window.omg-anim-ellipsis,
+.omg-window.omg-anim-asciiload,
+.omg-window.omg-anim-selbaron,
+.omg-window.omg-anim-attachunfold,
+.omg-window.omg-anim-equalizer,
+.omg-window.omg-anim-bootlog,
+.omg-window.omg-anim-flicker,
+.omg-window.omg-anim-scanlines,
+.omg-window.omg-anim-vignette,
+.omg-window.omg-anim-staticerror,
+.omg-window.omg-anim-poweron,
+.omg-window.omg-anim-scansweep,
+.omg-window.omg-anim-matrixrain,
+.omg-window.omg-anim-gridshimmer,
+.omg-window.omg-anim-liveclock,
+.omg-window.omg-anim-unreadcomet {
+  outline-color: var(--accent);
 }

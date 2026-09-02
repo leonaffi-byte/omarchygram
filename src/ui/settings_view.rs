@@ -7,6 +7,11 @@ use gtk4 as gtk;
 
 use crate::settings::{Settings, SettingsStore};
 
+use super::anim::{
+    EFFECTS, Effects, RadioGroup, apply_full_phosphor, apply_purist, apply_subtle, group_ids,
+    select_radio,
+};
+
 type SwitchGetter = Box<dyn Fn(&Settings) -> bool>;
 type EntryGetter = Box<dyn Fn(&Settings) -> String>;
 
@@ -21,7 +26,7 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(store: Rc<SettingsStore>) -> Self {
+    pub fn new(store: Rc<SettingsStore>, effects: Rc<Effects>) -> Self {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.add_css_class("omg-settings");
 
@@ -76,9 +81,12 @@ impl SettingsView {
             &timestamps,
             "Header clock",
             "Live ticking HH:MM:SS clock in the chat header.",
-            initial.header_clock,
-            |s, v| s.header_clock = v,
-            |s| s.header_clock,
+            initial.header_clock || initial.animation("liveclock"),
+            |s, v| {
+                s.header_clock = v;
+                s.animations.insert("liveclock".to_string(), v);
+            },
+            |s| s.header_clock || s.animation("liveclock"),
         );
         view.add_entry(
             &store,
@@ -200,6 +208,21 @@ impl SettingsView {
             |s| s.os.shell,
         );
 
+        let animations = view.add_section(&column, "ANIMATIONS");
+        view.add_presets(&store, &animations);
+        for effect in EFFECTS {
+            view.add_animation_switch(
+                &store,
+                &effects,
+                &animations,
+                effect.id,
+                effect.label,
+                effect.description,
+                effect.group,
+                initial.animation(effect.id) || effect.id == "liveclock" && initial.header_clock,
+            );
+        }
+
         {
             let on_close = view.on_close.clone();
             close.connect_clicked(move |_| {
@@ -298,9 +321,7 @@ impl SettingsView {
             });
         }
         row.append(&switch);
-        self.switches
-            .borrow_mut()
-            .push((switch, Box::new(get)));
+        self.switches.borrow_mut().push((switch, Box::new(get)));
     }
 
     fn add_entry(
@@ -338,5 +359,91 @@ impl SettingsView {
         }
         row.append(&entry);
         self.entries.borrow_mut().push((entry, Box::new(get)));
+    }
+
+    fn add_presets(&self, store: &Rc<SettingsStore>, section: &gtk::Box) {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        for (label, apply) in [
+            ("Purist (all off)", apply_purist as fn(&mut Settings)),
+            ("Subtle", apply_subtle as fn(&mut Settings)),
+            ("Full phosphor", apply_full_phosphor as fn(&mut Settings)),
+        ] {
+            let button = gtk::Button::with_label(label);
+            button.add_css_class("omg-attach");
+            let store = Rc::downgrade(store);
+            button.connect_clicked(move |_| {
+                if let Some(store) = store.upgrade() {
+                    store.update(apply);
+                }
+            });
+            row.append(&button);
+        }
+        section.append(&row);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_animation_switch(
+        &self,
+        store: &Rc<SettingsStore>,
+        effects: &Rc<Effects>,
+        section: &gtk::Box,
+        id: &'static str,
+        label: &str,
+        description: &str,
+        group: Option<RadioGroup>,
+        initial: bool,
+    ) {
+        let row = Self::add_row(section, label, description);
+        let preview = gtk::Button::with_label("Preview");
+        preview.add_css_class("omg-attach");
+        preview.set_valign(gtk::Align::Center);
+        {
+            let effects = effects.clone();
+            preview.connect_clicked(move |_| effects.preview(id));
+        }
+        row.append(&preview);
+
+        let switch = gtk::Switch::new();
+        switch.add_css_class("omg-switch");
+        switch.set_valign(gtk::Align::Center);
+        switch.set_state(initial);
+        switch.set_active(initial);
+        {
+            let store = Rc::downgrade(store);
+            let syncing = self.syncing.clone();
+            switch.connect_state_set(move |_, state| {
+                if syncing.get() {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(store) = store.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if !state && group.is_some() && store.get().animation(id) {
+                    // Once a radio family has a choice, move the selection by
+                    // activating another choice. Purist may still clear all.
+                    return glib::Propagation::Stop;
+                }
+                store.update(|settings| {
+                    if let Some(group) = group {
+                        if state {
+                            select_radio(settings, id, group_ids(group));
+                        }
+                    } else {
+                        settings.animations.insert(id.to_string(), state);
+                    }
+                    if id == "liveclock" {
+                        settings.header_clock = state;
+                    }
+                });
+                glib::Propagation::Proceed
+            });
+        }
+        row.append(&switch);
+        self.switches.borrow_mut().push((
+            switch,
+            Box::new(move |settings| {
+                settings.animation(id) || id == "liveclock" && settings.header_clock
+            }),
+        ));
     }
 }

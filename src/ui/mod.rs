@@ -1,3 +1,4 @@
+pub mod anim;
 pub mod auth;
 pub mod chatlist;
 pub mod messages;
