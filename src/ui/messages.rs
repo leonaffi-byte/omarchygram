@@ -345,17 +345,18 @@ impl MessagesView {
         send.add_css_class("omg-primary");
         send.set_valign(gtk::Align::End);
         send.set_sensitive(false);
+        // The label is the measured child; the charge fill is an unmeasured
+        // overlay. Expand flags on the fill would propagate up to the button
+        // and make the composer compete with the message pane for space.
         let send_contents = gtk::Overlay::new();
-        let send_fill = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        send_fill.add_css_class("omg-charge-fill");
-        send_fill.set_hexpand(true);
-        send_fill.set_vexpand(true);
-        send_fill.set_can_target(false);
-        send_contents.set_child(Some(&send_fill));
         let send_label = gtk::Label::new(Some("Send"));
         send_label.set_margin_start(8);
         send_label.set_margin_end(8);
-        send_contents.add_overlay(&send_label);
+        send_contents.set_child(Some(&send_label));
+        let send_fill = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        send_fill.add_css_class("omg-charge-fill");
+        send_fill.set_can_target(false);
+        send_contents.add_overlay(&send_fill);
         send.set_child(Some(&send_contents));
         composer_box.append(&send);
         widget.append(&composer_box);
