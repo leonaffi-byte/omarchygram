@@ -38,7 +38,7 @@
 
 # Known accepted limitations (decided 2026-09-01)
 - Backend command/event channels are unbounded and data commands spawn freely — accepted at personal-client scale; revisit only if memory growth is ever observed.
-- Animated (.tgs) stickers render as "image unavailable". Voice messages open in the default audio app, no in-app playback.
+- Animated (.tgs) stickers render as "image unavailable"; voice messages and video circles open in the default external player. Both are no longer "accepted": they are scheduled as wave 6A/6D in FEATURES.md (2026-09-03).
 - A non-"wrong password" error during 2FA (e.g. network drop) requires an app restart — the server-side password token is consumed and the error message says so.
 - Missing HOME/XDG dirs panic the backend with a clear message rather than degrade — never writable-relative-path session files.
 - Downloaded document extensions are normalized to plain ascii, not whitelisted — opening is always an explicit user click; a whitelist would block legitimate files from contacts.
