@@ -1,23 +1,237 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Datelike, Local};
 use gtk::gdk;
 use gtk::glib;
+use gtk::glib::subclass::prelude::ObjectSubclassIsExt;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
-use crate::tg::{MediaKind, Msg, MsgVersion};
+use crate::tg::{ChatInfo, ChatKind, ChatSummary, MediaKind, Msg, MsgVersion, Presence, Tg};
 
 use super::anim::Effects;
+use super::avatar::Avatar;
+use super::icons;
+use super::menus::{self, ChatAction, PopoverSlot};
 use super::virtual_chat::is_virtual;
+
+mod bubble_clamp_imp {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use gtk::glib;
+    use gtk::prelude::*;
+    use gtk::subclass::prelude::*;
+    use gtk4 as gtk;
+
+    #[derive(Default)]
+    pub struct BubbleClamp {
+        pub child: RefCell<Option<gtk::Widget>>,
+        pub pane_width: RefCell<Option<Rc<Cell<i32>>>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for BubbleClamp {
+        const NAME: &'static str = "OmgBubbleClamp";
+        type Type = super::BubbleClamp;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for BubbleClamp {
+        fn dispose(&self) {
+            if let Some(child) = self.child.borrow_mut().take() {
+                child.unparent();
+            }
+        }
+    }
+
+    impl BubbleClamp {
+        /// Width the child really gets: its natural width capped by the
+        /// bubble limit and the available width, never below its minimum.
+        fn child_width(&self, child: &gtk::Widget, available: i32, target: i32) -> i32 {
+            let (minimum, natural, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
+            natural.min(target).min(available).max(minimum).max(1)
+        }
+    }
+
+    impl WidgetImpl for BubbleClamp {
+        fn request_mode(&self) -> gtk::SizeRequestMode {
+            self.child
+                .borrow()
+                .as_ref()
+                .map(gtk::prelude::WidgetExt::request_mode)
+                .unwrap_or(gtk::SizeRequestMode::ConstantSize)
+        }
+
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            let Some(child) = self.child.borrow().as_ref().cloned() else {
+                return (0, 0, -1, -1);
+            };
+            let target = super::bubble_width_limit(
+                self.pane_width.borrow().as_ref().map(|width| width.get()),
+            );
+            if orientation == gtk::Orientation::Horizontal {
+                let (minimum, natural, min_baseline, nat_baseline) =
+                    child.measure(orientation, for_size);
+                (
+                    minimum,
+                    natural.min(target).max(minimum),
+                    min_baseline,
+                    nat_baseline,
+                )
+            } else {
+                // Height must be measured at the width the child will really
+                // get (the clamped one), or wrapped text is cut off.
+                let width = if for_size > 0 { self.child_width(&child, for_size, target) } else { for_size };
+                child.measure(orientation, width)
+            }
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            let Some(child) = self.child.borrow().as_ref().cloned() else {
+                return;
+            };
+            // Allocate the child at the clamped width (not the full row) and
+            // keep it at the start or end per its own alignment, so the
+            // visible bubble never exceeds the limit.
+            let target = super::bubble_width_limit(
+                self.pane_width.borrow().as_ref().map(|width| width.get()),
+            );
+            let child_width = self.child_width(&child, width, target);
+            let x = if child.halign() == gtk::Align::End { width - child_width } else { 0 };
+            let transform = (x > 0).then(|| {
+                gtk::gsk::Transform::new().translate(&gtk::graphene::Point::new(x as f32, 0.0))
+            });
+            child.allocate(child_width, height, baseline, transform);
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            if let Some(child) = self.child.borrow().as_ref() {
+                self.obj().snapshot_child(child, snapshot);
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct BubbleClamp(ObjectSubclass<bubble_clamp_imp::BubbleClamp>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl BubbleClamp {
+    fn new(child: &impl IsA<gtk::Widget>, pane_width: Rc<Cell<i32>>) -> Self {
+        let widget: Self = glib::Object::builder().build();
+        child.set_parent(&widget);
+        *widget.imp().child.borrow_mut() = Some(child.clone().upcast());
+        *widget.imp().pane_width.borrow_mut() = Some(pane_width);
+        widget
+    }
+}
+
+mod photo_clamp_imp {
+    use std::cell::RefCell;
+
+    use gtk::glib;
+    use gtk::prelude::*;
+    use gtk::subclass::prelude::*;
+    use gtk4 as gtk;
+
+    #[derive(Default)]
+    pub struct PhotoClamp {
+        pub child: RefCell<Option<gtk::Widget>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for PhotoClamp {
+        const NAME: &'static str = "OmgPhotoClamp";
+        type Type = super::PhotoClamp;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for PhotoClamp {
+        fn dispose(&self) {
+            if let Some(child) = self.child.borrow_mut().take() {
+                child.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for PhotoClamp {
+        fn request_mode(&self) -> gtk::SizeRequestMode {
+            self.child
+                .borrow()
+                .as_ref()
+                .map(gtk::prelude::WidgetExt::request_mode)
+                .unwrap_or(gtk::SizeRequestMode::ConstantSize)
+        }
+
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            let Some(child) = self.child.borrow().as_ref().cloned() else {
+                return (0, 0, -1, -1);
+            };
+            let (minimum, natural, min_baseline, nat_baseline) =
+                child.measure(orientation, for_size);
+            if orientation == gtk::Orientation::Horizontal {
+                (
+                    minimum,
+                    natural.min(320).max(minimum),
+                    min_baseline,
+                    nat_baseline,
+                )
+            } else {
+                (minimum, natural, min_baseline, nat_baseline)
+            }
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            if let Some(child) = self.child.borrow().as_ref() {
+                child.allocate(width, height, baseline, None);
+            }
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            if let Some(child) = self.child.borrow().as_ref() {
+                self.obj().snapshot_child(child, snapshot);
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct PhotoClamp(ObjectSubclass<photo_clamp_imp::PhotoClamp>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl PhotoClamp {
+    fn new(child: &impl IsA<gtk::Widget>) -> Self {
+        let widget: Self = glib::Object::builder().build();
+        child.set_parent(&widget);
+        *widget.imp().child.borrow_mut() = Some(child.clone().upcast());
+        widget
+    }
+}
+
+fn bubble_width_limit(parent_width: Option<i32>) -> i32 {
+    parent_width
+        .filter(|width| *width > 0)
+        .map(|width| ((f64::from(width) * 0.66).floor() as i32).min(520))
+        .unwrap_or(520)
+        .max(1)
+}
 
 #[derive(Clone)]
 pub enum MessageAction {
     Submit,
+    Mic,
     Attach,
+    DraftChanged,
+    DraftRetry,
+    Header(ChatAction),
     DropFile(gtk::gio::File),
     Reply(i32),
     Edit(i32),
@@ -28,6 +242,7 @@ pub enum MessageAction {
     CancelMode,
     CopyMessageId(i32),
     CopyUserId(i32),
+    JumpToMessage(i32),
     JumpToDate(DateTime<Local>),
     JumpToLatest,
     DraftReply(i32),
@@ -46,13 +261,15 @@ pub enum MediaState {
 
 #[derive(Clone)]
 struct MessageRow {
-    widget: gtk::Box,
+    widget: BubbleClamp,
     content: gtk::Box,
+    forwarded: gtk::Label,
     sender: gtk::Label,
     quote: gtk::Label,
     text: Rc<RefCell<Option<gtk::Label>>>,
     time: gtk::Label,
     deleted_tag: gtk::Label,
+    receipt: gtk::Label,
     reactions: gtk::Box,
     reaction_labels: Rc<RefCell<Vec<gtk::Label>>>,
     media_slot: gtk::Box,
@@ -87,28 +304,45 @@ struct EditMode {
 type MediaReady = Box<dyn FnOnce(PathBuf)>;
 
 struct MessagesInner {
+    header_avatar: Avatar,
     header_title: gtk::Label,
     online_dot: gtk::Box,
     typing: gtk::Label,
+    base_status: RefCell<String>,
+    header_summary: RefCell<Option<ChatSummary>>,
+    chat_kind: Cell<ChatKind>,
+    read_outbox: Cell<i32>,
     ghost: gtk::Label,
     clock: gtk::Label,
+    header_search: gtk::Button,
+    header_info: gtk::Button,
+    header_more: gtk::Button,
+    header_actions: gtk::Box,
     bottom_button: gtk::Button,
+    bottom_badge: gtk::Label,
+    bottom_unread: Cell<u32>,
     empty_effects: gtk::Overlay,
     date_chip: gtk::Label,
     scroll: gtk::ScrolledWindow,
     list: gtk::Box,
+    pane_width: Rc<Cell<i32>>,
+    probe_pane_width: Cell<Option<i32>>,
     loading: gtk::Label,
+    paging_spinner: gtk::Spinner,
     error: gtk::Label,
+    draft_retry: gtk::Button,
     reply_bar: gtk::Box,
     reply_label: gtk::Label,
     edit_bar: gtk::Box,
     edit_label: gtk::Label,
     composer: gtk::TextView,
+    composer_placeholder: gtk::Label,
     composer_cursor: gtk::Label,
     equalizer: gtk::Box,
     send: gtk::Button,
     send_label: gtk::Label,
     attach: gtk::Button,
+    emoji: gtk::Button,
     drop_target: gtk::DropTarget,
     store: RefCell<MessageStore>,
     action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
@@ -116,6 +350,7 @@ struct MessagesInner {
     edit_history: Cell<bool>,
     detached: Cell<bool>,
     busy: Cell<bool>,
+    composer_signal_blocked: Cell<bool>,
     paging: Cell<bool>,
     exhausted: Cell<bool>,
     suppress_paging: Cell<bool>,
@@ -137,10 +372,15 @@ struct MessagesInner {
     upper_tick: RefCell<Option<gtk::TickCallbackId>>,
     context_popover: RefCell<Option<gtk::Popover>>,
     history_popover: RefCell<Option<gtk::Popover>>,
+    header_popover: PopoverSlot,
+    composer_popover: PopoverSlot,
     initial_render_count: Cell<u64>,
     history_version_count: Cell<usize>,
     history_current_text: RefCell<Option<String>>,
     media_ready: RefCell<HashMap<i32, Vec<MediaReady>>>,
+    day_separators: RefCell<HashMap<chrono::NaiveDate, gtk::Label>>,
+    quote_cache: RefCell<HashMap<i32, (String, String)>>,
+    pending_messages: RefCell<HashSet<i32>>,
     effects: Rc<Effects>,
 }
 
@@ -165,21 +405,33 @@ impl MessagesView {
         widget.set_vexpand(true);
 
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        header.set_homogeneous(false);
         header.add_css_class("omg-chat-header");
+        let header_avatar = Avatar::new(36);
+        header.append(&header_avatar.widget);
+        let identity = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        identity.set_hexpand(true);
         let header_title = gtk::Label::new(Some("Select a chat"));
+        header_title.add_css_class("omg-chat-title");
         header_title.set_halign(gtk::Align::Start);
         header_title.set_hexpand(true);
-        header.append(&header_title);
+        header_title.set_width_chars(-1);
+        header_title.set_max_width_chars(-1);
+        header_title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        identity.append(&header_title);
+        let typing = gtk::Label::new(None);
+        typing.add_css_class("omg-header-status");
+        typing.set_halign(gtk::Align::Start);
+        typing.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        typing.set_visible(true);
+        identity.append(&typing);
+        header.append(&identity);
         let online_dot = gtk::Box::new(gtk::Orientation::Vertical, 0);
         online_dot.add_css_class("omg-online-dot");
         online_dot.set_size_request(6, 6);
         online_dot.set_valign(gtk::Align::Center);
         online_dot.set_visible(false);
         header.append(&online_dot);
-        let typing = gtk::Label::new(None);
-        typing.add_css_class("omg-typing");
-        typing.set_visible(false);
-        header.append(&typing);
 
         let ghost = gtk::Label::new(Some("ghost"));
         ghost.add_css_class("omg-ghost");
@@ -197,29 +449,46 @@ impl MessagesView {
         clock.set_attributes(Some(&clock_attrs));
         header.append(&clock);
 
-        let jump_button = gtk::Button::with_label("Jump…");
-        jump_button.add_css_class("omg-attach");
-        jump_button.set_valign(gtk::Align::Center);
-        header.append(&jump_button);
-        let jump_popover = gtk::Popover::new();
-        jump_popover.add_css_class("omg-menu");
-        jump_popover.set_has_arrow(false);
-        jump_popover.set_parent(&jump_button);
-        // Manually parented popover: unparent when closed so the widget tree doesn't keep it alive.
-        jump_popover.connect_closed(|popover| popover.unparent());
-        let calendar = gtk::Calendar::new();
-        jump_popover.set_child(Some(&calendar));
+        let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        header_actions.set_homogeneous(false);
+        header_actions.set_hexpand(false);
+        header_actions.set_visible(false);
+        let header_search = gtk::Button::with_label(icons::SEARCH);
+        header_search.add_css_class("omg-icon-button");
+        header_search.set_tooltip_text(Some("Search in chat"));
+        header_actions.append(&header_search);
+        let header_info = gtk::Button::with_label(icons::INFO);
+        header_info.add_css_class("omg-icon-button");
+        header_info.set_tooltip_text(Some("Chat info"));
+        header_actions.append(&header_info);
+        let header_more = gtk::Button::with_label(icons::MORE);
+        header_more.add_css_class("omg-icon-button");
+        header_more.set_tooltip_text(Some("More actions"));
+        header_actions.append(&header_more);
+        header.append(&header_actions);
 
         // Jump back to the latest page; always visible while detached.
-        let bottom_button = gtk::Button::with_label("▼");
-        bottom_button.add_css_class("omg-attach");
-        bottom_button.set_valign(gtk::Align::Center);
+        let bottom_button = gtk::Button::new();
+        bottom_button.add_css_class("omg-scroll-bottom");
+        bottom_button.add_css_class("omg-icon-button");
+        bottom_button.set_halign(gtk::Align::End);
+        bottom_button.set_valign(gtk::Align::End);
         bottom_button.set_visible(false);
-        header.append(&bottom_button);
+        let bottom_contents = gtk::Overlay::new();
+        bottom_contents.set_child(Some(&gtk::Label::new(Some(icons::DOWN))));
+        let bottom_badge = gtk::Label::new(None);
+        bottom_badge.add_css_class("omg-unread");
+        bottom_badge.set_halign(gtk::Align::End);
+        bottom_badge.set_valign(gtk::Align::Start);
+        bottom_badge.set_visible(false);
+        bottom_contents.add_overlay(&bottom_badge);
+        bottom_button.set_child(Some(&bottom_contents));
 
         widget.append(&header);
 
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        // Spacing comes from the rows themselves (4px same sender / 12px
+        // otherwise), so the list adds none.
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
         list.add_css_class("omg-messages");
         list.set_margin_start(16);
         list.set_margin_end(16);
@@ -231,6 +500,8 @@ impl MessagesView {
         scroll.set_child(Some(&list));
         scroll.set_hexpand(true);
         scroll.set_vexpand(true);
+
+        let pane_width = Rc::new(Cell::new(0));
 
         let middle = gtk::Overlay::new();
         let empty_effects = gtk::Overlay::new();
@@ -245,6 +516,12 @@ impl MessagesView {
         loading.set_halign(gtk::Align::Center);
         loading.set_valign(gtk::Align::Center);
         middle.add_overlay(&loading);
+        let paging_spinner = gtk::Spinner::new();
+        paging_spinner.set_halign(gtk::Align::Center);
+        paging_spinner.set_valign(gtk::Align::Start);
+        paging_spinner.set_margin_top(8);
+        paging_spinner.set_visible(false);
+        middle.add_overlay(&paging_spinner);
         let date_chip = gtk::Label::new(None);
         date_chip.add_css_class("omg-date-chip");
         date_chip.set_halign(gtk::Align::Center);
@@ -253,6 +530,7 @@ impl MessagesView {
         date_chip.set_can_target(false);
         date_chip.set_visible(false);
         middle.add_overlay(&date_chip);
+        middle.add_overlay(&bottom_button);
         widget.append(&middle);
 
         let error = gtk::Label::new(None);
@@ -263,6 +541,12 @@ impl MessagesView {
         error.set_wrap(true);
         error.set_visible(false);
         widget.append(&error);
+        let draft_retry = gtk::Button::with_label("Retry draft");
+        draft_retry.add_css_class("omg-primary");
+        draft_retry.set_halign(gtk::Align::Start);
+        draft_retry.set_margin_start(8);
+        draft_retry.set_visible(false);
+        widget.append(&draft_retry);
 
         let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         reply_bar.add_css_class("omg-reply-bar");
@@ -272,7 +556,7 @@ impl MessagesView {
         reply_label.set_hexpand(true);
         reply_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         reply_bar.append(&reply_label);
-        let reply_close = gtk::Button::with_label("x");
+        let reply_close = gtk::Button::with_label(icons::CLOSE);
         reply_close.add_css_class("omg-bar-close");
         reply_bar.append(&reply_close);
         widget.append(&reply_bar);
@@ -284,19 +568,25 @@ impl MessagesView {
         edit_label.set_halign(gtk::Align::Start);
         edit_label.set_hexpand(true);
         edit_bar.append(&edit_label);
-        let edit_close = gtk::Button::with_label("x");
+        let edit_close = gtk::Button::with_label(icons::CLOSE);
         edit_close.add_css_class("omg-bar-close");
         edit_bar.append(&edit_close);
         widget.append(&edit_bar);
 
         let composer_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         composer_box.add_css_class("omg-composer");
-        let attach = gtk::Button::with_label("+");
+        let attach = gtk::Button::with_label(icons::ATTACH);
         attach.add_css_class("omg-attach");
+        attach.set_tooltip_text(Some("Attach file"));
         attach.set_valign(gtk::Align::End);
         // Inert until a chat is open (reset_chat enables both).
         attach.set_sensitive(false);
         composer_box.append(&attach);
+        let emoji = gtk::Button::with_label(icons::EMOJI);
+        emoji.add_css_class("omg-attach");
+        emoji.set_tooltip_text(Some("Emoji"));
+        emoji.set_sensitive(false);
+        composer_box.append(&emoji);
 
         let composer = gtk::TextView::new();
         composer.set_sensitive(false);
@@ -310,12 +600,12 @@ impl MessagesView {
         let composer_scroll = gtk::ScrolledWindow::new();
         composer_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         composer_scroll.set_min_content_height(36);
-        composer_scroll.set_max_content_height(120);
+        composer_scroll.set_max_content_height(160);
         composer_scroll.set_propagate_natural_height(true);
         composer_scroll.set_hexpand(true);
         composer_scroll.set_child(Some(&composer));
 
-        let composer_cursor = gtk::Label::new(Some("▌"));
+        let composer_cursor = gtk::Label::new(Some(icons::COMPOSER_CURSOR));
         composer_cursor.add_css_class("omg-composer-cursor");
         composer_cursor.set_halign(gtk::Align::Start);
         composer_cursor.set_valign(gtk::Align::Start);
@@ -326,6 +616,12 @@ impl MessagesView {
         let composer_layer = gtk::Overlay::new();
         composer_layer.set_hexpand(true);
         composer_layer.set_child(Some(&composer_scroll));
+        let composer_placeholder = gtk::Label::new(Some("Message"));
+        composer_placeholder.add_css_class("omg-composer-placeholder");
+        composer_placeholder.set_halign(gtk::Align::Start);
+        composer_placeholder.set_valign(gtk::Align::Start);
+        composer_placeholder.set_can_target(false);
+        composer_layer.add_overlay(&composer_placeholder);
         composer_layer.add_overlay(&composer_cursor);
         composer_box.append(&composer_layer);
 
@@ -342,14 +638,15 @@ impl MessagesView {
         composer_box.append(&equalizer);
 
         let send = gtk::Button::new();
-        send.add_css_class("omg-primary");
+        send.add_css_class("omg-icon-button");
         send.set_valign(gtk::Align::End);
         send.set_sensitive(false);
         // The label is the measured child; the charge fill is an unmeasured
         // overlay. Expand flags on the fill would propagate up to the button
         // and make the composer compete with the message pane for space.
         let send_contents = gtk::Overlay::new();
-        let send_label = gtk::Label::new(Some("Send"));
+        let send_label = gtk::Label::new(Some(icons::MIC));
+        send.set_tooltip_text(Some("Voice message"));
         send_label.set_margin_start(8);
         send_label.set_margin_end(8);
         send_contents.set_child(Some(&send_label));
@@ -366,41 +663,13 @@ impl MessagesView {
         composer_box.add_controller(drop_target.clone());
 
         {
-            let popover = jump_popover.clone();
-            let button = jump_button.downgrade();
-            jump_button.connect_clicked(move |_| {
-                let Some(button) = button.upgrade() else {
-                    return;
-                };
-                // The popover unparents itself on close; re-parent before re-showing.
-                if popover.parent().is_none() {
-                    popover.set_parent(&button);
-                }
-                popover.popup();
-            });
-        }
-        {
-            let action = action.clone();
-            // Weak: the calendar is a child of the popover, a strong capture would cycle.
-            let popover = jump_popover.downgrade();
-            calendar.connect_day_selected(move |calendar| {
-                if let Some(popover) = popover.upgrade() {
-                    popover.popdown();
-                }
-                let Some(date) = calendar_day_end(calendar) else {
-                    return;
-                };
-                if let Some(callback) = action.borrow().as_ref().cloned() {
-                    callback(MessageAction::JumpToDate(date));
-                }
-            });
-        }
-        {
             let action = action.clone();
             let effects = effects.clone();
             let animated_button = bottom_button.clone();
+            let bottom_badge = bottom_badge.clone();
             bottom_button.connect_clicked(move |_| {
                 effects.scroll_to_bottom_pressed(animated_button.upcast_ref());
+                bottom_badge.set_visible(false);
                 if let Some(callback) = action.borrow().as_ref().cloned() {
                     callback(MessageAction::JumpToLatest);
                 }
@@ -408,28 +677,45 @@ impl MessagesView {
         }
 
         let inner = Rc::new(MessagesInner {
+            header_avatar,
             header_title,
             online_dot,
             typing,
+            base_status: RefCell::new(String::new()),
+            header_summary: RefCell::new(None),
+            chat_kind: Cell::new(ChatKind::User),
+            read_outbox: Cell::new(0),
             ghost,
             clock,
+            header_search,
+            header_info,
+            header_more,
+            header_actions,
             bottom_button,
+            bottom_badge,
+            bottom_unread: Cell::new(0),
             empty_effects,
             date_chip,
             scroll,
             list,
+            pane_width: pane_width.clone(),
+            probe_pane_width: Cell::new(None),
             loading,
+            paging_spinner,
             error,
+            draft_retry,
             reply_bar,
             reply_label,
             edit_bar,
             edit_label,
             composer,
+            composer_placeholder,
             composer_cursor,
             equalizer,
             send,
             send_label,
             attach,
+            emoji,
             drop_target,
             store: RefCell::new(MessageStore::default()),
             action,
@@ -437,6 +723,7 @@ impl MessagesView {
             edit_history: Cell::new(false),
             detached: Cell::new(false),
             busy: Cell::new(false),
+            composer_signal_blocked: Cell::new(false),
             paging: Cell::new(false),
             exhausted: Cell::new(false),
             suppress_paging: Cell::new(false),
@@ -458,13 +745,29 @@ impl MessagesView {
             upper_tick: RefCell::new(None),
             context_popover: RefCell::new(None),
             history_popover: RefCell::new(None),
+            header_popover: PopoverSlot::default(),
+            composer_popover: PopoverSlot::default(),
             initial_render_count: Cell::new(0),
             history_version_count: Cell::new(0),
             history_current_text: RefCell::new(None),
             media_ready: RefCell::new(HashMap::new()),
+            day_separators: RefCell::new(HashMap::new()),
+            quote_cache: RefCell::new(HashMap::new()),
+            pending_messages: RefCell::new(HashSet::new()),
             effects,
         });
         let view = Self { widget, inner };
+        {
+            let inner = Rc::downgrade(&view.inner);
+            view.widget.add_tick_callback(move |pane, _| {
+                let Some(inner) = inner.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                let width = inner.probe_pane_width.get().unwrap_or_else(|| pane.width());
+                apply_pane_width(&inner, width);
+                glib::ControlFlow::Continue
+            });
+        }
         view.connect_controls(reply_close, edit_close);
         view
     }
@@ -478,6 +781,20 @@ impl MessagesView {
                 }
             });
         }
+        {
+            let inner = self.inner.clone();
+            self.inner.emoji.connect_clicked(move |button| {
+                inner.composer_popover.dismiss();
+                let chooser = gtk::EmojiChooser::new();
+                let buffer = inner.composer.buffer();
+                chooser.connect_emoji_picked(move |_, emoji| {
+                    buffer.insert_at_cursor(emoji);
+                });
+                inner
+                    .composer_popover
+                    .show(button, chooser.upcast::<gtk::Popover>());
+            });
+        }
         for button in [reply_close, edit_close] {
             let action = self.inner.action.clone();
             button.connect_clicked(move |_| {
@@ -488,14 +805,55 @@ impl MessagesView {
         }
         {
             let action = self.inner.action.clone();
+            let composer = self.inner.composer.clone();
             self.inner.send.connect_clicked(move |_| {
                 if let Some(callback) = action.borrow().as_ref().cloned() {
-                    callback(MessageAction::Submit);
+                    let buffer = composer.buffer();
+                    let empty = buffer
+                        .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                        .is_empty();
+                    callback(if empty {
+                        MessageAction::Mic
+                    } else {
+                        MessageAction::Submit
+                    });
                 }
             });
         }
 
         {
+            let action = self.inner.action.clone();
+            self.inner.header_search.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::Header(ChatAction::Search));
+                }
+            });
+        }
+        {
+            let action = self.inner.action.clone();
+            self.inner.header_info.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::Header(ChatAction::Info));
+                }
+            });
+        }
+        {
+            let action = self.inner.action.clone();
+            self.inner.draft_retry.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::DraftRetry);
+                }
+            });
+        }
+        {
+            let inner = self.inner.clone();
+            self.inner.header_more.connect_clicked(move |button| {
+                MessagesView::show_header_menu(&inner, button);
+            });
+        }
+
+        {
+            let inner = self.inner.clone();
             let effects = self.inner.effects.clone();
             let cursor = self.inner.composer_cursor.clone();
             let equalizer = self.inner.equalizer.clone();
@@ -505,6 +863,25 @@ impl MessagesView {
                     .is_empty();
                 effects.composer_idle(cursor.upcast_ref(), empty);
                 effects.composer_typing(&equalizer, !empty);
+                inner.composer_placeholder.set_visible(empty);
+                inner
+                    .send_label
+                    .set_label(if empty { icons::MIC } else { icons::SEND });
+                inner
+                    .send
+                    .set_tooltip_text(Some(if empty { "Voice message" } else { "Send" }));
+                if empty {
+                    inner.send.remove_css_class("omg-primary");
+                    inner.send.add_css_class("omg-icon-button");
+                } else {
+                    inner.send.remove_css_class("omg-icon-button");
+                    inner.send.add_css_class("omg-primary");
+                }
+                if !inner.composer_signal_blocked.get() {
+                    if let Some(callback) = inner.action.borrow().as_ref().cloned() {
+                        callback(MessageAction::DraftChanged);
+                    }
+                }
             });
         }
 
@@ -559,6 +936,15 @@ impl MessagesView {
                 inner
                     .stick_to_bottom
                     .set(adjustment.value() >= adjustment.upper() - adjustment.page_size() - 4.0);
+                if inner.stick_to_bottom.get() {
+                    inner.bottom_unread.set(0);
+                    inner.bottom_badge.set_visible(false);
+                }
+                inner.bottom_button.set_visible(
+                    inner.detached.get()
+                        || adjustment.upper() - adjustment.page_size() - adjustment.value()
+                            > adjustment.page_size(),
+                );
                 update_date_chip_label(&inner, adjustment);
                 inner.effects.date_chip(inner.date_chip.upcast_ref(), true);
                 if let Some(source) = inner.date_timeout.borrow_mut().take() {
@@ -619,6 +1005,7 @@ impl MessagesView {
         while let Some(child) = self.inner.list.first_child() {
             self.inner.list.remove(&child);
         }
+        self.inner.day_separators.borrow_mut().clear();
     }
 
     fn after_upper_change<F>(&self, saved_upper: f64, callback: F)
@@ -736,6 +1123,7 @@ impl MessagesView {
         let composer_enabled = self.inner.virtual_mode.get() || !self.inner.busy.get();
         self.inner.composer.set_sensitive(composer_enabled);
         self.inner.attach.set_sensitive(composer_enabled);
+        self.inner.emoji.set_sensitive(composer_enabled);
         self.inner.send.set_sensitive(composer_enabled);
         self.cancel_pending_scroll();
         self.inner.scroll_epoch.set(epoch);
@@ -748,15 +1136,26 @@ impl MessagesView {
         self.clear_error();
         self.clear_typing();
         self.dismiss_row_popovers();
+        self.inner.header_popover.dismiss();
+        self.inner.composer_popover.dismiss();
         self.inner.media_ready.borrow_mut().clear();
+        self.inner.quote_cache.borrow_mut().clear();
+        self.inner.pending_messages.borrow_mut().clear();
+        self.inner.read_outbox.set(0);
         self.clear_rows();
         *self.inner.store.borrow_mut() = MessageStore {
             chat_id: Some(chat_id),
             ..MessageStore::default()
         };
         self.inner.header_title.set_label(title);
+        self.inner.header_actions.set_visible(true);
+        self.inner.header_summary.borrow_mut().take();
+        self.inner.base_status.borrow_mut().clear();
+        self.inner.typing.set_label("");
         self.inner.loading.set_label("Loading…");
         self.inner.loading.set_visible(true);
+        self.inner.paging_spinner.start();
+        self.inner.paging_spinner.set_visible(true);
         self.set_detached(false);
         self.inner.paging.set(false);
         self.inner.exhausted.set(false);
@@ -781,14 +1180,25 @@ impl MessagesView {
         self.clear_error();
         self.clear_typing();
         self.dismiss_row_popovers();
+        self.inner.header_popover.dismiss();
+        self.inner.composer_popover.dismiss();
         self.inner.media_ready.borrow_mut().clear();
+        self.inner.quote_cache.borrow_mut().clear();
+        self.inner.pending_messages.borrow_mut().clear();
+        self.inner.read_outbox.set(0);
         self.clear_rows();
         *self.inner.store.borrow_mut() = MessageStore::default();
         self.inner.header_title.set_label("Select a chat");
+        self.inner.header_actions.set_visible(false);
+        self.inner.header_summary.borrow_mut().take();
+        self.inner.base_status.borrow_mut().clear();
         self.inner.loading.set_label("Select a chat");
         self.inner.loading.set_visible(true);
+        self.inner.paging_spinner.stop();
+        self.inner.paging_spinner.set_visible(false);
         self.inner.composer.set_sensitive(false);
         self.inner.attach.set_sensitive(false);
+        self.inner.emoji.set_sensitive(false);
         self.inner.send.set_sensitive(false);
         self.set_detached(false);
         self.inner.paging.set(false);
@@ -810,7 +1220,10 @@ impl MessagesView {
         self.clear_error();
         self.clear_typing();
         self.dismiss_row_popovers();
+        self.inner.header_popover.dismiss();
         self.inner.media_ready.borrow_mut().clear();
+        self.inner.quote_cache.borrow_mut().clear();
+        self.inner.pending_messages.borrow_mut().clear();
         self.clear_rows();
         *self.inner.store.borrow_mut() = MessageStore {
             chat_id: Some(chat_id),
@@ -818,6 +1231,8 @@ impl MessagesView {
         };
         self.inner.loading.set_label("Loading…");
         self.inner.loading.set_visible(true);
+        self.inner.paging_spinner.start();
+        self.inner.paging_spinner.set_visible(true);
         self.inner.paging.set(false);
         self.inner.exhausted.set(false);
         self.inner.suppress_paging.set(true);
@@ -834,7 +1249,15 @@ impl MessagesView {
             .set(self.inner.initial_render_count.get().wrapping_add(1));
         let adjustment = self.inner.scroll.vadjustment();
         let inserted = self.merge(messages, false, false);
-        self.inner.loading.set_visible(false);
+        self.refresh_reply_bar();
+        self.inner.paging_spinner.stop();
+        self.inner.paging_spinner.set_visible(false);
+        if self.inner.store.borrow().order.is_empty() {
+            self.inner.loading.set_label("No messages yet");
+            self.inner.loading.set_visible(true);
+        } else {
+            self.inner.loading.set_visible(false);
+        }
         self.inner
             .effects
             .empty_state(&self.inner.empty_effects, false);
@@ -857,11 +1280,18 @@ impl MessagesView {
         if should_stick {
             self.inner.suppress_paging.set(true);
         }
-        let show_unread_divider = !message.outgoing
+        let incoming = !message.outgoing;
+        let show_unread_divider = incoming
             && !should_stick
             && self.inner.effects.on("unreaddivider")
             && !self.inner.unread_divider_shown.replace(true);
         let inserted = self.merge(vec![message], true, show_unread_divider);
+        if incoming && !should_stick && !inserted.is_empty() {
+            let unread = self.inner.bottom_unread.get().saturating_add(1);
+            self.inner.bottom_unread.set(unread);
+            self.inner.bottom_badge.set_label(&unread.to_string());
+            self.inner.bottom_badge.set_visible(true);
+        }
         if should_stick {
             let inner = self.inner.clone();
             self.after_upper_change(saved_upper, move |adjustment, changed| {
@@ -875,6 +1305,11 @@ impl MessagesView {
         inserted
     }
 
+    pub fn merge_pending(&self, message: Msg) -> Vec<i32> {
+        self.inner.pending_messages.borrow_mut().insert(message.id);
+        self.merge_event(message)
+    }
+
     pub fn begin_page(&self) -> Option<i32> {
         if self.inner.loading.is_visible()
             || self.inner.paging.get()
@@ -885,6 +1320,8 @@ impl MessagesView {
         }
         let oldest = self.inner.store.borrow().order.first().copied()?;
         self.inner.paging.set(true);
+        self.inner.paging_spinner.start();
+        self.inner.paging_spinner.set_visible(true);
         Some(oldest)
     }
 
@@ -895,6 +1332,8 @@ impl MessagesView {
         self.inner.suppress_paging.set(true);
         let inserted = self.merge(messages, false, false);
         self.inner.paging.set(false);
+        self.inner.paging_spinner.stop();
+        self.inner.paging_spinner.set_visible(false);
         if inserted.is_empty() {
             self.inner.exhausted.set(true);
             self.inner.suppress_paging.set(false);
@@ -913,11 +1352,15 @@ impl MessagesView {
 
     pub fn fail_page(&self, message: &str) {
         self.inner.paging.set(false);
+        self.inner.paging_spinner.stop();
+        self.inner.paging_spinner.set_visible(false);
         self.show_error(message);
     }
 
     pub fn fail_initial(&self, message: &str) {
         self.inner.loading.set_visible(false);
+        self.inner.paging_spinner.stop();
+        self.inner.paging_spinner.set_visible(false);
         self.inner.suppress_paging.set(false);
         self.show_error(message);
     }
@@ -966,7 +1409,11 @@ impl MessagesView {
     }
 
     fn build_row(&self, message: &Msg, is_live: bool, show_unread_divider: bool) -> MessageRow {
-        let widget = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let row_layout = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        // Same alignment as the clamp, so the bubble sits at the end even if
+        // a parent ever hands the clamp the full row width.
+        row_layout.set_halign(if message.outgoing { gtk::Align::End } else { gtk::Align::Start });
+        let widget = BubbleClamp::new(&row_layout, self.inner.pane_width.clone());
         widget.add_css_class("omg-msg");
         widget.set_hexpand(false);
         widget.set_halign(if message.outgoing {
@@ -987,7 +1434,7 @@ impl MessagesView {
             let line = gtk::Label::new(Some("unread"));
             line.add_css_class("omg-unread-divider");
             divider.set_child(Some(&line));
-            widget.append(&divider);
+            row_layout.append(&divider);
             self.inner
                 .effects
                 .unread_divider_added(divider.upcast_ref());
@@ -996,7 +1443,34 @@ impl MessagesView {
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
         content.add_css_class("omg-msg-content");
-        widget.append(&content);
+        row_layout.append(&content);
+
+        let forwarded = gtk::Label::new(
+            message
+                .forwarded_from
+                .as_ref()
+                .map(|name| format!("{} Forwarded from {name}", icons::FORWARD))
+                .as_deref(),
+        );
+        forwarded.add_css_class("omg-forwarded");
+        forwarded.set_halign(gtk::Align::Start);
+        forwarded.set_visible(message.forwarded_from.is_some());
+        content.append(&forwarded);
+
+        let show_sender = matches!(
+            self.inner.chat_kind.get(),
+            ChatKind::Group | ChatKind::Channel
+        ) && !message.outgoing
+            && !message.sender.is_empty()
+            && message.sender != "You";
+        let sender = gtk::Label::new(Some(&message.sender));
+        sender.add_css_class("omg-msg-sender");
+        sender.add_css_class(&format!("omg-c{}", sender_color_index(message)));
+        sender.set_halign(gtk::Align::Start);
+        sender.set_visible(show_sender);
+        sender.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        sender.set_max_width_chars(40);
+        content.append(&sender);
 
         let quote = gtk::Label::new(None);
         quote.add_css_class("omg-msg-quote");
@@ -1005,16 +1479,18 @@ impl MessagesView {
         quote.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         quote.set_max_width_chars(60);
         quote.set_visible(message.reply_to.is_some());
+        if let Some(reply_to) = message.reply_to {
+            quote.set_cursor_from_name(Some("pointer"));
+            let action = self.inner.action.clone();
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |_, _, _, _| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::JumpToMessage(reply_to));
+                }
+            });
+            quote.add_controller(click);
+        }
         content.append(&quote);
-
-        let sender = gtk::Label::new(Some(&message.sender));
-        sender.add_css_class("omg-msg-sender");
-        sender.set_halign(gtk::Align::Start);
-        sender.set_visible(!message.sender.is_empty());
-        // Remote-controlled string: never let it blow out the layout.
-        sender.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        sender.set_max_width_chars(40);
-        content.append(&sender);
 
         let media_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
         media_slot.set_halign(if message.outgoing {
@@ -1038,7 +1514,15 @@ impl MessagesView {
                     *media_loading_source.borrow_mut() = Some(source);
                 }
             }
-            Some(MediaKind::Document | MediaKind::Voice | MediaKind::Video | MediaKind::Gif | MediaKind::Audio | MediaKind::VideoNote | MediaKind::Unsupported) => {
+            Some(
+                MediaKind::Document
+                | MediaKind::Voice
+                | MediaKind::Video
+                | MediaKind::Gif
+                | MediaKind::Audio
+                | MediaKind::VideoNote
+                | MediaKind::Unsupported,
+            ) => {
                 let label = match message.media {
                     Some(MediaKind::Voice) => "voice message".to_string(),
                     _ => message
@@ -1097,14 +1581,22 @@ impl MessagesView {
         let meta = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         meta.set_halign(gtk::Align::End);
         meta.append(&time);
-        if message.outgoing && self.inner.effects.on("receiptdraw") {
-            let receipt = gtk::Label::new(Some("✓✓"));
-            receipt.add_css_class("omg-msg-time");
-            meta.append(&receipt);
-            if is_live {
-                if let Some(source) = self.inner.effects.receipt_drawn(receipt.upcast_ref()) {
-                    animation_sources.borrow_mut().push(source);
-                }
+        if let Some(views) = message.views {
+            let views = gtk::Label::new(Some(&format!("{} {views}", icons::EYE)));
+            views.add_css_class("omg-msg-time");
+            meta.append(&views);
+        }
+        let receipt = gtk::Label::new(Some(receipt_glyph(
+            self.inner.pending_messages.borrow().contains(&message.id),
+            message.id,
+            self.inner.read_outbox.get(),
+        )));
+        receipt.add_css_class("omg-msg-time");
+        receipt.set_visible(message.outgoing);
+        meta.append(&receipt);
+        if message.outgoing && is_live && self.inner.effects.on("receiptdraw") {
+            if let Some(source) = self.inner.effects.receipt_drawn(receipt.upcast_ref()) {
+                animation_sources.borrow_mut().push(source);
             }
         }
         meta.append(&deleted_tag);
@@ -1135,11 +1627,13 @@ impl MessagesView {
         let row = MessageRow {
             widget,
             content,
+            forwarded,
             sender,
             quote,
             text: Rc::new(RefCell::new(text)),
             time,
             deleted_tag,
+            receipt,
             reactions,
             reaction_labels,
             media_slot,
@@ -1171,8 +1665,28 @@ impl MessagesView {
             entry.msg = message.clone();
             (entry.row.clone(), was_edited, old_text)
         };
+        row.forwarded.set_label(
+            &message
+                .forwarded_from
+                .as_ref()
+                .map(|name| format!("{} Forwarded from {name}", icons::FORWARD))
+                .unwrap_or_default(),
+        );
+        row.forwarded.set_visible(message.forwarded_from.is_some());
         row.sender.set_label(&message.sender);
-        row.sender.set_visible(!message.sender.is_empty());
+        row.sender.set_visible(
+            matches!(
+                self.inner.chat_kind.get(),
+                ChatKind::Group | ChatKind::Channel
+            ) && !message.outgoing
+                && !message.sender.is_empty()
+                && message.sender != "You",
+        );
+        for index in 0..7 {
+            row.sender.remove_css_class(&format!("omg-c{index}"));
+        }
+        row.sender
+            .add_css_class(&format!("omg-c{}", sender_color_index(&message)));
         let mut text_label = row.text.borrow_mut();
         if let Some(label) = text_label.as_ref() {
             label.remove_css_class("omg-code-animation");
@@ -1193,6 +1707,14 @@ impl MessagesView {
         }
         drop(text_label);
         set_time_label(&row.time, &message, &self.inner.time_format.borrow());
+        row.receipt.set_visible(message.outgoing);
+        if message.outgoing {
+            row.receipt.set_label(receipt_glyph(
+                self.inner.pending_messages.borrow().contains(&message.id),
+                message.id,
+                self.inner.read_outbox.get(),
+            ));
+        }
         set_deleted_rendering(&row, message.deleted);
         update_reactions(&row, &message, &self.inner.effects, is_live);
         if message.edited && (!was_edited || old_text != message.text) {
@@ -1201,32 +1723,116 @@ impl MessagesView {
     }
 
     fn reorder_rows(&self) {
-        let rows: Vec<gtk::Box> = {
+        let rows: Vec<(Msg, BubbleClamp, gtk::Label)> = {
             let store = self.inner.store.borrow();
             store
                 .order
                 .iter()
-                .filter_map(|id| store.entries.get(id).map(|entry| entry.row.widget.clone()))
+                .filter_map(|id| {
+                    store.entries.get(id).map(|entry| {
+                        (
+                            entry.msg.clone(),
+                            entry.row.widget.clone(),
+                            entry.row.sender.clone(),
+                        )
+                    })
+                })
                 .collect()
         };
+        let used_dates: std::collections::HashSet<chrono::NaiveDate> = rows
+            .iter()
+            .map(|(message, _, _)| message.ts.date_naive())
+            .collect();
+        let unused = self
+            .inner
+            .day_separators
+            .borrow()
+            .iter()
+            .filter_map(|(date, label)| {
+                (!used_dates.contains(date)).then_some((*date, label.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (date, label) in unused {
+            if label.parent().is_some() {
+                self.inner.list.remove(&label);
+            }
+            self.inner.day_separators.borrow_mut().remove(&date);
+        }
         let mut previous: Option<gtk::Widget> = None;
-        for row in rows {
+        let mut previous_message: Option<Msg> = None;
+        for (message, row, sender) in rows {
+            let date = message.ts.date_naive();
+            let new_day = previous_message
+                .as_ref()
+                .is_none_or(|previous| previous.ts.date_naive() != date);
+            if new_day {
+                let separator = self
+                    .inner
+                    .day_separators
+                    .borrow_mut()
+                    .entry(date)
+                    .or_insert_with(|| {
+                        let label = gtk::Label::new(Some(&day_separator_label_at(
+                            date,
+                            Local::now().date_naive(),
+                        )));
+                        label.add_css_class("omg-date-separator");
+                        label.set_halign(gtk::Align::Center);
+                        label
+                    })
+                    .clone();
+                if separator.parent().is_none() {
+                    self.inner.list.append(&separator);
+                }
+                self.inner
+                    .list
+                    .reorder_child_after(&separator, previous.as_ref());
+                previous = Some(separator.upcast());
+            }
+            let same_sender = previous_message.as_ref().is_some_and(|previous| {
+                previous.ts.date_naive() == date
+                    && previous.outgoing == message.outgoing
+                    && sender_identity(previous) == sender_identity(&message)
+                    && message
+                        .ts
+                        .signed_duration_since(previous.ts)
+                        .num_minutes()
+                        .abs()
+                        <= 5
+            });
+            let can_show_sender = matches!(
+                self.inner.chat_kind.get(),
+                ChatKind::Group | ChatKind::Channel
+            ) && !message.outgoing
+                && message.sender != "You"
+                && !message.sender.is_empty();
+            sender.set_visible(can_show_sender && !same_sender);
+            row.set_margin_top(if previous_message.is_some() && same_sender {
+                4
+            } else if previous_message.is_some() {
+                12
+            } else {
+                0
+            });
             if row.parent().is_none() {
                 self.inner.list.append(&row);
             }
             self.inner.list.reorder_child_after(&row, previous.as_ref());
-            previous = Some(row.upcast());
+            previous = Some(row.clone().upcast());
+            previous_message = Some(message);
         }
     }
 
     fn refresh_quotes(&self) {
         let (quoted, rows) = {
             let store = self.inner.store.borrow();
-            let quoted: HashMap<i32, (String, String)> = store
-                .entries
-                .iter()
-                .map(|(&id, entry)| (id, (entry.msg.sender.clone(), entry.msg.text.clone())))
-                .collect();
+            let mut quoted = self.inner.quote_cache.borrow().clone();
+            quoted.extend(
+                store
+                    .entries
+                    .iter()
+                    .map(|(&id, entry)| (id, (entry.msg.sender.clone(), entry.msg.text.clone()))),
+            );
             let rows: Vec<(Option<i32>, gtk::Label)> = store
                 .entries
                 .values()
@@ -1251,7 +1857,56 @@ impl MessagesView {
         }
     }
 
+    pub fn missing_reply_ids(&self) -> Vec<i32> {
+        let store = self.inner.store.borrow();
+        let cache = self.inner.quote_cache.borrow();
+        let mut missing = store
+            .entries
+            .values()
+            .filter_map(|entry| entry.msg.reply_to)
+            .filter(|id| !store.entries.contains_key(id) && !cache.contains_key(id))
+            .collect::<Vec<_>>();
+        missing.sort_unstable();
+        missing.dedup();
+        missing
+    }
+
+    pub fn fill_quote_messages(&self, messages: Vec<Msg>) {
+        let mut cache = self.inner.quote_cache.borrow_mut();
+        for message in messages {
+            cache.insert(message.id, (message.sender, message.text));
+        }
+        drop(cache);
+        self.refresh_quotes();
+        self.refresh_reply_bar();
+    }
+
+    fn refresh_reply_bar(&self) {
+        let Some(reply_to) = self.inner.reply_to.get() else {
+            return;
+        };
+        let reply = self
+            .message(reply_to)
+            .map(|message| (message.sender, message.text))
+            .or_else(|| self.inner.quote_cache.borrow().get(&reply_to).cloned());
+        let Some((sender, text)) = reply else {
+            return;
+        };
+        let sender = if sender.is_empty() {
+            "Unknown"
+        } else {
+            &sender
+        };
+        self.inner
+            .reply_label
+            .set_label(&format!("Reply to {sender}: {}", snippet(&text, 60)));
+        self.inner.reply_bar.set_visible(true);
+    }
+
     fn show_context_menu(inner: &Rc<MessagesInner>, msg_id: i32, x: f64, y: f64) {
+        if inner.pending_messages.borrow().contains(&msg_id) {
+            return;
+        }
         let snapshot = inner
             .store
             .borrow()
@@ -1381,6 +2036,74 @@ impl MessagesView {
         popover.popup();
     }
 
+    fn show_header_menu(inner: &Rc<MessagesInner>, button: &gtk::Button) {
+        let Some(summary) = inner.header_summary.borrow().clone() else {
+            return;
+        };
+        let (popover, contents) = menus::popover();
+        let actions = [
+            ("Search", ChatAction::Search, false),
+            (
+                if summary.muted { "Unmute" } else { "Mute" },
+                ChatAction::Mute(if summary.muted {
+                    crate::tg::MuteMode::Unmute
+                } else {
+                    crate::tg::MuteMode::Forever
+                }),
+                false,
+            ),
+            (
+                if summary.pinned { "Unpin" } else { "Pin" },
+                ChatAction::Pin(!summary.pinned),
+                false,
+            ),
+            ("Mark as unread", ChatAction::MarkUnread(true), false),
+            ("Jump to date", ChatAction::JumpToDate, false),
+            ("Clear history", ChatAction::ClearHistory, true),
+            ("Delete chat", ChatAction::Delete, true),
+            ("Chat info", ChatAction::Info, false),
+        ];
+        for (label, action, danger) in actions {
+            let menu_button = menus::button(label, danger);
+            let inner_weak = Rc::downgrade(inner);
+            let popover_weak = popover.downgrade();
+            menu_button.connect_clicked(move |_| {
+                if let Some(popover) = popover_weak.upgrade() {
+                    popover.popdown();
+                }
+                let Some(inner) = inner_weak.upgrade() else {
+                    return;
+                };
+                if matches!(action, ChatAction::JumpToDate) {
+                    let calendar_popover = gtk::Popover::new();
+                    calendar_popover.add_css_class("omg-menu");
+                    calendar_popover.set_has_arrow(false);
+                    let calendar = gtk::Calendar::new();
+                    let action_callback = inner.action.clone();
+                    let popover_for_day = calendar_popover.downgrade();
+                    calendar.connect_day_selected(move |calendar| {
+                        if let Some(popover) = popover_for_day.upgrade() {
+                            popover.popdown();
+                        }
+                        if let Some(date) = calendar_day_end(calendar) {
+                            if let Some(callback) = action_callback.borrow().as_ref().cloned() {
+                                callback(MessageAction::JumpToDate(date));
+                            }
+                        }
+                    });
+                    calendar_popover.set_child(Some(&calendar));
+                    inner
+                        .header_popover
+                        .show(&inner.header_more, calendar_popover);
+                } else if let Some(callback) = inner.action.borrow().as_ref().cloned() {
+                    callback(MessageAction::Header(action));
+                }
+            });
+            contents.append(&menu_button);
+        }
+        inner.header_popover.show(button, popover);
+    }
+
     fn connect_menu_action(
         inner: &Rc<MessagesInner>,
         button: &gtk::Button,
@@ -1436,7 +2159,11 @@ impl MessagesView {
         *self.inner.edit.borrow_mut() = Some(EditMode { msg_id, draft });
         self.inner.ai_draft.set(false);
         self.inner.edit_label.set_label("Editing message");
-        self.set_composer_text(&message.text);
+        self.set_composer_text(if message.markdown.is_empty() {
+            &message.text
+        } else {
+            &message.markdown
+        });
         self.inner.edit_bar.set_visible(true);
         self.focus_composer();
     }
@@ -1520,7 +2247,59 @@ impl MessagesView {
     }
 
     pub fn set_composer_text(&self, text: &str) {
+        self.inner.composer_signal_blocked.set(true);
         self.inner.composer.buffer().set_text(text);
+        self.inner.composer_signal_blocked.set(false);
+    }
+
+    pub fn composer_cursor(&self) -> i32 {
+        self.inner.composer.buffer().cursor_position()
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.inner.edit.borrow().is_some()
+    }
+
+    pub fn draft_snapshot_for_switch(&self) -> (String, Option<i32>, i32) {
+        if self.is_editing() {
+            self.cancel_edit();
+        }
+        (
+            self.composer_text(),
+            self.reply_to(),
+            self.composer_cursor(),
+        )
+    }
+
+    pub fn restore_draft(&self, text: &str, reply_to: Option<i32>, cursor: i32) {
+        self.cancel_all_modes();
+        self.set_composer_text(text);
+        let buffer = self.inner.composer.buffer();
+        let mut iter = buffer.iter_at_offset(cursor.clamp(0, buffer.char_count()));
+        buffer.place_cursor(&iter);
+        if let Some(reply_to) = reply_to {
+            if self.message(reply_to).is_some() {
+                self.begin_reply(reply_to);
+            } else {
+                self.inner.reply_to.set(Some(reply_to));
+                self.inner.reply_label.set_label("Reply to message");
+                self.inner.reply_bar.set_visible(true);
+            }
+        }
+        // Keep the iter alive through place_cursor on older gtk-rs bindings.
+        let _ = &mut iter;
+    }
+
+    pub fn show_draft_error(&self, error: &str) {
+        self.show_error(&format!("draft not saved — retry: {error}"));
+        self.inner.draft_retry.set_visible(true);
+    }
+
+    pub fn clear_draft_error(&self) {
+        if self.inner.error.label().starts_with("draft not saved") {
+            self.clear_error();
+        }
+        self.inner.draft_retry.set_visible(false);
     }
 
     pub fn reply_to(&self) -> Option<i32> {
@@ -1536,6 +2315,7 @@ impl MessagesView {
         let sensitive = self.inner.virtual_mode.get() || !busy;
         self.inner.composer.set_sensitive(sensitive);
         self.inner.attach.set_sensitive(sensitive);
+        self.inner.emoji.set_sensitive(sensitive);
         self.inner.send.set_sensitive(sensitive);
         self.inner
             .drop_target
@@ -1562,6 +2342,7 @@ impl MessagesView {
     pub fn clear_error(&self) {
         self.inner.error.set_visible(false);
         self.inner.error.set_label("");
+        self.inner.draft_retry.set_visible(false);
     }
 
     pub fn message(&self, msg_id: i32) -> Option<Msg> {
@@ -1623,6 +2404,7 @@ impl MessagesView {
 
     pub fn remove(&self, msg_id: i32) -> Option<Msg> {
         self.dismiss_row_popovers();
+        self.inner.pending_messages.borrow_mut().remove(&msg_id);
         let entry = {
             let mut store = self.inner.store.borrow_mut();
             let entry = store.entries.remove(&msg_id)?;
@@ -1637,6 +2419,7 @@ impl MessagesView {
             remove_source_if_present(source);
         }
         self.inner.list.remove(&entry.row.widget);
+        self.reorder_rows();
         self.refresh_quotes();
         Some(entry.msg)
     }
@@ -1753,12 +2536,15 @@ impl MessagesView {
     }
 
     pub fn find_outgoing_text(&self, text: &str) -> Option<i32> {
+        let pending = self.inner.pending_messages.borrow();
         self.inner
             .store
             .borrow()
             .entries
             .values()
-            .find(|entry| entry.msg.outgoing && entry.msg.text == text)
+            .find(|entry| {
+                entry.msg.outgoing && entry.msg.text == text && !pending.contains(&entry.msg.id)
+            })
             .map(|entry| entry.msg.id)
     }
 
@@ -1848,19 +2634,20 @@ impl MessagesView {
         }
         let picture = gtk::Picture::for_paintable(texture);
         picture.set_can_shrink(true);
-        picture.set_hexpand(false);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
+        picture.set_content_fit(gtk::ContentFit::Contain);
         picture.set_halign(if outgoing {
             gtk::Align::End
         } else {
             gtk::Align::Start
         });
-        let width = texture.width().max(1);
-        let height = texture.height().max(1);
-        let scale = (320.0 / width as f64).min(320.0 / height as f64).min(1.0);
-        picture.set_size_request(
-            (width as f64 * scale).round() as i32,
-            (height as f64 * scale).round() as i32,
-        );
+        let picture = PhotoClamp::new(&picture);
+        picture.set_halign(if outgoing {
+            gtk::Align::End
+        } else {
+            gtk::Align::Start
+        });
         let action = self.inner.action.clone();
         let gesture = gtk::GestureClick::new();
         gesture.connect_released(move |_, _, _, _| {
@@ -1977,7 +2764,15 @@ impl MessagesView {
                 label.add_css_class("omg-media-placeholder");
                 media_slot.append(&label);
             }
-            Some(MediaKind::Document | MediaKind::Voice | MediaKind::Video | MediaKind::Gif | MediaKind::Audio | MediaKind::VideoNote | MediaKind::Unsupported) => {
+            Some(
+                MediaKind::Document
+                | MediaKind::Voice
+                | MediaKind::Video
+                | MediaKind::Gif
+                | MediaKind::Audio
+                | MediaKind::VideoNote
+                | MediaKind::Unsupported,
+            ) => {
                 if let (Some(button), Some(base)) = (button, base) {
                     button.set_label(&format!("{base} (unavailable)"));
                     button.set_sensitive(retryable);
@@ -2001,6 +2796,7 @@ impl MessagesView {
         };
         self.inner.typing.set_label(&label);
         self.inner.typing.set_visible(true);
+        self.inner.typing.add_css_class("omg-typing");
         *self.inner.typing_animation.borrow_mut() =
             self.inner.effects.typing_frame(&self.inner.typing, name);
         generation
@@ -2012,7 +2808,11 @@ impl MessagesView {
                 remove_source_if_present(source);
             }
             self.inner.typing.set_visible(false);
-            self.inner.typing.set_label("");
+            self.inner.typing.remove_css_class("omg-typing");
+            self.inner
+                .typing
+                .set_label(&self.inner.base_status.borrow());
+            self.inner.typing.set_visible(true);
         }
     }
 
@@ -2023,8 +2823,11 @@ impl MessagesView {
         self.inner
             .typing_generation
             .set(self.inner.typing_generation.get().wrapping_add(1));
-        self.inner.typing.set_visible(false);
-        self.inner.typing.set_label("");
+        self.inner.typing.remove_css_class("omg-typing");
+        self.inner
+            .typing
+            .set_label(&self.inner.base_status.borrow());
+        self.inner.typing.set_visible(true);
     }
 
     pub fn typing_generation(&self) -> u64 {
@@ -2099,11 +2902,169 @@ impl MessagesView {
     pub fn set_status(&self, text: Option<&str>) {
         match text {
             Some(text) => {
+                *self.inner.base_status.borrow_mut() = text.to_string();
                 self.inner.typing.set_label(text);
                 self.inner.typing.set_visible(true);
             }
-            None => self.clear_typing(),
+            None => {
+                self.inner.base_status.borrow_mut().clear();
+                self.clear_typing();
+            }
         }
+    }
+
+    pub fn set_chat_summary(&self, summary: &ChatSummary, tg: &Tg) {
+        self.inner.header_title.set_label(&summary.title);
+        self.inner
+            .header_avatar
+            .bind(tg, summary.id, &summary.title, summary.has_photo);
+        self.inner.chat_kind.set(summary.kind);
+        self.inner
+            .read_outbox
+            .set(self.inner.read_outbox.get().max(summary.read_outbox_max_id));
+        *self.inner.header_summary.borrow_mut() = Some(summary.clone());
+        let status = match summary.kind {
+            ChatKind::User => presence_text(summary.presence, Local::now()),
+            ChatKind::Bot => "bot".to_string(),
+            ChatKind::Group | ChatKind::Channel => String::new(),
+            ChatKind::Saved => "saved messages".to_string(),
+        };
+        self.set_base_status(&status, summary.presence == Presence::Online);
+    }
+
+    pub fn set_chat_info(&self, info: &ChatInfo) {
+        let status = match info.kind {
+            ChatKind::Group => info
+                .members
+                .map(|count| format!("{count} members"))
+                .unwrap_or_default(),
+            ChatKind::Channel => info
+                .members
+                .map(|count| format!("{count} subscribers"))
+                .unwrap_or_default(),
+            ChatKind::User => presence_text(info.presence, Local::now()),
+            ChatKind::Bot => "bot".to_string(),
+            ChatKind::Saved => "saved messages".to_string(),
+        };
+        self.set_base_status(&status, info.presence == Presence::Online);
+    }
+
+    pub fn set_virtual_header(&self, chat_id: i64, tg: &Tg) {
+        let (title, initials_name) = if chat_id == super::virtual_chat::ASSISTANT_CHAT {
+            ("Assistant", "AI")
+        } else {
+            ("Omarchy", "OM")
+        };
+        self.inner.header_title.set_label(title);
+        self.inner
+            .header_avatar
+            .bind(tg, chat_id, initials_name, false);
+        self.inner.chat_kind.set(ChatKind::Bot);
+        self.inner.header_summary.borrow_mut().take();
+        self.set_base_status("local", false);
+    }
+
+    pub fn set_presence(&self, presence: Presence) {
+        let status = presence_text(presence, Local::now());
+        self.set_base_status(&status, presence == Presence::Online);
+        if let Some(summary) = self.inner.header_summary.borrow_mut().as_mut() {
+            summary.presence = presence;
+        }
+    }
+
+    fn set_base_status(&self, status: &str, online: bool) {
+        *self.inner.base_status.borrow_mut() = status.to_string();
+        if !self.inner.typing.has_css_class("omg-typing") {
+            self.inner.typing.set_label(status);
+            self.inner.typing.set_visible(true);
+        }
+        self.inner.online_dot.set_visible(online);
+        if online {
+            self.inner.typing.add_css_class("omg-online");
+        } else {
+            self.inner.typing.remove_css_class("omg-online");
+        }
+    }
+
+    pub fn set_read_outbox(&self, max_id: i32) {
+        let max_id = self.inner.read_outbox.get().max(max_id);
+        self.inner.read_outbox.set(max_id);
+        let rows = {
+            let store = self.inner.store.borrow();
+            store
+                .entries
+                .values()
+                .map(|entry| {
+                    (
+                        entry.msg.id,
+                        entry.msg.outgoing,
+                        self.inner.pending_messages.borrow().contains(&entry.msg.id),
+                        entry.row.receipt.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (id, outgoing, pending, receipt) in rows {
+            receipt.set_visible(outgoing);
+            if outgoing {
+                receipt.set_label(receipt_glyph(pending, id, max_id));
+            }
+        }
+    }
+
+    pub fn header_menu_open(&self) -> bool {
+        self.inner.header_popover.is_open()
+    }
+
+    pub fn open_header_menu(&self) {
+        Self::show_header_menu(&self.inner, &self.inner.header_more);
+    }
+
+    pub fn dismiss_header_menu(&self) {
+        self.inner.header_popover.dismiss();
+    }
+
+    pub fn dismiss_owned_popovers(&self) {
+        self.dismiss_row_popovers();
+        self.inner.header_popover.dismiss();
+        self.inner.composer_popover.dismiss();
+    }
+
+    pub fn has_sender_name(&self) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .values()
+            .any(|entry| entry.row.sender.is_visible())
+    }
+
+    pub fn header_title(&self) -> String {
+        self.inner.header_title.label().to_string()
+    }
+
+    pub fn header_avatar_key(&self) -> i64 {
+        self.inner.header_avatar.key()
+    }
+
+    pub fn bubble_metrics(&self) -> (i32, i32) {
+        let max_bubble = self
+            .inner
+            .store
+            .borrow()
+            .entries
+            .values()
+            // The clamp fills the row; its child is the visible bubble.
+            .map(|entry| entry.row.widget.first_child().map(|c| c.width()).unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        (max_bubble, self.inner.scroll.width())
+    }
+
+    pub fn set_probe_pane_width(&self, width: Option<i32>) {
+        self.inner.probe_pane_width.set(width);
+        let width = width.unwrap_or_else(|| self.widget.width());
+        apply_pane_width(&self.inner, width);
     }
 
     pub fn animate_chat_switched(&self) {
@@ -2393,19 +3354,23 @@ impl MessagesView {
     }
 
     pub fn rendered_row_count(&self) -> usize {
-        let mut count = 0;
-        let mut child = self.inner.list.first_child();
-        while let Some(row) = child {
-            count += 1;
-            child = row.next_sibling();
-        }
-        count
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .values()
+            .filter(|entry| entry.row.widget.parent().is_some())
+            .count()
     }
 
     /// Detached = viewing a jumped-to historical page; the ▼ button stays
     /// visible and reloads the latest page.
     pub fn set_detached(&self, detached: bool) {
         self.inner.detached.set(detached);
+        if !detached {
+            self.inner.bottom_unread.set(0);
+            self.inner.bottom_badge.set_visible(false);
+        }
         self.inner.bottom_button.set_visible(detached);
     }
 
@@ -2418,6 +3383,27 @@ impl MessagesView {
         self.inner.bottom_button.emit_clicked();
     }
 
+    pub fn scroll_to_message(&self, msg_id: i32) -> bool {
+        let row = self
+            .inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .map(|entry| entry.row.widget.clone());
+        let Some(row) = row else { return false };
+        let Some(bounds) = row.compute_bounds(&self.inner.list) else {
+            return false;
+        };
+        let adjustment = self.inner.scroll.vadjustment();
+        adjustment.set_value(
+            (f64::from(bounds.y()) - adjustment.page_size() / 3.0)
+                .clamp(0.0, (adjustment.upper() - adjustment.page_size()).max(0.0)),
+        );
+        row.grab_focus();
+        true
+    }
+
     /// Time label text of the newest message in the store (probe helper).
     pub fn last_time_label(&self) -> Option<String> {
         let store = self.inner.store.borrow();
@@ -2426,6 +3412,14 @@ impl MessagesView {
             .last()
             .and_then(|id| store.entries.get(id))
             .map(|entry| entry.row.time.label().to_string())
+    }
+}
+
+fn apply_pane_width(inner: &MessagesInner, width: i32) {
+    if width > 0 && inner.pane_width.replace(width) != width {
+        for entry in inner.store.borrow().entries.values() {
+            entry.row.widget.queue_resize();
+        }
     }
 }
 
@@ -2491,6 +3485,53 @@ fn valid_time_format(format: &str) -> bool {
     };
     let mut rendered = String::new();
     write!(rendered, "{}", fixed.format(format)).is_ok()
+}
+
+fn presence_text(presence: Presence, now: DateTime<Local>) -> String {
+    match presence {
+        Presence::Online => "Online".to_string(),
+        Presence::LastSeen(time) if time.date_naive() == now.date_naive() => {
+            format!("last seen at {}", time.format("%H:%M"))
+        }
+        Presence::LastSeen(time) => format!("last seen {}", time.format("%d.%m.%y")),
+        Presence::Recently => "last seen recently".to_string(),
+        Presence::LastWeek => "last seen within a week".to_string(),
+        Presence::LastMonth => "last seen within a month".to_string(),
+        Presence::LongAgo => "last seen a long time ago".to_string(),
+        Presence::Unknown => String::new(),
+    }
+}
+
+fn sender_identity(message: &Msg) -> String {
+    message
+        .sender_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| message.sender.clone())
+}
+
+fn sender_color_index(message: &Msg) -> usize {
+    if let Some(sender_id) = message.sender_id {
+        return sender_id.rem_euclid(7) as usize;
+    }
+    let hash = message
+        .sender
+        .bytes()
+        .fold(1_469_598_103_934_665_603_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(1_099_511_628_211)
+        });
+    (hash % 7) as usize
+}
+
+pub fn day_separator_label_at(date: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
+    if date == today {
+        "Today".to_string()
+    } else if date == today - chrono::Duration::days(1) {
+        "Yesterday".to_string()
+    } else if date.year() == today.year() {
+        date.format("%B %-d").to_string()
+    } else {
+        date.format("%-d %B %Y").to_string()
+    }
 }
 
 /// 23:59:59 local on the calendar's selected day.
@@ -2568,6 +3609,16 @@ fn set_deleted_rendering(row: &MessageRow, deleted: bool) {
     row.deleted_tag.set_visible(deleted);
 }
 
+fn receipt_glyph(pending: bool, id: i32, read_outbox: i32) -> &'static str {
+    if pending {
+        icons::CLOCK
+    } else if id <= read_outbox {
+        icons::CHECK_DOUBLE
+    } else {
+        icons::CHECK
+    }
+}
+
 fn history_row(time: &str, text: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
     row.add_css_class("omg-history-row");
@@ -2596,4 +3647,36 @@ fn snippet(text: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+#[cfg(test)]
+mod wave5_tests {
+    use chrono::NaiveDate;
+
+    use super::{bubble_width_limit, day_separator_label_at};
+
+    #[test]
+    fn day_separator_labels_cover_relative_and_absolute_dates() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
+        assert_eq!(day_separator_label_at(today, today), "Today");
+        assert_eq!(
+            day_separator_label_at(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), today),
+            "Yesterday"
+        );
+        assert_eq!(
+            day_separator_label_at(NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(), today),
+            "August 20"
+        );
+        assert_eq!(
+            day_separator_label_at(NaiveDate::from_ymd_opt(2025, 9, 1).unwrap(), today),
+            "1 September 2025"
+        );
+    }
+
+    #[test]
+    fn bubble_width_is_capped_by_pane_fraction_and_pixels() {
+        assert_eq!(bubble_width_limit(Some(600)), 396);
+        assert_eq!(bubble_width_limit(Some(1200)), 520);
+        assert_eq!(bubble_width_limit(None), 520);
+    }
 }
