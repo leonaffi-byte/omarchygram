@@ -105,7 +105,6 @@ window.omg-window {
 .omg-msg {
   padding: 6px 10px;
   border-radius: 4px;
-  margin: 2px 0;
 }
 
 .omg-msg-in {
@@ -907,3 +906,215 @@ scrollbar slider:hover {
 .omg-avatar-c4 { background-color: var(--magenta); color: var(--bg-darker); }
 .omg-avatar-c5 { background-color: var(--yellow); color: var(--bg-darker); }
 .omg-avatar-c6 { background-color: var(--orange); color: var(--bg-darker); }
+
+/* ---- wave 5A: Telegram layout and chrome ---- */
+
+.omg-handle > separator {
+  background-color: var(--bg-lighter);
+  min-width: 1px;
+}
+
+.omg-sidebar-top {
+  min-height: 48px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--bg-lighter);
+}
+
+.omg-sidebar-top entry {
+  background-color: var(--bg-darker);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 6px;
+  padding: 6px 10px;
+  caret-color: var(--accent);
+}
+
+button.omg-icon-button {
+  background-image: none;
+  background-color: transparent;
+  color: var(--muted);
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+button.omg-icon-button:hover,
+button.omg-icon-button:focus-visible {
+  background-color: var(--bg-lighter);
+  color: var(--fg);
+}
+
+.omg-folder-tabs {
+  padding: 0 4px;
+  border-bottom: 1px solid var(--bg-lighter);
+}
+
+button.omg-folder-tab {
+  background-image: none;
+  background-color: transparent;
+  color: var(--muted);
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 6px 8px 4px 8px;
+}
+
+button.omg-folder-tab.omg-active {
+  color: var(--fg);
+  border-bottom-color: var(--accent);
+}
+
+.omg-folder-unread,
+.omg-mention {
+  background-color: var(--accent);
+  color: var(--bg-darker);
+  border-radius: 6px;
+  padding: 0 4px;
+  font-size: 9pt;
+  font-weight: bold;
+}
+
+.omg-chat-row {
+  min-height: 64px;
+  padding: 8px 10px;
+  border-left: none;
+  border-bottom: none;
+}
+
+.omg-chat-row:selected {
+  background-color: var(--selection);
+  border-left: none;
+}
+
+.omg-chat-row.omg-virtual {
+  border-left: none;
+}
+
+.omg-chat-title {
+  font-weight: bold;
+}
+
+.omg-muted,
+.omg-small {
+  color: var(--muted);
+  font-size: 9.5pt;
+}
+
+.omg-title {
+  color: var(--fg);
+  font-size: 12pt;
+  font-weight: bold;
+}
+
+.omg-draft {
+  color: var(--red);
+}
+
+.omg-muted-unread {
+  background-color: var(--muted);
+}
+
+.omg-unread-dot {
+  background-color: var(--accent);
+  border: 2px solid var(--bg-dark);
+  border-radius: 6px;
+  min-width: 8px;
+  min-height: 8px;
+}
+
+.omg-avatar {
+  border-radius: 6px;
+}
+
+.omg-avatar picture,
+.omg-avatar-initials {
+  border-radius: 6px;
+}
+
+.omg-avatar-initials {
+  font-weight: bold;
+}
+
+button.omg-archived-row,
+button.omg-search-row {
+  background-image: none;
+  background-color: transparent;
+  color: var(--fg);
+  border: none;
+  border-radius: 0;
+  padding: 8px 12px;
+}
+
+button.omg-archived-row {
+  border-top: 1px solid var(--bg-lighter);
+}
+
+button.omg-archived-row:hover,
+button.omg-search-row:hover {
+  background-color: var(--bg-lighter);
+}
+
+.omg-search-results {
+  padding: 8px;
+}
+
+.omg-list-state {
+  padding: 8px 12px;
+}
+
+.omg-chat-header {
+  min-height: 56px;
+  padding: 4px 12px;
+}
+
+.omg-header-status {
+  color: var(--muted);
+  font-size: 9.5pt;
+}
+
+.omg-header-status.omg-online {
+  color: var(--accent);
+}
+
+.omg-msg {
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+.omg-msg picture,
+.omg-media-placeholder,
+.omg-doc-pill,
+.omg-date-separator,
+popover.omg-menu > contents,
+popover.omg-history > contents,
+button.omg-menu-item,
+button.omg-attach,
+button.omg-bar-close,
+button.omg-primary,
+.omg-composer textview {
+  border-radius: 6px;
+}
+
+.omg-date-separator {
+  background-color: var(--bg-lighter);
+  color: var(--muted);
+  padding: 2px 8px;
+  margin: 8px 0;
+}
+
+.omg-forwarded {
+  color: var(--muted);
+  font-size: 9.5pt;
+}
+
+.omg-scroll-bottom {
+  min-width: 36px;
+  min-height: 36px;
+  margin: 16px;
+  border-radius: 6px;
+}
+
+.omg-composer-placeholder {
+  color: var(--muted);
+  padding: 8px 12px;
+}

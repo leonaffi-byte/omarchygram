@@ -17,12 +17,17 @@ use crate::ai::{ChatMessage, Prefs, Role};
 use crate::local::Local as LocalServices;
 use crate::os::{self, OsPolicy, Parsed};
 use crate::settings::{Settings, SettingsStore};
-use crate::tg::{AuthState, BackendFlags, Event, MediaKind, Msg, Tg};
+use crate::tg::{
+    AuthState, BackendFlags, ChatInfo, ChatKind, Event, Me, MediaKind, Msg, Tg,
+};
+use crate::uistate::UiState;
 
 use super::anim::{Effects, RadioGroup, apply_full_phosphor, group_ids, select_radio};
 use super::auth::{AuthAction, AuthView};
-use super::chatlist::{ChatList, UnreadUpdate};
+use super::avatar::Avatar;
+use super::chatlist::{ChatList, SearchRetry, SidebarMode, UnreadUpdate};
 use super::keys;
+use super::menus::{self, ChatAction, MainMenuAction, PopoverSlot};
 use super::messages::{MediaState, MessageAction, MessagesView};
 use super::settings_view::SettingsView;
 use super::switcher::Switcher;
@@ -79,6 +84,22 @@ struct FlagsRequest {
     session_epoch: u64,
 }
 
+#[derive(Clone, Default)]
+struct DraftSnapshot {
+    text: String,
+    reply_to: Option<i32>,
+    cursor: i32,
+    revision: u64,
+}
+
+#[derive(Default)]
+struct DraftState {
+    current: DraftSnapshot,
+    in_flight: bool,
+    queued: Option<DraftSnapshot>,
+    dirty: bool,
+}
+
 struct PendingShellTicket {
     ticket: Option<os::ShellTicket>,
 }
@@ -119,6 +140,7 @@ struct ShellInner {
     auth: AuthView,
     chatlist: ChatList,
     messages: MessagesView,
+    paned: gtk::Paned,
     effects: Rc<Effects>,
     overlay: gtk::Overlay,
     switcher: Switcher,
@@ -129,17 +151,22 @@ struct ShellInner {
     theme_switch_timeout: RefCell<Option<glib::SourceId>>,
     dialogs_error_box: gtk::Box,
     dialogs_error: gtk::Label,
+    dialogs_retry: gtk::Button,
     epoch: Cell<u64>,
     open_chat: Cell<Option<i64>>,
     session_ready: Cell<bool>,
     session_epoch: Cell<u64>,
     event_loop_started: Cell<bool>,
+    started: Cell<bool>,
     dialogs_loaded: Cell<bool>,
     dialogs_in_flight: Cell<bool>,
     dialogs_refresh_again: Cell<bool>,
+    dialogs_revision: Cell<u64>,
+    dialogs_reload_timeout: RefCell<Option<glib::SourceId>>,
     window_hooked: Cell<bool>,
     composer_operation: Cell<bool>,
     mutations_in_flight: Cell<u32>,
+    pending_message_id: Cell<i32>,
     mark_reads: RefCell<HashMap<i64, ReadState>>,
     last_by_chat: RefCell<HashMap<i64, Msg>>,
     settings_gen: Cell<u64>,
@@ -156,6 +183,25 @@ struct ShellInner {
     flags_in_flight: Cell<bool>,
     flags_pending: RefCell<Option<FlagsRequest>>,
     typing_timeout: RefCell<Option<glib::SourceId>>,
+    search_timeout: RefCell<Option<glib::SourceId>>,
+    ui_state: RefCell<UiState>,
+    ui_save_timeout: RefCell<Option<glib::SourceId>>,
+    layout_tick: RefCell<Option<gtk::TickCallbackId>>,
+    probe_window_width: Cell<Option<i32>>,
+    applying_sidebar_layout: Cell<bool>,
+    effective_sidebar_collapsed: Cell<bool>,
+    main_menu: PopoverSlot,
+    me: RefCell<Option<Me>>,
+    me_loading: Cell<bool>,
+    chat_info: RefCell<HashMap<i64, ChatInfo>>,
+    drafts: RefCell<HashMap<i64, DraftState>>,
+    draft_timeouts: RefCell<HashMap<i64, glib::SourceId>>,
+    pending_mutes: RefCell<HashMap<i64, bool>>,
+    manual_unread_hold: RefCell<HashSet<i64>>,
+    read_outbox: RefCell<HashMap<i64, i32>>,
+    quote_requests: RefCell<HashSet<(i64, u64, i32)>>,
+    probe_restored_ui_state: Option<(i32, bool, i32)>,
+    smoke_hook_done: Cell<bool>,
     probe_started: Cell<bool>,
     auth_probe_started: Cell<bool>,
     probe_answer: Cell<Option<usize>>,
@@ -166,7 +212,7 @@ impl Shell {
         let auth = AuthView::new();
         let settings = SettingsStore::new();
         let effects = Effects::new(settings.clone());
-        let chatlist = ChatList::new(effects.clone());
+        let chatlist = ChatList::new(effects.clone(), tg.clone());
         let messages = MessagesView::new(effects.clone());
         let switcher = Switcher::new();
         let last_applied_settings = settings.get();
@@ -190,12 +236,22 @@ impl Shell {
         dialogs_error_box.append(&dialogs_retry);
         main.append(&dialogs_error_box);
 
-        let panes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        panes.set_hexpand(true);
-        panes.set_vexpand(true);
-        panes.append(&chatlist.widget);
-        panes.append(&messages.widget);
-        main.append(&panes);
+        let (ui_state, probe_restored_ui_state) = load_shell_ui_state(probe);
+        let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+        paned.add_css_class("omg-handle");
+        paned.set_hexpand(true);
+        paned.set_vexpand(true);
+        paned.set_start_child(Some(&chatlist.widget));
+        paned.set_end_child(Some(&messages.widget));
+        paned.set_resize_start_child(false);
+        paned.set_shrink_start_child(ui_state.sidebar_collapsed);
+        paned.set_position(if ui_state.sidebar_collapsed {
+            64
+        } else {
+            ui_state.sidebar_width
+        });
+        chatlist.set_collapsed(ui_state.sidebar_collapsed);
+        main.append(&paned);
 
         let stack = gtk::Stack::new();
         stack.set_transition_type(gtk::StackTransitionType::None);
@@ -233,6 +289,7 @@ impl Shell {
             auth,
             chatlist,
             messages,
+            paned,
             effects,
             overlay,
             switcher,
@@ -243,17 +300,22 @@ impl Shell {
             theme_switch_timeout: RefCell::new(None),
             dialogs_error_box,
             dialogs_error,
+            dialogs_retry: dialogs_retry.clone(),
             epoch: Cell::new(0),
             open_chat: Cell::new(None),
             session_ready: Cell::new(false),
             session_epoch: Cell::new(0),
             event_loop_started: Cell::new(false),
+            started: Cell::new(false),
             dialogs_loaded: Cell::new(false),
             dialogs_in_flight: Cell::new(false),
             dialogs_refresh_again: Cell::new(false),
+            dialogs_revision: Cell::new(0),
+            dialogs_reload_timeout: RefCell::new(None),
             window_hooked: Cell::new(false),
             composer_operation: Cell::new(false),
             mutations_in_flight: Cell::new(0),
+            pending_message_id: Cell::new(i32::MAX),
             mark_reads: RefCell::new(HashMap::new()),
             last_by_chat: RefCell::new(HashMap::new()),
             settings_gen: Cell::new(0),
@@ -270,6 +332,25 @@ impl Shell {
             flags_in_flight: Cell::new(false),
             flags_pending: RefCell::new(None),
             typing_timeout: RefCell::new(None),
+            search_timeout: RefCell::new(None),
+            ui_state: RefCell::new(ui_state),
+            ui_save_timeout: RefCell::new(None),
+            layout_tick: RefCell::new(None),
+            probe_window_width: Cell::new(None),
+            applying_sidebar_layout: Cell::new(false),
+            effective_sidebar_collapsed: Cell::new(false),
+            main_menu: PopoverSlot::default(),
+            me: RefCell::new(None),
+            me_loading: Cell::new(false),
+            chat_info: RefCell::new(HashMap::new()),
+            drafts: RefCell::new(HashMap::new()),
+            draft_timeouts: RefCell::new(HashMap::new()),
+            pending_mutes: RefCell::new(HashMap::new()),
+            manual_unread_hold: RefCell::new(HashSet::new()),
+            read_outbox: RefCell::new(HashMap::new()),
+            quote_requests: RefCell::new(HashSet::new()),
+            probe_restored_ui_state,
+            smoke_hook_done: Cell::new(false),
             probe_started: Cell::new(false),
             auth_probe_started: Cell::new(false),
             probe_answer: Cell::new(None),
@@ -280,6 +361,22 @@ impl Shell {
 
     pub async fn start(&self) {
         self.inner.clone().start_backend().await;
+    }
+
+    pub fn toggle_sidebar(&self) {
+        self.inner.toggle_sidebar();
+    }
+
+    pub fn focus_search(&self) {
+        self.inner.focus_search();
+    }
+
+    pub fn open_contacts(&self) {
+        self.inner.open_contacts();
+    }
+
+    pub fn open_saved_messages(&self) {
+        self.inner.clone().open_saved_messages();
     }
 }
 
@@ -307,6 +404,59 @@ impl ShellInner {
                     this.open_chat(chat_id);
                 }
             }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.chatlist
+                .set_on_search(Rc::new(move |query, generation| {
+                    if let Some(this) = weak.upgrade() {
+                        this.sidebar_search_changed(query, generation);
+                    }
+                }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.chatlist
+                .set_on_search_open(Rc::new(move |chat_id, msg_id| {
+                    if let Some(this) = weak.upgrade() {
+                        this.open_search_result(chat_id, msg_id);
+                    }
+                }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.chatlist
+                .set_on_search_retry(Rc::new(move |kind, query, generation| {
+                    if let Some(this) = weak.upgrade() {
+                        this.retry_sidebar_search(kind, query, generation);
+                    }
+                }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.chatlist.set_on_folder(Rc::new(move |folder_id| {
+                if let Some(this) = weak.upgrade() {
+                    this.ui_state.borrow_mut().folder_id = folder_id;
+                    this.schedule_ui_save();
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.chatlist.set_on_main_menu(Rc::new(move || {
+                if let Some(this) = weak.upgrade() {
+                    this.open_main_menu();
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.chatlist
+                .set_on_chat_action(Rc::new(move |chat_id, action| {
+                    if let Some(this) = weak.upgrade() {
+                        this.handle_chat_action(chat_id, action);
+                    }
+                }));
         }
         {
             let weak = Rc::downgrade(this);
@@ -357,6 +507,19 @@ impl ShellInner {
                     this.messages.refresh_animations();
                     this.chatlist.refresh_animations();
                 }
+            });
+        }
+
+        {
+            let weak = Rc::downgrade(this);
+            this.paned.connect_position_notify(move |paned| {
+                let Some(this) = weak.upgrade() else { return };
+                if this.applying_sidebar_layout.get() || this.effective_sidebar_collapsed.get() {
+                    return;
+                }
+                let width = paned.position().max(220);
+                this.ui_state.borrow_mut().sidebar_width = width;
+                this.schedule_ui_save();
             });
         }
 
@@ -479,8 +642,10 @@ impl ShellInner {
         if self.session_ready.replace(true) {
             return;
         }
+        let first_ready = !self.started.replace(true);
         self.stack.set_visible_child_name("main");
         self.install_window_hook();
+        self.install_sidebar_layout();
         self.install_theme_switch_hook();
         if let Some(window) = self.window() {
             self.effects.bind(&window, &self.overlay);
@@ -493,7 +658,11 @@ impl ShellInner {
             self.spawn_event_loop();
         }
         self.load_dialogs();
-        self.start_probe();
+        self.load_folders();
+        self.load_me();
+        if first_ready {
+            self.start_probe();
+        }
     }
 
     fn log_out(self: Rc<Self>) {
@@ -504,11 +673,17 @@ impl ShellInner {
         }
         self.settings_view.begin_logout();
         self.switcher.close();
+        self.main_menu.dismiss();
         self.messages.set_busy(true);
+        self.widget.set_sensitive(false);
+        for (_, source) in self.draft_timeouts.borrow_mut().drain() {
+            source.remove();
+        }
         glib::MainContext::default().spawn_local(async move {
             self.local.record_cancel().await;
             while self.mutations_in_flight.get() != 0
                 || self.flags_in_flight.get()
+                || self.drafts.borrow().values().any(|state| state.in_flight)
                 || self
                     .mark_reads
                     .borrow()
@@ -524,6 +699,12 @@ impl ShellInner {
             let epoch = self.bump_epoch();
             let result = self.tg.log_out().await;
             self.messages.set_busy(false);
+            self.widget.set_sensitive(true);
+            if result.is_ok() {
+                self.me.borrow_mut().take();
+                self.chat_info.borrow_mut().clear();
+                self.drafts.borrow_mut().clear();
+            }
             match result {
                 Ok(AuthState::NeedPhone) => {
                     self.open_chat.set(None);
@@ -537,6 +718,7 @@ impl ShellInner {
                     self.session_ready.set(true);
                     self.apply_settings(&self.settings.get());
                     self.settings_view.account_error(&error);
+                    self.messages.show_error(&error);
                 }
             }
         });
@@ -557,6 +739,7 @@ impl ShellInner {
         self.messages.set_ghost(settings.ghost_mode);
         self.messages.set_edit_history(settings.edit_history);
         self.messages.set_ai_enabled(settings.ai.enabled);
+        self.chatlist.set_show_avatars(settings.ui.show_avatars);
         self.update_clock(settings.header_clock || settings.animation("liveclock"));
         self.effects.sync();
         self.messages.refresh_animations();
@@ -712,6 +895,672 @@ impl ShellInner {
         }
     }
 
+    fn install_sidebar_layout(self: &Rc<Self>) {
+        if self.layout_tick.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let tick = self.paned.add_tick_callback(move |paned, _| {
+            let Some(this) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let width = paned
+                .root()
+                .and_downcast::<gtk::ApplicationWindow>()
+                .map(|window| window.width())
+                .unwrap_or_else(|| paned.width());
+            let width = this.probe_window_width.get().unwrap_or(width);
+            this.apply_sidebar_layout(width);
+            glib::ControlFlow::Continue
+        });
+        *self.layout_tick.borrow_mut() = Some(tick);
+    }
+
+    fn apply_sidebar_layout(&self, window_width: i32) {
+        let state = self.ui_state.borrow();
+        let collapsed = state.sidebar_collapsed || window_width < 640;
+        let position = if collapsed {
+            64
+        } else {
+            clamp_sidebar_width(state.sidebar_width, window_width)
+        };
+        drop(state);
+        if self.effective_sidebar_collapsed.get() == collapsed && self.paned.position() == position
+        {
+            return;
+        }
+        self.applying_sidebar_layout.set(true);
+        self.effective_sidebar_collapsed.set(collapsed);
+        self.paned.set_shrink_start_child(collapsed);
+        self.chatlist.set_collapsed(collapsed);
+        self.paned.set_position(position);
+        self.applying_sidebar_layout.set(false);
+    }
+
+    async fn resize_window_for_probe(
+        &self,
+        window: &gtk::ApplicationWindow,
+        width: i32,
+    ) -> ProbeResize {
+        self.probe_window_width.set(None);
+        self.messages.set_probe_pane_width(None);
+        window.set_default_size(width, window.height().max(1));
+        if poll_until(600, || window.width() == width).await {
+            // One frame observes the new pane allocation; the next applies the
+            // queued BubbleClamp resize produced by that allocation.
+            wait_for_frame(window.upcast_ref()).await;
+            wait_for_frame(window.upcast_ref()).await;
+            if window.width() == width {
+                eprintln!("[probe] resize: real");
+                return ProbeResize {
+                    pane_width: self.messages.bubble_metrics().1,
+                };
+            }
+        }
+
+        self.probe_window_width.set(Some(width));
+        self.apply_sidebar_layout(width);
+        let pane_width = (width - self.paned.position()).max(1);
+        self.messages.set_probe_pane_width(Some(pane_width));
+        eprintln!("[probe] resize: injected");
+        wait_for_frame(window.upcast_ref()).await;
+        wait_for_frame(window.upcast_ref()).await;
+        ProbeResize { pane_width }
+    }
+
+    fn toggle_sidebar(self: &Rc<Self>) {
+        let collapsed = !self.ui_state.borrow().sidebar_collapsed;
+        self.ui_state.borrow_mut().sidebar_collapsed = collapsed;
+        let width = self.window().map(|window| window.width()).unwrap_or(1100);
+        self.apply_sidebar_layout(width);
+        self.schedule_ui_save();
+    }
+
+    fn focus_search(&self) {
+        self.chatlist.focus_search();
+    }
+
+    fn open_contacts(&self) {
+        // TODO(5D): replace with the contacts dialog. The menu/action surface
+        // intentionally exists now so the shortcut package can bind it.
+    }
+
+    fn open_saved_messages(self: Rc<Self>) {
+        let saved = self.chatlist.ordered().into_iter().find_map(|(id, _)| {
+            self.chatlist
+                .summary(id)
+                .filter(|chat| chat.kind == ChatKind::Saved)
+                .map(|_| id)
+        });
+        if let Some(chat_id) = saved {
+            self.open_chat(chat_id);
+        }
+    }
+
+    fn schedule_ui_save(self: &Rc<Self>) {
+        if let Some(source) = self.ui_save_timeout.borrow_mut().take() {
+            source.remove();
+        }
+        let weak = Rc::downgrade(self);
+        let source = glib::timeout_add_local_once(Duration::from_secs(1), move || {
+            let Some(this) = weak.upgrade() else { return };
+            this.ui_save_timeout.borrow_mut().take();
+            let state = this.ui_state.borrow().clone();
+            if let Err(error) = state.save() {
+                eprintln!("ui-state: {error}");
+            }
+        });
+        *self.ui_save_timeout.borrow_mut() = Some(source);
+    }
+
+    fn load_folders(self: &Rc<Self>) {
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_folders().await;
+            let Some(this) = weak.upgrade().filter(|this| {
+                this.session_ready.get() && this.session_epoch.get() == session_epoch
+            }) else {
+                return;
+            };
+            match result {
+                Ok(folders) => {
+                    let folder_id = this.ui_state.borrow().folder_id;
+                    this.chatlist.set_folders(folders, folder_id);
+                }
+                Err(error) => eprintln!("get_folders: {error}"),
+            }
+        });
+    }
+
+    fn load_me(self: &Rc<Self>) {
+        if self.me_loading.replace(true) {
+            return;
+        }
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_me().await;
+            let Some(this) = weak.upgrade() else { return };
+            this.me_loading.set(false);
+            if !this.session_ready.get() || this.session_epoch.get() != session_epoch {
+                return;
+            }
+            match result {
+                Ok(me) => *this.me.borrow_mut() = Some(me),
+                Err(error) => eprintln!("get_me: {error}"),
+            }
+        });
+    }
+
+    fn sidebar_search_changed(self: Rc<Self>, query: String, generation: u64) {
+        if let Some(source) = self.search_timeout.borrow_mut().take() {
+            source.remove();
+        }
+        self.chatlist.refresh_search();
+        if query.chars().count() < 3 {
+            return;
+        }
+        let weak = Rc::downgrade(&self);
+        let source = glib::timeout_add_local_once(Duration::from_millis(300), move || {
+            let Some(this) = weak.upgrade() else { return };
+            this.search_timeout.borrow_mut().take();
+            this.run_sidebar_search(query, generation);
+        });
+        *self.search_timeout.borrow_mut() = Some(source);
+    }
+
+    fn run_sidebar_search(self: &Rc<Self>, query: String, generation: u64) {
+        let session_epoch = self.session_epoch.get();
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        let chats_query = query.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.search_chats(&chats_query).await;
+            if let Some(this) = weak.upgrade().filter(|this| {
+                this.session_ready.get() && this.session_epoch.get() == session_epoch
+            }) {
+                this.chatlist
+                    .finish_chat_search(&chats_query, generation, result);
+            }
+        });
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        let session_epoch = self.session_epoch.get();
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.search_global(&query).await;
+            if let Some(this) = weak.upgrade().filter(|this| {
+                this.session_ready.get() && this.session_epoch.get() == session_epoch
+            }) {
+                this.chatlist
+                    .finish_message_search(&query, generation, result);
+            }
+        });
+    }
+
+    fn retry_sidebar_search(self: Rc<Self>, kind: SearchRetry, query: String, generation: u64) {
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(&self);
+        glib::MainContext::default().spawn_local(async move {
+            match kind {
+                SearchRetry::Chats => {
+                    let result = tg.search_chats(&query).await;
+                    let Some(this) = weak.upgrade().filter(|this| {
+                        this.session_ready.get() && this.session_epoch.get() == session_epoch
+                    }) else {
+                        return;
+                    };
+                    this.chatlist.finish_chat_search(&query, generation, result);
+                }
+                SearchRetry::Messages => {
+                    let result = tg.search_global(&query).await;
+                    let Some(this) = weak.upgrade().filter(|this| {
+                        this.session_ready.get() && this.session_epoch.get() == session_epoch
+                    }) else {
+                        return;
+                    };
+                    this.chatlist
+                        .finish_message_search(&query, generation, result);
+                }
+            }
+        });
+    }
+
+    fn open_search_result(self: Rc<Self>, chat_id: i64, msg_id: Option<i32>) {
+        if self.chatlist.summary(chat_id).is_none() {
+            if let Some(summary) = self.chatlist.search_summary(chat_id) {
+                self.bump_dialogs_revision();
+                self.chatlist.set_summary(summary);
+            }
+        }
+        self.chatlist.set_search_text("");
+        self.clone().open_chat(chat_id);
+        let Some(msg_id) = msg_id else { return };
+        let weak = Rc::downgrade(&self);
+        glib::MainContext::default().spawn_local(async move {
+            if !poll_until(3000, || {
+                weak.upgrade().is_some_and(|this| {
+                    this.open_chat.get() == Some(chat_id) && !this.messages.is_loading()
+                })
+            })
+            .await
+            {
+                return;
+            }
+            if let Some(this) = weak.upgrade() {
+                if !this.messages.scroll_to_message(msg_id) {
+                    this.jump_to_message(msg_id);
+                }
+            }
+        });
+    }
+
+    fn open_main_menu(self: Rc<Self>) {
+        self.open_main_menu_with_autohide(true);
+    }
+
+    fn open_main_menu_with_autohide(self: Rc<Self>, autohide: bool) {
+        let (popover, contents) = menus::popover();
+        popover.set_autohide(autohide);
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        header.add_css_class("omg-menu-header");
+        if let Some(me) = self.me.borrow().clone() {
+            let avatar = Avatar::new(36);
+            avatar.bind(&self.tg, me.id, &me.name, me.has_photo);
+            header.append(&avatar.widget);
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            let name = gtk::Label::new(Some(&me.name));
+            name.add_css_class("omg-chat-title");
+            name.set_halign(gtk::Align::Start);
+            text.append(&name);
+            let phone = gtk::Label::new(Some(&me.phone));
+            phone.add_css_class("omg-muted");
+            phone.set_halign(gtk::Align::Start);
+            text.append(&phone);
+            header.append(&text);
+        } else {
+            header.append(&gtk::Label::new(Some("Loading account…")));
+            self.load_me();
+        }
+        contents.append(&header);
+        for (label, action, danger) in [
+            ("Saved messages", MainMenuAction::Saved, false),
+            ("Contacts", MainMenuAction::Contacts, false),
+            ("New group", MainMenuAction::NewGroup, false),
+            ("Archived chats", MainMenuAction::Archived, false),
+            ("Settings", MainMenuAction::Settings, false),
+            ("Keyboard shortcuts", MainMenuAction::Shortcuts, false),
+            ("About", MainMenuAction::About, false),
+            ("Log out", MainMenuAction::LogOut, true),
+        ] {
+            let button = menus::button(label, danger);
+            let weak = Rc::downgrade(&self);
+            let popover_weak = popover.downgrade();
+            button.connect_clicked(move |_| {
+                if let Some(popover) = popover_weak.upgrade() {
+                    popover.popdown();
+                }
+                if let Some(this) = weak.upgrade() {
+                    this.handle_main_menu(action);
+                }
+            });
+            contents.append(&button);
+        }
+        let button = self.chatlist.main_menu_button();
+        self.main_menu.show(&button, popover);
+    }
+
+    fn handle_main_menu(self: Rc<Self>, action: MainMenuAction) {
+        match action {
+            MainMenuAction::Saved => self.open_saved_messages(),
+            MainMenuAction::Contacts => self.open_contacts(),
+            MainMenuAction::NewGroup => {
+                // TODO(5D): open the dedicated new-group flow.
+            }
+            MainMenuAction::Archived => self.chatlist.show_archived(),
+            MainMenuAction::Settings | MainMenuAction::Shortcuts => self.toggle_settings(),
+            MainMenuAction::About => {
+                if let Some(window) = self.window() {
+                    gtk::AlertDialog::builder()
+                        .message("Omarchygram")
+                        .detail("A Telegram client for Omarchy")
+                        .buttons(["Close"])
+                        .build()
+                        .show(Some(&window));
+                }
+            }
+            MainMenuAction::LogOut => self.confirm_log_out(),
+        }
+    }
+
+    fn confirm_log_out(self: Rc<Self>) {
+        let Some(window) = self.window() else { return };
+        let dialog = gtk::AlertDialog::builder()
+            .message("Log out of Omarchygram?")
+            .buttons(["Cancel", "Log out"])
+            .default_button(0)
+            .cancel_button(0)
+            .build();
+        glib::MainContext::default().spawn_local(async move {
+            let answer = dialog.choose_future(Some(&window)).await.ok();
+            if answer != Some(1) {
+                return;
+            }
+            self.log_out();
+        });
+    }
+
+    fn handle_chat_action(self: Rc<Self>, chat_id: i64, action: ChatAction) {
+        if !self.session_ready.get() {
+            return;
+        }
+        if matches!(action, ChatAction::Open) {
+            self.open_chat(chat_id);
+            return;
+        }
+        if matches!(
+            action,
+            ChatAction::Search | ChatAction::Info | ChatAction::JumpToDate
+        ) {
+            return;
+        }
+        if matches!(action, ChatAction::ClearHistory | ChatAction::Delete) {
+            self.confirm_destructive_chat_action(chat_id, action);
+            return;
+        }
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(&self);
+        if let ChatAction::Mute(mode) = action {
+            let muted = !matches!(mode, crate::tg::MuteMode::Unmute);
+            self.pending_mutes.borrow_mut().insert(chat_id, muted);
+        }
+        if let ChatAction::MarkUnread(unread) = action {
+            if unread {
+                self.manual_unread_hold.borrow_mut().insert(chat_id);
+            } else {
+                self.manual_unread_hold.borrow_mut().remove(&chat_id);
+            }
+        }
+        self.begin_chat_mutation();
+        glib::MainContext::default().spawn_local(async move {
+            let result = match action {
+                ChatAction::MarkUnread(true) => tg.mark_unread(chat_id, true).await,
+                ChatAction::MarkUnread(false) => {
+                    let up_to = weak
+                        .upgrade()
+                        .and_then(|this| this.chatlist.summary(chat_id))
+                        .map(|chat| chat.last_msg_id)
+                        .unwrap_or(0);
+                    tg.mark_read(chat_id, up_to).await
+                }
+                ChatAction::Pin(pinned) => tg.set_pinned(chat_id, pinned).await,
+                ChatAction::Mute(mode) => tg.set_muted(chat_id, mode).await,
+                ChatAction::Archive(archived) => tg.set_archived(chat_id, archived).await,
+                _ => Ok(()),
+            };
+            let Some(this) = weak.upgrade() else { return };
+            this.finish_chat_mutation();
+            if !this.session_ready.get() || this.session_epoch.get() != session_epoch {
+                return;
+            }
+            if matches!(action, ChatAction::Mute(_)) {
+                this.pending_mutes.borrow_mut().remove(&chat_id);
+            }
+            match result {
+                Ok(()) if matches!(action, ChatAction::MarkUnread(true)) => {
+                    this.bump_dialogs_revision();
+                    this.chatlist.set_unread_mark(chat_id, true);
+                }
+                Ok(()) if matches!(action, ChatAction::MarkUnread(false)) => {
+                    this.bump_dialogs_revision();
+                    this.chatlist.clear_unread(chat_id);
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    if matches!(action, ChatAction::MarkUnread(true)) {
+                        this.manual_unread_hold.borrow_mut().remove(&chat_id);
+                    }
+                    this.messages.show_error(&error);
+                }
+            }
+        });
+    }
+
+    fn confirm_destructive_chat_action(self: Rc<Self>, chat_id: i64, action: ChatAction) {
+        if !self.session_ready.get() {
+            return;
+        }
+        let Some(window) = self.window() else { return };
+        let view_epoch = self.epoch.get();
+        let session_epoch = self.session_epoch.get();
+        let (message, accept) = match action {
+            ChatAction::ClearHistory => ("Clear this chat's history?", "Clear"),
+            ChatAction::Delete => ("Delete this chat?", "Delete"),
+            _ => return,
+        };
+        let dialog = gtk::AlertDialog::builder()
+            .message(message)
+            .buttons(["Cancel", accept])
+            .default_button(0)
+            .cancel_button(0)
+            .build();
+        glib::MainContext::default().spawn_local(async move {
+            if dialog.choose_future(Some(&window)).await.ok() != Some(1) {
+                return;
+            }
+            if !self.session_ready.get() {
+                return;
+            }
+            self.begin_chat_mutation();
+            let result = match action {
+                ChatAction::ClearHistory => self.tg.clear_history(chat_id).await,
+                ChatAction::Delete => self.tg.delete_chat(chat_id).await,
+                _ => Ok(()),
+            };
+            self.finish_chat_mutation();
+            if !self.session_ready.get() || self.session_epoch.get() != session_epoch {
+                return;
+            }
+            match result {
+                Ok(()) if matches!(action, ChatAction::ClearHistory) => {
+                    self.bump_dialogs_revision();
+                    if self.is_current(chat_id, view_epoch) {
+                        self.clone().force_reload(chat_id);
+                    }
+                }
+                Ok(()) if matches!(action, ChatAction::Delete) => {
+                    self.bump_dialogs_revision();
+                    self.chatlist.remove_chat(chat_id);
+                    if self.is_current(chat_id, view_epoch) {
+                        self.open_chat.set(None);
+                        let epoch = self.bump_epoch();
+                        self.messages.clear_selection(epoch);
+                    }
+                }
+                Ok(()) => {}
+                Err(error) => self.messages.show_error(&error),
+            }
+        });
+    }
+
+    fn load_chat_info(self: &Rc<Self>, chat_id: i64, epoch: u64) {
+        if let Some(info) = self.chat_info.borrow().get(&chat_id).cloned() {
+            self.messages.set_chat_info(&info);
+            return;
+        }
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_chat_info(chat_id).await;
+            let Some(this) = weak.upgrade().filter(|this| {
+                this.session_ready.get() && this.session_epoch.get() == session_epoch
+            }) else {
+                return;
+            };
+            match result {
+                Ok(info) => {
+                    this.chat_info.borrow_mut().insert(chat_id, info.clone());
+                    if this.is_current(chat_id, epoch) {
+                        this.messages.set_chat_info(&info);
+                    }
+                }
+                Err(error) => eprintln!("get_chat_info({chat_id}): {error}"),
+            }
+        });
+    }
+
+    fn capture_current_draft(&self, chat_id: i64) {
+        let (text, reply_to, cursor) = self.messages.draft_snapshot_for_switch();
+        let mut drafts = self.drafts.borrow_mut();
+        let state = drafts.entry(chat_id).or_default();
+        if state.current.text == text
+            && state.current.reply_to == reply_to
+            && state.current.cursor == cursor
+        {
+            return;
+        }
+        state.current = DraftSnapshot {
+            text: text.clone(),
+            reply_to,
+            cursor,
+            revision: state.current.revision.wrapping_add(1),
+        };
+        state.dirty = true;
+        drop(drafts);
+        self.bump_dialogs_revision();
+        self.chatlist.set_draft(chat_id, &text);
+    }
+
+    fn composer_draft_changed(self: &Rc<Self>) {
+        if !self.session_ready.get() {
+            return;
+        }
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        if self.messages.is_editing() {
+            return;
+        }
+        self.capture_current_draft(chat_id);
+        if let Some(source) = self.draft_timeouts.borrow_mut().remove(&chat_id) {
+            source.remove();
+        }
+        let weak = Rc::downgrade(self);
+        let source = glib::timeout_add_local_once(Duration::from_secs(1), move || {
+            let Some(this) = weak.upgrade() else { return };
+            this.draft_timeouts.borrow_mut().remove(&chat_id);
+            this.flush_draft(chat_id);
+        });
+        self.draft_timeouts.borrow_mut().insert(chat_id, source);
+    }
+
+    fn restore_draft(&self, chat_id: i64) {
+        let server_draft = self
+            .chatlist
+            .summary(chat_id)
+            .map(|summary| summary.draft)
+            .unwrap_or_default();
+        let snapshot = {
+            let mut drafts = self.drafts.borrow_mut();
+            let state = drafts.entry(chat_id).or_default();
+            if state.current.text.is_empty() && !state.dirty && !server_draft.is_empty() {
+                state.current.text = server_draft;
+                state.current.cursor = state.current.text.chars().count() as i32;
+            }
+            state.current.clone()
+        };
+        self.messages
+            .restore_draft(&snapshot.text, snapshot.reply_to, snapshot.cursor);
+    }
+
+    fn flush_draft(self: &Rc<Self>, chat_id: i64) {
+        if let Some(source) = self.draft_timeouts.borrow_mut().remove(&chat_id) {
+            source.remove();
+        }
+        let snapshot = self
+            .drafts
+            .borrow()
+            .get(&chat_id)
+            .filter(|state| state.dirty)
+            .map(|state| state.current.clone());
+        if let Some(snapshot) = snapshot {
+            self.send_draft_snapshot(chat_id, snapshot);
+        }
+    }
+
+    fn send_draft_snapshot(self: &Rc<Self>, chat_id: i64, snapshot: DraftSnapshot) {
+        if !self.session_ready.get() {
+            return;
+        }
+        {
+            let mut drafts = self.drafts.borrow_mut();
+            let state = drafts.entry(chat_id).or_default();
+            if state.in_flight {
+                state.queued = Some(snapshot);
+                return;
+            }
+            state.in_flight = true;
+        }
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg
+                .save_draft(chat_id, &snapshot.text, snapshot.reply_to)
+                .await;
+            let Some(this) = weak.upgrade() else { return };
+            let next = {
+                let mut drafts = this.drafts.borrow_mut();
+                let state = drafts.entry(chat_id).or_default();
+                state.in_flight = false;
+                if result.is_ok() && state.current.revision == snapshot.revision {
+                    state.dirty = false;
+                }
+                match state.queued.take() {
+                    Some(queued) if queued.revision >= state.current.revision => Some(queued),
+                    Some(_) if state.dirty => Some(state.current.clone()),
+                    _ => None,
+                }
+            };
+            match result {
+                Ok(()) => {
+                    if this.open_chat.get() == Some(chat_id) {
+                        this.messages.clear_draft_error();
+                    }
+                }
+                Err(error) => {
+                    if this.open_chat.get() == Some(chat_id) {
+                        this.messages.show_draft_error(&error);
+                    }
+                }
+            }
+            if let Some(next) = next {
+                this.send_draft_snapshot(chat_id, next);
+            }
+        });
+    }
+
+    fn clear_sent_draft(self: &Rc<Self>, chat_id: i64) {
+        let snapshot = {
+            let mut drafts = self.drafts.borrow_mut();
+            let state = drafts.entry(chat_id).or_default();
+            let revision = state.current.revision.wrapping_add(1);
+            state.current = DraftSnapshot {
+                revision,
+                ..DraftSnapshot::default()
+            };
+            state.dirty = true;
+            state.current.clone()
+        };
+        self.bump_dialogs_revision();
+        self.chatlist.set_draft(chat_id, "");
+        self.send_draft_snapshot(chat_id, snapshot);
+    }
+
     fn spawn_event_loop(self: &Rc<Self>) {
         let this = self.clone();
         let events = self.tg.events.clone();
@@ -733,77 +1582,210 @@ impl ShellInner {
             self.dialogs_refresh_again.set(true);
             return;
         }
+        let requested_revision = self.dialogs_revision.get();
         let session_epoch = self.session_epoch.get();
         let this = self.clone();
         glib::MainContext::default().spawn_local(async move {
             let result = this.tg.get_dialogs().await;
             this.dialogs_in_flight.set(false);
-            if this.is_session_current(session_epoch) {
-                match result {
-                    Ok(dialogs) => {
-                        let dialog_times: HashMap<i64, Option<chrono::DateTime<chrono::Local>>> =
-                            dialogs
-                                .iter()
-                                .map(|dialog| (dialog.id, dialog.last_time))
-                                .collect();
-                        this.chatlist.set_chats(dialogs);
-                        let mut event_messages: Vec<Msg> =
-                            this.last_by_chat.borrow().values().cloned().collect();
-                        event_messages.sort_by_key(|message| message.ts);
-                        for message in &event_messages {
-                            match dialog_times.get(&message.chat_id).copied().flatten() {
-                                None => this.chatlist.upsert(
-                                    message.chat_id,
-                                    &chat_title(message),
-                                    &message_preview(message),
-                                    Some(message.ts),
-                                    UnreadUpdate::Delta(0),
-                                ),
-                                Some(dialog_time) if message.ts > dialog_time => {
-                                    this.chatlist.upsert(
-                                        message.chat_id,
-                                        &chat_title(message),
-                                        &message_preview(message),
-                                        Some(message.ts),
-                                        UnreadUpdate::Delta(0),
-                                    )
+            if !this.session_ready.get() || this.session_epoch.get() != session_epoch {
+                return;
+            }
+            match result {
+                Ok(mut dialogs) => {
+                    if requested_revision != this.dialogs_revision.get() {
+                        this.dialogs_refresh_again.set(false);
+                        this.load_dialogs();
+                        return;
+                    }
+                    for dialog in &mut dialogs {
+                        let mut read = this.read_outbox.borrow_mut();
+                        let known = read.entry(dialog.id).or_insert(dialog.read_outbox_max_id);
+                        *known = (*known).max(dialog.read_outbox_max_id);
+                        dialog.read_outbox_max_id = *known;
+                        drop(read);
+
+                        if let Some(local) = this.chatlist.summary(dialog.id) {
+                            let local_is_newer = match (local.last_time, dialog.last_time) {
+                                (Some(local_time), Some(server_time)) => {
+                                    local_time > server_time
+                                        || (local_time == server_time
+                                            && local.last_msg_id > dialog.last_msg_id)
                                 }
-                                Some(dialog_time) if message.ts == dialog_time => {
-                                    this.chatlist.update(
-                                        message.chat_id,
-                                        &chat_title(message),
-                                        &message_preview(message),
-                                        Some(message.ts),
-                                        UnreadUpdate::Delta(0),
-                                    )
-                                }
-                                Some(_) => {}
+                                (Some(_), None) => true,
+                                _ => false,
+                            };
+                            if local_is_newer {
+                                dialog.last_message = local.last_message;
+                                dialog.last_sender = local.last_sender;
+                                dialog.last_time = local.last_time;
+                                dialog.last_msg_id = local.last_msg_id;
+                                dialog.last_outgoing = local.last_outgoing;
+                                dialog.unread = local.unread;
+                                dialog.mentions = local.mentions;
+                                dialog.unread_mark = local.unread_mark;
+                                dialog.read_inbox_max_id = local.read_inbox_max_id;
+                            } else if this.manual_unread_hold.borrow().contains(&dialog.id) {
+                                dialog.unread = local.unread;
+                                dialog.unread_mark = true;
                             }
                         }
-                        if let Some(chat_id) = this.open_chat.get() {
-                            if this.window_is_active() && this.chatlist.unread(chat_id) > 0 {
-                                let latest = this
-                                    .messages
-                                    .last_message()
-                                    .map(|message| message.id)
-                                    .unwrap_or(0);
-                                this.queue_mark_read(chat_id, latest, this.epoch.get());
+
+                        let mut drafts = this.drafts.borrow_mut();
+                        match drafts.get_mut(&dialog.id) {
+                            Some(state) if state.dirty => {
+                                dialog.draft = state.current.text.clone();
+                            }
+                            Some(_) => {}
+                            None => {
+                                drafts.insert(
+                                    dialog.id,
+                                    DraftState {
+                                        current: DraftSnapshot {
+                                            text: dialog.draft.clone(),
+                                            cursor: dialog.draft.chars().count() as i32,
+                                            ..DraftSnapshot::default()
+                                        },
+                                        ..DraftState::default()
+                                    },
+                                );
                             }
                         }
-                        this.dialogs_loaded.set(true);
-                        this.dialogs_error_box.set_visible(false);
                     }
-                    Err(error) => {
-                        shell_log!("get_dialogs: {error}");
-                        this.dialogs_error.set_label(&error);
-                        this.dialogs_error_box.set_visible(true);
+                    let dialog_times: HashMap<i64, Option<chrono::DateTime<chrono::Local>>> =
+                        dialogs
+                            .iter()
+                            .map(|dialog| (dialog.id, dialog.last_time))
+                            .collect();
+                    this.chatlist.set_chats(dialogs);
+                    let mut event_messages: Vec<Msg> =
+                        this.last_by_chat.borrow().values().cloned().collect();
+                    event_messages.sort_by_key(|message| message.ts);
+                    for message in &event_messages {
+                        match dialog_times.get(&message.chat_id).copied().flatten() {
+                            None => this.chatlist.upsert(
+                                message.chat_id,
+                                &chat_title(message),
+                                &message_preview(message),
+                                Some(message.ts),
+                                UnreadUpdate::Delta(0),
+                            ),
+                            Some(dialog_time) if message.ts > dialog_time => this.chatlist.upsert(
+                                message.chat_id,
+                                &chat_title(message),
+                                &message_preview(message),
+                                Some(message.ts),
+                                UnreadUpdate::Delta(0),
+                            ),
+                            Some(dialog_time) if message.ts == dialog_time => this.chatlist.update(
+                                message.chat_id,
+                                &chat_title(message),
+                                &message_preview(message),
+                                Some(message.ts),
+                                UnreadUpdate::Delta(0),
+                            ),
+                            Some(_) => {}
+                        }
                     }
+                    if let Some(chat_id) = this.open_chat.get() {
+                        if this.window_is_active() && this.chatlist.unread(chat_id) > 0 {
+                            let latest = this
+                                .messages
+                                .last_message()
+                                .map(|message| message.id)
+                                .unwrap_or(0);
+                            this.queue_mark_read(chat_id, latest, this.epoch.get());
+                        }
+                    }
+                    this.dialogs_loaded.set(true);
+                    this.dialogs_error_box.set_visible(false);
+                    this.run_smoke_hooks();
                 }
+                Err(error) => {
+                    shell_log!("get_dialogs: {error}");
+                    this.dialogs_error.set_label(&error);
+                    this.dialogs_error_box.set_visible(true);
+                }
+            }
+            if requested_revision != this.dialogs_revision.get() {
+                this.dialogs_refresh_again.set(true);
             }
             if this.dialogs_refresh_again.replace(false) && this.session_ready.get() {
                 this.load_dialogs();
             }
         });
+    }
+
+    fn schedule_dialogs_reload(self: &Rc<Self>) {
+        if self.dialogs_reload_timeout.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let source = glib::timeout_add_local_once(Duration::from_millis(300), move || {
+            let Some(this) = weak.upgrade() else { return };
+            this.dialogs_reload_timeout.borrow_mut().take();
+            this.load_dialogs();
+        });
+        *self.dialogs_reload_timeout.borrow_mut() = Some(source);
+    }
+
+    fn bump_dialogs_revision(&self) {
+        self.dialogs_revision
+            .set(self.dialogs_revision.get().wrapping_add(1));
+    }
+
+    fn begin_chat_mutation(&self) {
+        self.mutations_in_flight
+            .set(self.mutations_in_flight.get().saturating_add(1));
+    }
+
+    fn finish_chat_mutation(&self) {
+        self.mutations_in_flight
+            .set(self.mutations_in_flight.get().saturating_sub(1));
+    }
+
+    fn dialog_upsert(
+        &self,
+        chat_id: i64,
+        title: &str,
+        preview: &str,
+        time: Option<DateTime<Local>>,
+        unread: UnreadUpdate,
+    ) {
+        self.bump_dialogs_revision();
+        self.chatlist.upsert(chat_id, title, preview, time, unread);
+    }
+
+    fn run_smoke_hooks(self: &Rc<Self>) {
+        if self.probe || self.smoke_hook_done.replace(true) {
+            return;
+        }
+        if let Ok(title) = std::env::var("OMG_SMOKE_OPEN") {
+            if let Some(chat_id) = self
+                .chatlist
+                .ordered()
+                .into_iter()
+                .find_map(|(id, candidate)| (candidate == title).then_some(id))
+            {
+                self.clone().open_chat(chat_id);
+            }
+        }
+        if let Ok(query) = std::env::var("OMG_SMOKE_SEARCH") {
+            self.chatlist.set_search_text(&query);
+        }
+        if std::env::var("OMG_SMOKE_MENU").is_ok_and(|value| !value.is_empty()) {
+            let weak = Rc::downgrade(self);
+            let Some(window) = self.window() else { return };
+            window.add_tick_callback(move |_, _| {
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(this) = weak.upgrade() {
+                        this.open_main_menu_with_autohide(false);
+                    }
+                });
+                glib::ControlFlow::Break
+            });
+        }
     }
 
     fn install_window_hook(self: &Rc<Self>) {
@@ -879,14 +1861,41 @@ impl ShellInner {
     }
 
     fn handle_event(self: &Rc<Self>, event: Event) {
+        if !self.session_ready.get() {
+            return;
+        }
         match event {
-            // Wave 5: read state, presence, dialog/pin changes are consumed by
-            // packages 5A/5C (specs/spec-wave5.md); until then they are inert.
-            Event::ReadOutbox { .. }
-            | Event::ReadInbox { .. }
-            | Event::Presence { .. }
-            | Event::DialogsChanged
-            | Event::PinnedChanged { .. } => {}
+            Event::ReadOutbox { chat_id, max_id } => {
+                self.bump_dialogs_revision();
+                let mut read = self.read_outbox.borrow_mut();
+                let known = read.entry(chat_id).or_insert(max_id);
+                *known = (*known).max(max_id);
+                let known = *known;
+                drop(read);
+                self.chatlist.set_read_outbox(chat_id, known);
+                if self.open_chat.get() == Some(chat_id) {
+                    self.messages.set_read_outbox(known);
+                }
+            }
+            Event::ReadInbox { chat_id, max_id: _ } => {
+                self.bump_dialogs_revision();
+                if !self.manual_unread_hold.borrow().contains(&chat_id) {
+                    self.chatlist.clear_unread(chat_id);
+                }
+            }
+            Event::Presence { user_id, presence } => {
+                self.chatlist.set_presence(user_id, presence);
+                if self.open_chat.get() == Some(user_id) {
+                    self.messages.set_presence(presence);
+                }
+            }
+            Event::DialogsChanged => {
+                self.bump_dialogs_revision();
+                self.schedule_dialogs_reload();
+            }
+            // Package 5C owns the pinned-message bar. Consuming the event here
+            // keeps the event match exhaustive without starting that fill.
+            Event::PinnedChanged { .. } => {}
             Event::NewMessage(message) => self.handle_new_message(message),
             Event::MessageChanged(message) => {
                 let message = self.apply_tombstone(message);
@@ -896,7 +1905,7 @@ impl ShellInner {
                     self.post_render(inserted);
                     if was_last && !message.deleted {
                         self.remember_last(&message);
-                        self.chatlist.upsert(
+                        self.dialog_upsert(
                             message.chat_id,
                             &chat_title(&message),
                             &message_preview(&message),
@@ -970,13 +1979,7 @@ impl ShellInner {
                             .as_ref()
                             .map(|message| (message_preview(message), Some(message.ts)))
                             .unwrap_or_else(|| (String::new(), None));
-                        self.chatlist.upsert(
-                            chat_id,
-                            &title,
-                            &preview,
-                            time,
-                            UnreadUpdate::Delta(0),
-                        );
+                        self.dialog_upsert(chat_id, &title, &preview, time, UnreadUpdate::Delta(0));
                     }
                 }
 
@@ -1015,7 +2018,8 @@ impl ShellInner {
         let message = self.apply_tombstone(message);
         let active = self.window_is_active();
         let is_open = self.open_chat.get() == Some(message.chat_id);
-        let read_triggered = is_open && active;
+        let manual_unread = self.manual_unread_hold.borrow().contains(&message.chat_id);
+        let read_triggered = is_open && active && !manual_unread;
         // Outgoing = sent from the user's own other device: show it (the store
         // dedupes against local sends by id), but never notify or count unread.
         let own = message.outgoing;
@@ -1026,7 +2030,7 @@ impl ShellInner {
         }
         if !message.deleted {
             self.remember_last(&message);
-            self.chatlist.upsert(
+            self.dialog_upsert(
                 message.chat_id,
                 &chat_title(&message),
                 &message_preview(&message),
@@ -1057,6 +2061,20 @@ impl ShellInner {
     }
 
     fn notify(&self, message: &Msg) {
+        let muted = self
+            .pending_mutes
+            .borrow()
+            .get(&message.chat_id)
+            .copied()
+            .or_else(|| {
+                self.chatlist
+                    .summary(message.chat_id)
+                    .map(|chat| chat.muted)
+            })
+            .unwrap_or(false);
+        if muted {
+            return;
+        }
         let Some(window) = self.window() else { return };
         let Some(application) = window.application() else {
             return;
@@ -1093,6 +2111,14 @@ impl ShellInner {
         if self.open_chat.get() == Some(chat_id) {
             return;
         }
+        self.main_menu.dismiss();
+        self.chatlist.dismiss_popovers();
+        self.messages.dismiss_owned_popovers();
+        if let Some(previous) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
+            self.manual_unread_hold.borrow_mut().remove(&previous);
+            self.capture_current_draft(previous);
+            self.flush_draft(previous);
+        }
         if is_virtual(chat_id) {
             self.open_virtual_chat(chat_id);
             return;
@@ -1107,6 +2133,18 @@ impl ShellInner {
         }
         let title = self.title_for(chat_id);
         self.messages.reset_chat(chat_id, &title, epoch);
+        if let Some(summary) = self.chatlist.summary(chat_id) {
+            self.messages.set_chat_summary(&summary, &self.tg);
+            let known = self
+                .read_outbox
+                .borrow()
+                .get(&chat_id)
+                .copied()
+                .unwrap_or(summary.read_outbox_max_id);
+            self.messages.set_read_outbox(known);
+        }
+        self.restore_draft(chat_id);
+        self.load_chat_info(chat_id, epoch);
         let recent = self
             .recent_incoming
             .borrow()
@@ -1147,6 +2185,7 @@ impl ShellInner {
         self.chatlist.select_chat(chat_id);
         self.messages
             .reset_chat(chat_id, virtual_title(chat_id), epoch);
+        self.messages.set_virtual_header(chat_id, &self.tg);
         let (messages, mono_ids) = {
             let stores = self.virtual_stores.borrow();
             let Some(store) = stores.get(&chat_id) else {
@@ -1178,6 +2217,17 @@ impl ShellInner {
         let epoch = self.bump_epoch();
         let title = self.title_for(chat_id);
         self.messages.reset_chat(chat_id, &title, epoch);
+        if let Some(summary) = self.chatlist.summary(chat_id) {
+            self.messages.set_chat_summary(&summary, &self.tg);
+            let known = self
+                .read_outbox
+                .borrow()
+                .get(&chat_id)
+                .copied()
+                .unwrap_or(summary.read_outbox_max_id);
+            self.messages.set_read_outbox(known);
+        }
+        self.restore_draft(chat_id);
         self.start_initial_load(chat_id, epoch);
     }
 
@@ -1263,6 +2313,20 @@ impl ShellInner {
         }
         match action {
             MessageAction::Submit => self.submit_composer(),
+            MessageAction::Mic => {
+                // TODO(5D): replace with the serialized voice-recorder state machine.
+            }
+            MessageAction::DraftChanged => self.composer_draft_changed(),
+            MessageAction::DraftRetry => {
+                if let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
+                    self.flush_draft(chat_id);
+                }
+            }
+            MessageAction::Header(action) => {
+                if let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
+                    self.handle_chat_action(chat_id, action);
+                }
+            }
             MessageAction::Attach => {
                 if self.open_chat.get().is_some_and(is_virtual) {
                     return;
@@ -1277,7 +2341,10 @@ impl ShellInner {
                 self.messages.prepare_attachment();
                 self.send_file(file);
             }
-            MessageAction::Reply(msg_id) => self.messages.begin_reply(msg_id),
+            MessageAction::Reply(msg_id) => {
+                self.messages.begin_reply(msg_id);
+                self.composer_draft_changed();
+            }
             MessageAction::Edit(msg_id) => self.messages.begin_edit(msg_id),
             MessageAction::EditHistory(msg_id) => self.open_edit_history(msg_id),
             MessageAction::Delete(msg_id) => self.delete_message(msg_id),
@@ -1285,6 +2352,7 @@ impl ShellInner {
             MessageAction::Paginate => self.paginate(),
             MessageAction::CancelMode => {
                 self.messages.cancel_mode();
+                self.composer_draft_changed();
             }
             MessageAction::CopyMessageId(msg_id) => {
                 if let Some(message) = self.messages.message(msg_id) {
@@ -1302,6 +2370,7 @@ impl ShellInner {
                     self.widget.clipboard().set_text(&sender_id.to_string());
                 }
             }
+            MessageAction::JumpToMessage(msg_id) => self.jump_to_message(msg_id),
             MessageAction::JumpToDate(date) => self.jump_to_date(date),
             MessageAction::JumpToLatest => self.jump_to_latest(),
             MessageAction::DraftReply(msg_id) => self.draft_reply(msg_id),
@@ -1309,6 +2378,35 @@ impl ShellInner {
             MessageAction::Summarize(msg_id) => self.summarize_message(msg_id),
             MessageAction::Transcribe(msg_id) => self.request_transcription(msg_id),
         }
+    }
+
+    fn jump_to_message(self: Rc<Self>, msg_id: i32) {
+        if self.messages.scroll_to_message(msg_id) {
+            return;
+        }
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        let session_epoch = self.session_epoch.get();
+        glib::MainContext::default().spawn_local(async move {
+            let result = self.tg.get_messages(chat_id, vec![msg_id]).await;
+            if !self.session_ready.get()
+                || self.session_epoch.get() != session_epoch
+                || !self.is_current(chat_id, epoch)
+            {
+                return;
+            }
+            match result {
+                Ok(messages) => {
+                    if let Some(message) = messages.into_iter().find(|message| message.id == msg_id)
+                    {
+                        self.jump_to_date_ensuring(message.ts, Some(message));
+                    }
+                }
+                Err(error) => self.messages.show_error(&error),
+            }
+        });
     }
 
     fn open_edit_history(self: Rc<Self>, msg_id: i32) {
@@ -1349,6 +2447,10 @@ impl ShellInner {
     /// stays `detached` (▼ always visible) until the user reloads the latest
     /// page; pagination upward from the jumped page keeps working (C3).
     fn jump_to_date(self: Rc<Self>, date: DateTime<Local>) {
+        self.jump_to_date_ensuring(date, None);
+    }
+
+    fn jump_to_date_ensuring(self: Rc<Self>, date: DateTime<Local>, ensure: Option<Msg>) {
         let Some(chat_id) = self.open_chat.get() else {
             return;
         };
@@ -1365,6 +2467,11 @@ impl ShellInner {
                 Ok(mut messages) => {
                     if !this.is_current(chat_id, epoch) {
                         return;
+                    }
+                    if let Some(message) =
+                        ensure.filter(|message| !messages.iter().any(|item| item.id == message.id))
+                    {
+                        messages.push(message);
                     }
                     this.apply_tombstones(chat_id, &mut messages);
                     let inserted = this.messages.finish_initial(messages);
@@ -1464,6 +2571,11 @@ impl ShellInner {
 
     fn finish_virtual(&self, chat_id: i64, result: Result<String, String>, monospace: bool) {
         self.end_virtual_request(chat_id);
+        // A local reply that lands while logging out must not touch the
+        // (soon to be cleared) message view.
+        if !self.session_ready.get() {
+            return;
+        }
         let text = match result {
             Ok(text) => text,
             Err(error) if chat_id == ASSISTANT_CHAT && error.contains("no chat provider") => {
@@ -1905,7 +3017,7 @@ impl ShellInner {
                         if was_last && !message.deleted {
                             self.remember_last(&message);
                             if self.is_tracked_last(chat_id, msg_id) {
-                                self.chatlist.upsert(
+                                self.dialog_upsert(
                                     chat_id,
                                     &title,
                                     &message.text,
@@ -1935,6 +3047,22 @@ impl ShellInner {
             return;
         }
 
+        let pending_id = self.pending_message_id.get();
+        self.pending_message_id.set(pending_id.saturating_sub(1));
+        let pending = Msg {
+            id: pending_id,
+            chat_id,
+            chat_title: title.clone(),
+            sender: "You".to_string(),
+            text: text.clone(),
+            ts: Local::now(),
+            outgoing: true,
+            reply_to,
+            ..Msg::default()
+        };
+        let inserted = self.messages.merge_pending(pending);
+        self.post_render(inserted);
+
         glib::MainContext::default().spawn_local(async move {
             charge.await;
             let result = self.tg.send_text(chat_id, &text, reply_to).await;
@@ -1948,7 +3076,7 @@ impl ShellInner {
                     let message = self.apply_tombstone(message);
                     if !message.deleted {
                         self.remember_last(&message);
-                        self.chatlist.upsert(
+                        self.dialog_upsert(
                             chat_id,
                             &title,
                             &message_preview(&message),
@@ -1957,16 +3085,19 @@ impl ShellInner {
                         );
                     }
                     if self.is_current(chat_id, epoch) {
+                        self.messages.remove(pending_id);
                         let inserted = self.messages.merge_event(message);
                         self.post_render(inserted);
                     }
                     let epoch_is_current = self.is_current(chat_id, epoch);
                     self.messages
                         .complete_text_operation(&text, epoch_is_current);
+                    self.clear_sent_draft(chat_id);
                 }
                 Err(error) => {
                     shell_log!("send_text({chat_id}): {error}");
                     if self.is_current(chat_id, epoch) {
+                        self.messages.remove(pending_id);
                         self.messages.show_error(&error);
                         self.effects.error_flash(&self.overlay);
                     }
@@ -2081,7 +3212,7 @@ impl ShellInner {
                 let message = self.apply_tombstone(message);
                 if !message.deleted {
                     self.remember_last(&message);
-                    self.chatlist.upsert(
+                    self.dialog_upsert(
                         chat_id,
                         &title,
                         &message_preview(&message),
@@ -2145,13 +3276,7 @@ impl ShellInner {
                             .as_ref()
                             .map(|message| (message_preview(message), Some(message.ts)))
                             .unwrap_or_else(|| (String::new(), None));
-                        self.chatlist.upsert(
-                            chat_id,
-                            &title,
-                            &preview,
-                            time,
-                            UnreadUpdate::Delta(0),
-                        );
+                        self.dialog_upsert(chat_id, &title, &preview, time, UnreadUpdate::Delta(0));
                     }
                     if self.is_current(chat_id, epoch) {
                         if self.messages.animate_deleted(msg_id) {
@@ -2169,6 +3294,7 @@ impl ShellInner {
                     }
                 }
             }
+            self.finish_chat_mutation();
         });
     }
 
@@ -2352,6 +3478,7 @@ impl ShellInner {
     }
 
     fn post_render(self: &Rc<Self>, ids: Vec<i32>) {
+        self.resolve_missing_quotes();
         self.start_image_downloads(ids.clone());
         let settings = self.settings.get();
         for msg_id in ids {
@@ -2379,6 +3506,49 @@ impl ShellInner {
                 _ => {}
             }
         }
+    }
+
+    fn resolve_missing_quotes(self: &Rc<Self>) {
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        let requested = self
+            .messages
+            .missing_reply_ids()
+            .into_iter()
+            .filter(|msg_id| {
+                self.quote_requests
+                    .borrow_mut()
+                    .insert((chat_id, epoch, *msg_id))
+            })
+            .collect::<Vec<_>>();
+        if requested.is_empty() {
+            return;
+        }
+        let session_epoch = self.session_epoch.get();
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_messages(chat_id, requested.clone()).await;
+            let Some(this) = weak.upgrade() else { return };
+            {
+                let mut in_flight = this.quote_requests.borrow_mut();
+                for msg_id in &requested {
+                    in_flight.remove(&(chat_id, epoch, *msg_id));
+                }
+            }
+            if !this.session_ready.get()
+                || this.session_epoch.get() != session_epoch
+                || !this.is_current(chat_id, epoch)
+            {
+                return;
+            }
+            match result {
+                Ok(messages) => this.messages.fill_quote_messages(messages),
+                Err(error) => eprintln!("get_messages quotes ({chat_id}): {error}"),
+            }
+        });
     }
 
     fn render_aux_for(&self, msg_id: i32) {
@@ -2649,6 +3819,9 @@ impl ShellInner {
 
     fn queue_mark_read(self: &Rc<Self>, chat_id: i64, latest: i32, epoch: u64) {
         if !self.session_ready.get() || is_virtual(chat_id) {
+            return;
+        }
+        if self.manual_unread_hold.borrow().contains(&chat_id) {
             return;
         }
         // Ghost mode suppresses read receipts; check the CURRENT snapshot so
@@ -2951,13 +4124,175 @@ impl ShellInner {
     async fn run_probe(self: Rc<Self>) {
         probe_step("load dialogs");
         if !poll_until(3000, || {
-            self.dialogs_loaded.get() && !self.chatlist.ordered().is_empty()
+            self.dialogs_loaded.get() || self.dialogs_error_box.is_visible()
         })
         .await
         {
             probe_fail("load dialogs");
             return;
         }
+        if self.dialogs_error_box.is_visible() {
+            probe_step("dialogs error retry");
+            self.dialogs_retry.emit_clicked();
+        }
+        if !poll_until(3500, || {
+            self.dialogs_loaded.get() && !self.chatlist.ordered().is_empty()
+        })
+        .await
+        {
+            probe_fail("dialogs retry");
+            return;
+        }
+
+        if let Some((width, explicitly_collapsed, folder_id)) = self.probe_restored_ui_state {
+            probe_step("restored UI state");
+            if !poll_until(3500, || {
+                let window_width = self.window().map(|window| window.width()).unwrap_or(1100);
+                let collapsed = explicitly_collapsed || window_width < 640;
+                let position = if collapsed {
+                    64
+                } else {
+                    clamp_sidebar_width(width, window_width)
+                };
+                self.ui_state.borrow().sidebar_width == width
+                    && self.ui_state.borrow().sidebar_collapsed == explicitly_collapsed
+                    && self.ui_state.borrow().folder_id == folder_id
+                    && self.chatlist.mode() == SidebarMode::Dialogs(folder_id)
+                    && self.effective_sidebar_collapsed.get() == collapsed
+                    && self.paned.position() == position
+            })
+            .await
+            {
+                probe_fail("restored UI state");
+                return;
+            }
+        }
+
+        if environment_listed("OMG_MOCK_SLOW", "GetDialogs")
+            || environment_listed("OMG_MOCK_SLOW", "SearchGlobal")
+            || environment_listed("OMG_MOCK_SLOW", "DownloadAvatar")
+        {
+            probe_step("slow dialogs search avatar generations");
+            let marta = self
+                .chatlist
+                .ordered()
+                .into_iter()
+                .find_map(|(id, title)| (title == "Marta").then_some(id));
+            let deni = self
+                .chatlist
+                .ordered()
+                .into_iter()
+                .find_map(|(id, title)| (title == "Deni").then_some(id));
+            let (Some(marta), Some(deni)) = (marta, deni) else {
+                probe_fail("slow generation fixtures");
+                return;
+            };
+            self.load_dialogs();
+            self.clone().open_chat(marta);
+            self.clone().open_chat(deni);
+            self.chatlist.set_search_text("green");
+            glib::timeout_future(Duration::from_millis(400)).await;
+            self.chatlist.clear_search();
+            glib::timeout_future(Duration::from_millis(1900)).await;
+            if self.chatlist.selected() != Some(deni)
+                || self.messages.header_title() != "Deni"
+                || self.messages.header_avatar_key() != deni
+                || !self.chatlist.avatar_keys_match()
+            {
+                probe_fail("slow generation stale widget");
+                return;
+            }
+        }
+
+        probe_step("sidebar collapse");
+        self.toggle_sidebar();
+        if !poll_until(1000, || self.effective_sidebar_collapsed.get()).await {
+            probe_fail("sidebar collapse");
+            return;
+        }
+        self.toggle_sidebar();
+        if !poll_until(1000, || !self.effective_sidebar_collapsed.get()).await {
+            probe_fail("sidebar expand");
+            return;
+        }
+
+        probe_step("search chats mar");
+        self.chatlist.set_search_text("mar");
+        if !poll_until(3000, || self.chatlist.search_counts().0 > 0).await {
+            probe_fail("search chats mar");
+            return;
+        }
+        if environment_listed("OMG_MOCK_FAIL_ONCE", "SearchGlobal") {
+            if !poll_until(1500, || self.chatlist.search_has_message_error()).await {
+                probe_fail("search messages transient error");
+                return;
+            }
+            probe_step("search messages retry");
+            self.chatlist.activate_message_retry();
+            if !poll_until(3500, || self.chatlist.search_messages_ready()).await {
+                probe_fail("search messages transient retry");
+                return;
+            }
+        }
+        probe_step("search messages green");
+        self.chatlist.set_search_text("green");
+        if !poll_until(3500, || {
+            self.chatlist.search_counts().1 > 0 || self.chatlist.search_has_message_error()
+        })
+        .await
+        {
+            probe_fail("search messages green");
+            return;
+        }
+        if self.chatlist.search_has_message_error() {
+            probe_step("search messages retry");
+            self.chatlist.activate_message_retry();
+            if !poll_until(3500, || self.chatlist.search_counts().1 > 0).await {
+                probe_fail("search messages retry");
+                return;
+            }
+        }
+        self.chatlist.clear_search();
+        if !poll_until(1000, || self.chatlist.search_text().is_empty()).await {
+            probe_fail("search escape clear");
+            return;
+        }
+
+        probe_step("main menu");
+        self.clone().open_main_menu();
+        if !poll_until(1000, || self.main_menu.is_open()).await {
+            probe_fail("main menu open");
+            return;
+        }
+        self.main_menu.dismiss();
+
+        probe_step("archived list");
+        self.chatlist.show_archived();
+        if !poll_until(1000, || {
+            self.chatlist.mode() == SidebarMode::Archived
+                && self.chatlist.visible_titles() == vec!["Old project".to_string()]
+        })
+        .await
+        {
+            probe_fail("archived list");
+            return;
+        }
+        self.chatlist.show_dialogs_from_archive();
+
+        probe_step("folder Work");
+        if !poll_until(3000, || {
+            self.chatlist.select_folder(1);
+            let mut titles = self.chatlist.visible_titles();
+            titles.sort();
+            titles == vec!["Arch Linux ARM".to_string(), "Deni".to_string()]
+        })
+        .await
+        {
+            probe_fail("folder Work");
+            return;
+        }
+        self.chatlist.select_folder(0);
+        self.ui_state.borrow_mut().folder_id = 0;
 
         self.settings.update(|settings| {
             settings.ai.enabled = true;
@@ -3007,6 +4342,36 @@ impl ShellInner {
             probe_fail("find Marta");
             return;
         };
+        probe_step("row context menu");
+        if !self.chatlist.open_row_menu(marta)
+            || !poll_until(1000, || self.chatlist.row_menu_open()).await
+        {
+            probe_fail("row context menu");
+            return;
+        }
+        self.chatlist.dismiss_popovers();
+
+        let group = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find_map(|(id, title)| (title == "Arch Linux ARM").then_some(id));
+        let Some(group) = group else {
+            probe_fail("find group");
+            return;
+        };
+        self.clone().open_chat(group);
+        probe_step("group sender names");
+        if !poll_until(3500, || {
+            self.open_chat.get() == Some(group)
+                && !self.messages.is_loading()
+                && self.messages.has_sender_name()
+        })
+        .await
+        {
+            probe_fail("group sender names");
+            return;
+        }
         self.clone().open_chat(marta);
         probe_step("open Marta");
         if !poll_until(3000, || {
@@ -3017,6 +4382,185 @@ impl ShellInner {
         .await
         {
             probe_fail("open Marta");
+            return;
+        }
+        if self.messages.has_sender_name() {
+            probe_fail("1:1 sender names");
+            return;
+        }
+        probe_step("header more menu");
+        self.messages.open_header_menu();
+        if !poll_until(1000, || self.messages.header_menu_open()).await {
+            probe_fail("header more menu");
+            return;
+        }
+        self.messages.dismiss_header_menu();
+
+        probe_step("per-chat drafts");
+        self.messages.set_composer_text("Marta local draft");
+        self.composer_draft_changed();
+        let deni_for_draft = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find_map(|(id, title)| (title == "Deni").then_some(id));
+        let Some(deni_for_draft) = deni_for_draft else {
+            probe_fail("find Deni for draft");
+            return;
+        };
+        self.clone().open_chat(deni_for_draft);
+        if !poll_until(3500, || {
+            self.open_chat.get() == Some(deni_for_draft)
+                && !self.messages.is_loading()
+                && self.messages.composer_text() == "let me check"
+                && self.messages.header_title() == "Deni"
+                && self.chatlist.selected() == Some(deni_for_draft)
+        })
+        .await
+        {
+            probe_fail("server draft restore");
+            return;
+        }
+        self.clone().open_chat(marta);
+        if !poll_until(3500, || {
+            self.open_chat.get() == Some(marta)
+                && !self.messages.is_loading()
+                && self.messages.composer_text() == "Marta local draft"
+                && self.messages.header_title() == "Marta"
+                && self.chatlist.selected() == Some(marta)
+        })
+        .await
+        {
+            probe_fail("local draft restore");
+            return;
+        }
+        self.messages.set_composer_text("");
+        self.composer_draft_changed();
+
+        let Some(window) = self.window() else {
+            probe_fail("sidebar resize window");
+            return;
+        };
+        let auto_resize_state = {
+            let state = self.ui_state.borrow();
+            (
+                state.sidebar_width,
+                state.sidebar_collapsed,
+                state.folder_id,
+            )
+        };
+        probe_step("sidebar auto-collapse 600");
+        let resize = self.resize_window_for_probe(&window, 600).await;
+        if !poll_until(1000, || {
+            self.effective_sidebar_collapsed.get()
+                && self.paned.position() == 64
+                && sidebar_position_fits(600, self.paned.position())
+                && !self.chatlist.folder_tabs_visible()
+                && {
+                    let state = self.ui_state.borrow();
+                    (
+                        state.sidebar_width,
+                        state.sidebar_collapsed,
+                        state.folder_id,
+                    ) == auto_resize_state
+                }
+        })
+        .await
+        {
+            probe_fail("sidebar auto-collapse 600");
+            return;
+        }
+        if !poll_until(1500, || {
+            let (bubble, _) = self.messages.bubble_metrics();
+            bubble > 0 && resize.pane_width > 0 && bubble <= probe_bubble_limit(resize.pane_width)
+        })
+        .await
+        {
+            probe_fail("bubble width clamp");
+            return;
+        }
+        self.resize_window_for_probe(&window, 1100).await;
+        if !poll_until(1000, || {
+            !self.effective_sidebar_collapsed.get()
+                && self.paned.position() == clamp_sidebar_width(auto_resize_state.0, 1100)
+                && sidebar_position_fits(1100, self.paned.position())
+                && self.chatlist.folder_tabs_visible()
+                && {
+                    let state = self.ui_state.borrow();
+                    (
+                        state.sidebar_width,
+                        state.sidebar_collapsed,
+                        state.folder_id,
+                    ) == auto_resize_state
+                }
+        })
+        .await
+        {
+            probe_fail("sidebar restore 1100");
+            return;
+        }
+        probe_step("sidebar boundary 639 to 640");
+        self.resize_window_for_probe(&window, 639).await;
+        if !poll_until(1000, || {
+            self.effective_sidebar_collapsed.get()
+                && self.paned.position() == 64
+                && sidebar_position_fits(639, self.paned.position())
+                && !self.chatlist.folder_tabs_visible()
+        })
+        .await
+        {
+            probe_fail("sidebar boundary 639");
+            return;
+        }
+        self.resize_window_for_probe(&window, 640).await;
+        if !poll_until(1000, || {
+            !self.effective_sidebar_collapsed.get()
+                && self.paned.position() == clamp_sidebar_width(auto_resize_state.0, 640)
+                && sidebar_position_fits(640, self.paned.position())
+                && self.chatlist.folder_tabs_visible()
+                && {
+                    let state = self.ui_state.borrow();
+                    (
+                        state.sidebar_width,
+                        state.sidebar_collapsed,
+                        state.folder_id,
+                    ) == auto_resize_state
+                }
+        })
+        .await
+        {
+            probe_fail("sidebar boundary 640");
+            return;
+        }
+        probe_step("explicit collapse survives narrow resize");
+        self.toggle_sidebar();
+        self.resize_window_for_probe(&window, 600).await;
+        self.resize_window_for_probe(&window, 1100).await;
+        if !self.effective_sidebar_collapsed.get()
+            || !self.ui_state.borrow().sidebar_collapsed
+            || self.ui_state.borrow().sidebar_width != auto_resize_state.0
+            || self.ui_state.borrow().folder_id != auto_resize_state.2
+            || self.paned.position() != 64
+            || !sidebar_position_fits(1100, self.paned.position())
+            || self.chatlist.folder_tabs_visible()
+        {
+            probe_fail("explicit collapse survives narrow resize");
+            return;
+        }
+        self.toggle_sidebar();
+        self.resize_window_for_probe(&window, 1100).await;
+        if !poll_until(1000, || {
+            !self.effective_sidebar_collapsed.get()
+                && !self.ui_state.borrow().sidebar_collapsed
+                && self.ui_state.borrow().sidebar_width == auto_resize_state.0
+                && self.ui_state.borrow().folder_id == auto_resize_state.2
+                && self.paned.position() == clamp_sidebar_width(auto_resize_state.0, 1100)
+                && sidebar_position_fits(1100, self.paned.position())
+                && self.chatlist.folder_tabs_visible()
+        })
+        .await
+        {
+            probe_fail("restore expanded window allocation");
             return;
         }
         probe_step("pagination ready");
@@ -3827,11 +5371,94 @@ impl Drop for ShellInner {
         if let Some(source) = self.theme_switch_timeout.borrow_mut().take() {
             source.remove();
         }
+        if let Some(source) = self.search_timeout.borrow_mut().take() {
+            source.remove();
+        }
+        if let Some(source) = self.dialogs_reload_timeout.borrow_mut().take() {
+            source.remove();
+        }
+        if let Some(source) = self.ui_save_timeout.borrow_mut().take() {
+            source.remove();
+            if let Err(error) = self.ui_state.borrow().save() {
+                eprintln!("ui-state: {error}");
+            }
+        }
+        if let Some(tick) = self.layout_tick.borrow_mut().take() {
+            tick.remove();
+        }
+        self.main_menu.dismiss();
+        self.chatlist.dismiss_popovers();
+        self.messages.dismiss_owned_popovers();
     }
 }
 
 fn clock_text() -> String {
     Local::now().format("%H:%M:%S").to_string()
+}
+
+/// `main.rs` gives smoke runs a private state file. The probe contract also
+/// supports an explicitly pre-seeded state file, so retain just the
+/// shell-owned fields from the process's initial environment when both are
+/// present. `/proc/self/environ` is the initial environment on Linux and is
+/// unaffected by the smoke override performed before GTK starts.
+fn load_shell_ui_state(probe: bool) -> (UiState, Option<(i32, bool, i32)>) {
+    let mut state = UiState::load();
+    if !probe {
+        return (state, None);
+    }
+    let Some(path) = initial_environment_path("OMG_UISTATE_PATH") else {
+        return (state, None);
+    };
+    let external = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<UiState>(&text).ok());
+    let Some(mut external) = external else {
+        return (state, None);
+    };
+    external.sidebar_width = external.sidebar_width.clamp(220, 2000);
+    state.sidebar_width = external.sidebar_width;
+    state.sidebar_collapsed = external.sidebar_collapsed;
+    state.folder_id = external.folder_id;
+    let restored = Some((
+        state.sidebar_width,
+        state.sidebar_collapsed,
+        state.folder_id,
+    ));
+    (state, restored)
+}
+
+fn initial_environment_path(name: &str) -> Option<PathBuf> {
+    let environment = std::fs::read("/proc/self/environ").ok()?;
+    let prefix = format!("{name}=").into_bytes();
+    environment
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(prefix.as_slice()))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn environment_listed(variable: &str, value: &str) -> bool {
+    std::env::var(variable)
+        .is_ok_and(|list| list.split(',').any(|candidate| candidate.trim() == value))
+}
+
+pub fn clamp_sidebar_width(saved_width: i32, window_width: i32) -> i32 {
+    let maximum = (((window_width.max(0) as f64) * 0.45).floor() as i32).max(220);
+    saved_width.clamp(220, maximum)
+}
+
+#[cfg(test)]
+mod wave5_tests {
+    use super::clamp_sidebar_width;
+
+    #[test]
+    fn sidebar_width_is_clamped_to_minimum_and_window_fraction() {
+        assert_eq!(clamp_sidebar_width(300, 1100), 300);
+        assert_eq!(clamp_sidebar_width(700, 1000), 450);
+        assert_eq!(clamp_sidebar_width(100, 1000), 220);
+        assert_eq!(clamp_sidebar_width(300, 400), 220);
+    }
 }
 
 /// Matches `\d\d:\d\d:\d\d` (with an optional " edited" suffix).
@@ -3951,6 +5578,29 @@ fn virtual_last_id(stores: &RefCell<HashMap<i64, VirtualStore>>, chat_id: i64) -
         .and_then(|store| store.msgs.last())
         .map(|message| message.id)
         .unwrap_or(i32::MIN)
+}
+
+struct ProbeResize {
+    pane_width: i32,
+}
+
+fn sidebar_position_fits(window_width: i32, position: i32) -> bool {
+    position <= (f64::from(window_width) * 0.45).floor() as i32
+}
+
+fn probe_bubble_limit(pane_width: i32) -> i32 {
+    ((f64::from(pane_width) * 0.66).floor() as i32)
+        .min(520)
+        .max(1)
+}
+
+async fn wait_for_frame(widget: &gtk::Widget) {
+    let (sender, receiver) = async_channel::bounded(1);
+    widget.add_tick_callback(move |_, _| {
+        let _ = sender.try_send(());
+        glib::ControlFlow::Break
+    });
+    let _ = receiver.recv().await;
 }
 
 async fn poll_until<F>(timeout_ms: u64, condition: F) -> bool

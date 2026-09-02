@@ -1,8 +1,11 @@
 pub mod anim;
 pub mod auth;
+pub mod avatar;
 pub mod chatlist;
+pub mod icons;
 pub mod keys;
 pub mod keys_view;
+pub mod menus;
 pub mod messages;
 pub mod settings_view;
 pub mod shell;
