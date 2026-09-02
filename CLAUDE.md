@@ -6,7 +6,7 @@
 - Build: `cargo build`
 - Run: `cargo run` (real Telegram) / `cargo run -- --smoke` (offline mock data, no login)
 - Test: `cargo test`
-- Smoke check: `cargo run -- --smoke --probe` (opens themed window, auto-quits after 2s, exit 0 = pass)
+- Smoke check: `cargo run -- --smoke --probe` (scripted traversal of every feature on mock data — auth, chats, media, settings, anti-delete, virtual chats, animations — quits on success; exit 0 = pass, 45s failsafe)
 - `OMG_MOCK_AUTH=1 cargo run -- --smoke` walks the login screens offline (code `2fa` routes via the password screen)
 - HARD acceptance gate for any UI change (learned the hard way, 2026-09-02): `G_DEBUG=fatal-criticals ./target/debug/omarchygram --smoke --probe` ×6 + the `OMG_MOCK_AUTH=1` variant ×3 + `OMG_MOCK_LATENCY_MS=400` ×1 must all exit 0. A plain probe exits 0 even when GTK prints CRITICALs. `OMG_PROBE_TRACE=1` prints each traversal step (bisects crashes that have no Rust frame); `coredumpctl -1 debug` gives the backtrace.
 
