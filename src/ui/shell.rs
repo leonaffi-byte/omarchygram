@@ -18,6 +18,7 @@ use crate::os::{self, OsPolicy, Parsed};
 use crate::settings::{Settings, SettingsStore};
 use crate::tg::{AuthState, BackendFlags, Event, MediaKind, Msg, SETUP_HELP, Tg};
 
+use super::anim::{Effects, RadioGroup, apply_full_phosphor, group_ids, select_radio};
 use super::auth::{AuthAction, AuthView};
 use super::chatlist::{ChatList, UnreadUpdate};
 use super::messages::{MediaState, MessageAction, MessagesView};
@@ -86,10 +87,14 @@ struct ShellInner {
     auth: AuthView,
     chatlist: ChatList,
     messages: MessagesView,
+    effects: Rc<Effects>,
+    overlay: gtk::Overlay,
     switcher: Switcher,
     settings: Rc<SettingsStore>,
     settings_view: SettingsView,
     clock_source: RefCell<Option<glib::SourceId>>,
+    theme_monitor: RefCell<Option<gio::FileMonitor>>,
+    theme_switch_timeout: RefCell<Option<glib::SourceId>>,
     dialogs_error_box: gtk::Box,
     dialogs_error: gtk::Label,
     epoch: Cell<u64>,
@@ -109,6 +114,7 @@ struct ShellInner {
     aux: RefCell<AuxState>,
     transcription_active: RefCell<HashSet<(i64, i32)>>,
     recent_real_chats: RefCell<Vec<i64>>,
+    recent_incoming: RefCell<HashMap<i64, DateTime<Local>>>,
     flags_initialized: Cell<bool>,
     desired_flags: Cell<BackendFlags>,
     anti_reload_pending: Cell<bool>,
@@ -123,12 +129,13 @@ struct ShellInner {
 impl Shell {
     pub fn new(tg: Tg, probe: bool) -> Shell {
         let auth = AuthView::new();
-        let chatlist = ChatList::new();
-        let messages = MessagesView::new();
-        let switcher = Switcher::new();
         let settings = SettingsStore::new();
+        let effects = Effects::new(settings.clone());
+        let chatlist = ChatList::new(effects.clone());
+        let messages = MessagesView::new(effects.clone());
+        let switcher = Switcher::new();
         let last_applied_settings = settings.get();
-        let settings_view = SettingsView::new(settings.clone());
+        let settings_view = SettingsView::new(settings.clone(), effects.clone());
         let local = LocalServices::spawn();
 
         let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -162,16 +169,22 @@ impl Shell {
         stack.add_named(&settings_view.widget, Some("settings"));
         stack.set_visible_child_name("auth");
 
+        // Effects live in a nested overlay. The switcher belongs to the outer
+        // overlay, so atmosphere/launch layers can never paint over Ctrl+K.
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&stack));
-        overlay.add_overlay(&switcher.widget);
         overlay.set_hexpand(true);
         overlay.set_vexpand(true);
+        let shell_overlay = gtk::Overlay::new();
+        shell_overlay.set_child(Some(&overlay));
+        shell_overlay.add_overlay(&switcher.widget);
+        shell_overlay.set_hexpand(true);
+        shell_overlay.set_vexpand(true);
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.set_hexpand(true);
         widget.set_vexpand(true);
-        widget.append(&overlay);
+        widget.append(&shell_overlay);
 
         let mut virtual_stores = HashMap::new();
         virtual_stores.insert(ASSISTANT_CHAT, VirtualStore::default());
@@ -185,10 +198,14 @@ impl Shell {
             auth,
             chatlist,
             messages,
+            effects,
+            overlay,
             switcher,
             settings,
             settings_view,
             clock_source: RefCell::new(None),
+            theme_monitor: RefCell::new(None),
+            theme_switch_timeout: RefCell::new(None),
             dialogs_error_box,
             dialogs_error,
             epoch: Cell::new(0),
@@ -208,6 +225,7 @@ impl Shell {
             aux: RefCell::new(AuxState::default()),
             transcription_active: RefCell::new(HashSet::new()),
             recent_real_chats: RefCell::new(Vec::new()),
+            recent_incoming: RefCell::new(HashMap::new()),
             flags_initialized: Cell::new(false),
             desired_flags: Cell::new(BackendFlags::default()),
             anti_reload_pending: Cell::new(false),
@@ -282,6 +300,17 @@ impl ShellInner {
             this.settings.on_change(move |settings| {
                 if let Some(this) = weak.upgrade() {
                     this.apply_settings(settings);
+                }
+            });
+        }
+        if let Some(gtk_settings) = gtk::Settings::default() {
+            let weak = Rc::downgrade(this);
+            gtk_settings.connect_gtk_enable_animations_notify(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    let settings = this.settings.get();
+                    this.update_clock(settings.header_clock || settings.animation("liveclock"));
+                    this.messages.refresh_animations();
+                    this.chatlist.refresh_animations();
                 }
             });
         }
@@ -392,6 +421,13 @@ impl ShellInner {
         }
         self.stack.set_visible_child_name("main");
         self.install_window_hook();
+        self.install_theme_switch_hook();
+        if let Some(window) = self.window() {
+            self.effects.bind(&window, &self.overlay);
+            self.effects
+                .window_focus(window.upcast_ref(), window.is_active());
+            self.effects.launched(&self.overlay);
+        }
         self.apply_settings(&self.settings.get());
         self.spawn_event_loop();
         self.load_dialogs();
@@ -413,7 +449,10 @@ impl ShellInner {
         self.messages.set_ghost(settings.ghost_mode);
         self.messages.set_edit_history(settings.edit_history);
         self.messages.set_ai_enabled(settings.ai.enabled);
-        self.update_clock(settings.header_clock);
+        self.update_clock(settings.header_clock || settings.animation("liveclock"));
+        self.effects.sync();
+        self.messages.refresh_animations();
+        self.chatlist.refresh_animations();
         self.refresh_virtual_rows(settings);
         let disabled_open = match self.open_chat.get() {
             Some(ASSISTANT_CHAT) => !settings.ai.enabled,
@@ -649,10 +688,12 @@ impl ShellInner {
         };
         let weak = Rc::downgrade(self);
         window.connect_is_active_notify(move |window| {
+            let Some(this) = weak.upgrade() else { return };
+            this.effects
+                .window_focus(window.upcast_ref(), window.is_active());
             if !window.is_active() {
                 return;
             }
-            let Some(this) = weak.upgrade() else { return };
             let Some(chat_id) = this.open_chat.get() else {
                 return;
             };
@@ -665,6 +706,42 @@ impl ShellInner {
                 this.queue_mark_read(chat_id, latest, epoch);
             }
         });
+    }
+
+    fn install_theme_switch_hook(self: &Rc<Self>) {
+        if self.theme_monitor.borrow().is_some() {
+            return;
+        }
+        let state_dir = dirs::state_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")));
+        let Some(path) =
+            state_dir.map(|state| state.join("omarchy").join("current").join("theme.name"))
+        else {
+            return;
+        };
+        if path.parent().is_none_or(|parent| !parent.exists()) {
+            return;
+        }
+        let Ok(monitor) = gio::File::for_path(path)
+            .monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+        else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        monitor.connect_changed(move |_, _, _, _| {
+            let Some(this) = weak.upgrade() else { return };
+            if let Some(source) = this.theme_switch_timeout.borrow_mut().take() {
+                source.remove();
+            }
+            let weak = Rc::downgrade(&this);
+            let source = glib::timeout_add_local_once(Duration::from_millis(220), move || {
+                let Some(this) = weak.upgrade() else { return };
+                this.theme_switch_timeout.borrow_mut().take();
+                this.effects.theme_switched(&this.overlay);
+            });
+            *this.theme_switch_timeout.borrow_mut() = Some(source);
+        });
+        *self.theme_monitor.borrow_mut() = Some(monitor);
     }
 
     fn handle_event(self: &Rc<Self>, event: Event) {
@@ -718,15 +795,26 @@ impl ShellInner {
                         .messages
                         .last_message()
                         .is_some_and(|message| msg_ids.contains(&message.id));
+                    let next_last = self.messages.last_excluding(&msg_ids);
+                    let epoch = self.epoch.get();
                     for msg_id in &msg_ids {
-                        self.messages.remove(*msg_id);
+                        if self.messages.animate_deleted(*msg_id) {
+                            let this = self.clone();
+                            let msg_id = *msg_id;
+                            glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                                if this.is_current(chat_id, epoch) {
+                                    this.messages.remove(msg_id);
+                                }
+                            });
+                        } else {
+                            self.messages.remove(*msg_id);
+                        }
                     }
                     if tracked_was_deleted || store_last_was_deleted {
-                        let next_last = self.messages.last_message();
                         let reconciled = if let Some(deleted_id) =
                             tracked_last.filter(|tracked| msg_ids.contains(tracked))
                         {
-                            self.reconcile_deleted_last(chat_id, deleted_id, next_last)
+                            self.reconcile_deleted_last(chat_id, deleted_id, next_last.clone())
                         } else {
                             let mut last_by_chat = self.last_by_chat.borrow_mut();
                             if let Some(message) = next_last {
@@ -790,6 +878,11 @@ impl ShellInner {
         // Outgoing = sent from the user's own other device: show it (the store
         // dedupes against local sends by id), but never notify or count unread.
         let own = message.outgoing;
+        if !own && !message.deleted {
+            self.recent_incoming
+                .borrow_mut()
+                .insert(message.chat_id, message.ts);
+        }
         if !message.deleted {
             self.remember_last(&message);
             self.chatlist.upsert(
@@ -807,9 +900,15 @@ impl ShellInner {
         if is_open {
             let inserted = self.messages.merge_event(message.clone());
             self.post_render(inserted);
+            if !own && !message.deleted {
+                self.messages.mark_recent_incoming();
+            }
             if read_triggered && !own && !message.deleted {
                 self.queue_mark_read(message.chat_id, message.id, self.epoch.get());
             }
+        }
+        if !own && !message.deleted && !is_open {
+            self.chatlist.mention(message.chat_id);
         }
         if !own && !message.deleted && (!active || !is_open) {
             self.notify(&message);
@@ -864,6 +963,14 @@ impl ShellInner {
         }
         let title = self.title_for(chat_id);
         self.messages.reset_chat(chat_id, &title, epoch);
+        let recent = self
+            .recent_incoming
+            .borrow()
+            .get(&chat_id)
+            .is_some_and(|time| Local::now().signed_duration_since(*time).num_minutes() < 5);
+        if recent {
+            self.messages.mark_recent_incoming();
+        }
         self.start_initial_load(chat_id, epoch);
     }
 
@@ -906,6 +1013,7 @@ impl ShellInner {
             self.messages
                 .set_monospace(msg_id, mono_ids.contains(&msg_id));
         }
+        self.messages.animate_chat_switched();
         self.update_virtual_status(chat_id);
         self.refresh_virtual_rows(&settings);
     }
@@ -944,6 +1052,7 @@ impl ShellInner {
                     }
                     let inserted = self.messages.finish_initial(messages);
                     self.post_render(inserted);
+                    self.messages.animate_chat_switched();
                     if self.window_is_active() {
                         let latest = self
                             .messages
@@ -1619,9 +1728,13 @@ impl ShellInner {
         self.composer_operation.set(true);
         self.messages.clear_error();
         self.messages.set_busy(true);
+        self.messages.start_send_feedback();
+        let send_button = self.messages.send_button();
+        let charge = self.effects.send_pressed(send_button.upcast_ref());
         if let Some(msg_id) = edit_id {
             let was_last = self.messages.is_last(msg_id);
             glib::MainContext::default().spawn_local(async move {
+                charge.await;
                 let result = self.tg.edit_text(chat_id, msg_id, &text).await;
                 self.composer_operation.set(false);
                 match result {
@@ -1650,15 +1763,18 @@ impl ShellInner {
                         eprintln!("edit_text({chat_id}, {msg_id}): {error}");
                         if self.is_current(chat_id, epoch) {
                             self.messages.show_error(&error);
+                            self.effects.error_flash(&self.overlay);
                         }
                     }
                 }
+                self.messages.stop_send_feedback();
                 self.messages.set_busy(false);
             });
             return;
         }
 
         glib::MainContext::default().spawn_local(async move {
+            charge.await;
             let result = self.tg.send_text(chat_id, &text, reply_to).await;
             self.composer_operation.set(false);
             match result {
@@ -1686,9 +1802,11 @@ impl ShellInner {
                     eprintln!("send_text({chat_id}): {error}");
                     if self.is_current(chat_id, epoch) {
                         self.messages.show_error(&error);
+                        self.effects.error_flash(&self.overlay);
                     }
                 }
             }
+            self.messages.stop_send_feedback();
             self.messages.set_busy(false);
         });
     }
@@ -1794,6 +1912,7 @@ impl ShellInner {
                 eprintln!("send_file({chat_id}): {error}");
                 if self.is_current(chat_id, epoch) {
                     self.messages.show_error(&error);
+                    self.effects.error_flash(&self.overlay);
                 }
             }
         }
@@ -1833,6 +1952,11 @@ impl ShellInner {
                             time,
                             UnreadUpdate::Delta(0),
                         );
+                    }
+                    if self.is_current(chat_id, epoch) {
+                        if self.messages.animate_deleted(msg_id) {
+                            glib::timeout_future(Duration::from_millis(500)).await;
+                        }
                     }
                     if self.is_current(chat_id, epoch) {
                         self.messages.remove(msg_id);
@@ -3157,6 +3281,61 @@ impl ShellInner {
             return;
         }
 
+        // Wave 4: exercise every radio alternative, then run the full
+        // phosphor hook traversal and prove all registered ticks stop when
+        // animations are switched off again.
+        for group in [RadioGroup::Entry, RadioGroup::Send, RadioGroup::Switch] {
+            for id in group_ids(group) {
+                self.settings
+                    .update(|settings| select_radio(settings, id, group_ids(group)));
+            }
+        }
+        self.settings.update(apply_full_phosphor);
+        glib::timeout_future(Duration::from_millis(200)).await;
+
+        self.clone().open_chat(marta);
+        probe_step("animation open chat");
+        if !poll_until(2500, || {
+            self.open_chat.get() == Some(marta) && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("animation open chat");
+            return;
+        }
+        glib::timeout_future(Duration::from_millis(200)).await;
+
+        self.messages.set_composer_text("hi");
+        self.clone().submit_composer();
+        probe_step("animation receive");
+        if !poll_until(2500, || self.messages.find_outgoing_text("hi").is_some()).await {
+            probe_fail("animation send");
+            return;
+        }
+        self.clone().open_chat(deni);
+        glib::timeout_future(Duration::from_millis(200)).await;
+        self.clone().open_chat(marta);
+        glib::timeout_future(Duration::from_millis(200)).await;
+        self.clone().open_chat(deni);
+        probe_step("animation mention");
+        if !poll_until(3500, || self.chatlist.unread(marta) > 0).await {
+            probe_fail("animation mention");
+            return;
+        }
+        glib::timeout_future(Duration::from_millis(200)).await;
+
+        self.effects.theme_switched(&self.overlay);
+        glib::timeout_future(Duration::from_millis(200)).await;
+        self.effects.launched(&self.overlay);
+        glib::timeout_future(Duration::from_millis(200)).await;
+
+        self.settings.update(super::anim::apply_purist);
+        glib::timeout_future(Duration::from_millis(200)).await;
+        if self.effects.live_tick_count() != 0 {
+            probe_fail("animation tick cleanup");
+            return;
+        }
+
         let Some(window) = self.window() else {
             probe_fail("find application window");
             return;
@@ -3172,6 +3351,9 @@ impl ShellInner {
 impl Drop for ShellInner {
     fn drop(&mut self) {
         if let Some(source) = self.clock_source.borrow_mut().take() {
+            source.remove();
+        }
+        if let Some(source) = self.theme_switch_timeout.borrow_mut().take() {
             source.remove();
         }
     }

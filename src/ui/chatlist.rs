@@ -3,10 +3,13 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::{DateTime, Local};
+use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
 use crate::tg::ChatSummary;
+
+use super::anim::Effects;
 
 #[derive(Clone, Copy, Debug)]
 pub enum UnreadUpdate {
@@ -34,10 +37,14 @@ pub struct ChatList {
     virtual_order: Rc<RefCell<Vec<i64>>>,
     selected: Rc<Cell<Option<i64>>>,
     on_open: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
+    effects: Rc<Effects>,
+    overlay: gtk::Overlay,
+    selection_bar: gtk::Box,
+    unread_comet: gtk::Box,
 }
 
 impl ChatList {
-    pub fn new() -> Self {
+    pub fn new(effects: Rc<Effects>) -> Self {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.add_css_class("omg-sidebar");
         widget.set_size_request(280, -1);
@@ -52,13 +59,70 @@ impl ChatList {
         scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         scroll.set_child(Some(&list));
         scroll.set_vexpand(true);
-        widget.append(&scroll);
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&scroll));
+        overlay.set_hexpand(true);
+        overlay.set_vexpand(true);
+        let selection_bar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        selection_bar.add_css_class("omg-selection-bar");
+        selection_bar.set_halign(gtk::Align::Start);
+        selection_bar.set_valign(gtk::Align::Start);
+        selection_bar.set_size_request(2, 48);
+        selection_bar.set_can_target(false);
+        selection_bar.set_visible(false);
+        overlay.add_overlay(&selection_bar);
+        let unread_comet = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        unread_comet.add_css_class("omg-unread-comet");
+        unread_comet.set_halign(gtk::Align::Start);
+        unread_comet.set_valign(gtk::Align::Start);
+        unread_comet.set_margin_start(4);
+        unread_comet.set_size_request(3, 12);
+        unread_comet.set_can_target(false);
+        unread_comet.set_visible(false);
+        overlay.add_overlay(&unread_comet);
+        widget.append(&overlay);
 
         let rows = Rc::new(RefCell::new(HashMap::<i64, ChatRow>::new()));
         let order = Rc::new(RefCell::new(Vec::<i64>::new()));
         let virtual_order = Rc::new(RefCell::new(Vec::<i64>::new()));
         let selected = Rc::new(Cell::new(None));
         let on_open: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>> = Rc::new(RefCell::new(None));
+
+        {
+            let effects = effects.clone();
+            let selected = selected.clone();
+            let rows = rows.clone();
+            let selection_bar = selection_bar.clone();
+            let overlay = overlay.clone();
+            scroll.vadjustment().connect_value_changed(move |_| {
+                sync_selection_indicator(&effects, &selected, &rows, &selection_bar, &overlay);
+            });
+        }
+        {
+            let effects = effects.clone();
+            let selected = selected.clone();
+            let rows = rows.clone();
+            let selection_bar = selection_bar.clone();
+            let overlay_weak = overlay.downgrade();
+            overlay.connect_map(move |_| {
+                let effects = effects.clone();
+                let selected = selected.clone();
+                let rows = rows.clone();
+                let selection_bar = selection_bar.clone();
+                let overlay_weak = overlay_weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(overlay) = overlay_weak.upgrade() {
+                        sync_selection_indicator(
+                            &effects,
+                            &selected,
+                            &rows,
+                            &selection_bar,
+                            &overlay,
+                        );
+                    }
+                });
+            });
+        }
 
         {
             let rows = rows.clone();
@@ -73,7 +137,6 @@ impl ChatList {
                 if selected.get() == Some(id) {
                     return;
                 }
-                selected.set(Some(id));
                 if let Some(callback) = on_open.borrow().as_ref().cloned() {
                     callback(id);
                 }
@@ -88,6 +151,10 @@ impl ChatList {
             virtual_order,
             selected,
             on_open,
+            effects,
+            overlay,
+            selection_bar,
+            unread_comet,
         }
     }
 
@@ -130,6 +197,7 @@ impl ChatList {
         for chat_id in old.into_iter().filter(|id| !wanted.contains(id)) {
             let removed = self.rows.borrow_mut().remove(&chat_id);
             if let Some(row) = removed {
+                self.move_focus_before_removal(&row.widget);
                 self.list.remove(&row.widget);
             }
             self.order.borrow_mut().retain(|id| *id != chat_id);
@@ -230,8 +298,22 @@ impl ChatList {
         let Some(row) = self.rows.borrow().get(&chat_id).cloned() else {
             return;
         };
+        let from = self.selected.get().and_then(|selected| {
+            self.rows
+                .borrow()
+                .get(&selected)
+                .map(|row| row.widget.clone().upcast::<gtk::Widget>())
+        });
+        let to: gtk::Widget = row.widget.clone().upcast();
         self.selected.set(Some(chat_id));
         self.list.select_row(Some(&row.widget));
+        self.effects.sidebar_selection_moved(from.as_ref(), &to);
+        self.effects.move_sidebar_indicator(
+            self.selection_bar.upcast_ref(),
+            self.overlay.upcast_ref(),
+            from.as_ref(),
+            &to,
+        );
     }
 
     pub fn selected(&self) -> Option<i64> {
@@ -248,6 +330,36 @@ impl ChatList {
                     .map(|row| (*id, row.title_text.borrow().clone()))
             })
             .collect()
+    }
+
+    pub fn mention(&self, chat_id: i64) {
+        let row = self
+            .rows
+            .borrow()
+            .get(&chat_id)
+            .map(|row| row.widget.clone().upcast::<gtk::Widget>());
+        if let Some(row) = row {
+            self.effects.mention(&row);
+            self.effects.unread_comet(
+                self.unread_comet.upcast_ref(),
+                self.overlay.upcast_ref(),
+                &row,
+            );
+        }
+    }
+
+    pub fn refresh_animations(&self) {
+        sync_selection_indicator(
+            &self.effects,
+            &self.selected,
+            &self.rows,
+            &self.selection_bar,
+            &self.overlay,
+        );
+        if !self.effects.on("unreadcomet") {
+            self.unread_comet.set_visible(false);
+            self.unread_comet.set_opacity(1.0);
+        }
     }
 
     fn select_offset(&self, offset: isize) {
@@ -311,7 +423,11 @@ impl ChatList {
         let unread = gtk::Label::new(None);
         unread.add_css_class("omg-unread");
         unread.set_visible(false);
-        second.append(&unread);
+        let unread_overflow = gtk::Overlay::new();
+        unread_overflow.add_css_class("omg-badge-overflow");
+        unread_overflow.set_overflow(gtk::Overflow::Hidden);
+        unread_overflow.set_child(Some(&unread));
+        second.append(&unread_overflow);
 
         row_widget.set_child(Some(&outer));
         self.list.append(&row_widget);
@@ -354,6 +470,7 @@ impl ChatList {
         }
         row.preview.set_label(preview);
         row.time.set_label(&format_time(time));
+        let old_count = row.unread_count.get();
         let count = match unread {
             UnreadUpdate::Set(_) if row.unread_is_local.get() => row.unread_count.get(),
             UnreadUpdate::Set(value) => value,
@@ -363,13 +480,23 @@ impl ChatList {
         row.unread_count.set(count);
         row.unread.set_label(&count.to_string());
         row.unread.set_visible(count > 0);
+        self.effects
+            .badge_changed(row.unread.upcast_ref(), old_count, count);
     }
 
     fn reorder_widgets(&self) {
         let selected = self.selected.get();
         let rows = self.rows.borrow();
+        let focused = self.widget.root().and_then(|root| root.focus());
+        let focused_chat = focused.as_ref().and_then(|focus| {
+            rows.iter().find_map(|(&chat_id, row)| {
+                let widget: gtk::Widget = row.widget.clone().upcast();
+                (focus == &widget || focus.is_ancestor(&widget)).then_some(chat_id)
+            })
+        });
         for (index, chat_id) in self.order.borrow().iter().enumerate() {
             if let Some(row) = rows.get(chat_id) {
+                self.move_focus_before_removal(&row.widget);
                 self.list.remove(&row.widget);
                 self.list.insert(&row.widget, index as i32);
             }
@@ -379,7 +506,47 @@ impl ChatList {
                 self.list.select_row(Some(&row.widget));
             }
         }
+        if let Some(chat_id) = focused_chat {
+            if let Some(row) = rows.get(&chat_id) {
+                row.widget.grab_focus();
+            }
+        }
+        drop(rows);
+        self.refresh_animations();
     }
+
+    fn move_focus_before_removal(&self, subtree: &impl IsA<gtk::Widget>) {
+        let Some(root) = self.widget.root() else {
+            return;
+        };
+        let Some(focus) = root.focus() else {
+            return;
+        };
+        let subtree = subtree.as_ref();
+        if focus != subtree.clone() && !focus.is_ancestor(subtree) {
+            return;
+        }
+        root.set_focus(None::<&gtk::Widget>);
+    }
+}
+
+fn sync_selection_indicator(
+    effects: &Effects,
+    selected: &Cell<Option<i64>>,
+    rows: &RefCell<HashMap<i64, ChatRow>>,
+    selection_bar: &gtk::Box,
+    overlay: &gtk::Overlay,
+) {
+    let selected_row = selected.get().and_then(|chat_id| {
+        rows.borrow()
+            .get(&chat_id)
+            .map(|row| row.widget.clone().upcast::<gtk::Widget>())
+    });
+    effects.sync_sidebar_indicator(
+        selection_bar.upcast_ref(),
+        overlay.upcast_ref(),
+        selected_row.as_ref(),
+    );
 }
 
 fn format_time(time: Option<DateTime<Local>>) -> String {
