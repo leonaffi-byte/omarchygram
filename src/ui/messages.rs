@@ -19,6 +19,7 @@ use super::avatar::Avatar;
 use super::icons;
 use super::markup;
 use super::menus::{self, ChatAction, PopoverSlot};
+use super::recorder::{RecorderBar, RecorderUiAction};
 use super::virtual_chat::is_virtual;
 
 mod bubble_clamp_imp {
@@ -239,6 +240,10 @@ fn bubble_width_limit(parent_width: Option<i32>) -> i32 {
 pub enum MessageAction {
     Submit,
     Mic,
+    Stickers,
+    RecorderCancel,
+    RecorderSend,
+    RecorderRetry,
     Attach,
     DraftChanged,
     DraftRetry,
@@ -256,6 +261,11 @@ pub enum MessageAction {
     Edit(i32),
     EditHistory(i32),
     Forward(i32),
+    Select(i32),
+    SelectionForward,
+    SelectionDelete,
+    SelectionCopy,
+    SelectionCancel,
     Reaction {
         msg_id: i32,
         emoji: Option<String>,
@@ -295,6 +305,7 @@ pub enum MediaState {
 #[derive(Clone)]
 struct MessageRow {
     widget: BubbleClamp,
+    selection: gtk::CheckButton,
     forwarded: gtk::Label,
     sender: gtk::Label,
     quote: gtk::Label,
@@ -335,6 +346,35 @@ struct MessageStore {
 struct EditMode {
     msg_id: i32,
     draft: String,
+}
+
+#[derive(Default)]
+struct SelectionBook {
+    ids: HashSet<i32>,
+}
+
+impl SelectionBook {
+    fn set(&mut self, msg_id: i32, selected: bool) {
+        if selected {
+            self.ids.insert(msg_id);
+        } else {
+            self.ids.remove(&msg_id);
+        }
+    }
+
+    fn remove_deleted(&mut self, ids: &[i32]) -> bool {
+        let before = self.ids.len();
+        self.ids.retain(|id| !ids.contains(id));
+        before != self.ids.len()
+    }
+
+    fn ordered(&self, order: &[i32]) -> Vec<i32> {
+        order
+            .iter()
+            .filter(|id| self.ids.contains(id))
+            .copied()
+            .collect()
+    }
 }
 
 type MediaReady = Box<dyn FnOnce(PathBuf)>;
@@ -388,11 +428,21 @@ struct MessagesInner {
     composer_placeholder: gtk::Label,
     composer_cursor: gtk::Label,
     equalizer: gtk::Box,
+    composer_box: gtk::Box,
+    sticker: gtk::Button,
     send: gtk::Button,
     send_label: gtk::Label,
     attach: gtk::Button,
     emoji: gtk::Button,
     drop_target: gtk::DropTarget,
+    selection_bar: gtk::Box,
+    selection_count: gtk::Label,
+    selection_copy: gtk::Button,
+    selection_forward: gtk::Button,
+    selection_delete: gtk::Button,
+    selection: RefCell<SelectionBook>,
+    selection_mode: Cell<bool>,
+    recorder: RecorderBar,
     store: RefCell<MessageStore>,
     action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
     time_format: RefCell<String>,
@@ -436,6 +486,7 @@ struct MessagesInner {
     available_reactions: RefCell<Vec<String>>,
     available_reactions_loading: Cell<bool>,
     available_reactions_error: RefCell<Option<String>>,
+    darker_background: RefCell<String>,
     effects: Rc<Effects>,
 }
 
@@ -694,6 +745,35 @@ impl MessagesView {
         edit_bar.append(&edit_close);
         widget.append(&edit_bar);
 
+        let selection_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        selection_bar.add_css_class("omg-message-selection-bar");
+        selection_bar.set_visible(false);
+        let selection_count = gtk::Label::new(Some("0 selected"));
+        selection_count.set_halign(gtk::Align::Start);
+        selection_count.set_hexpand(true);
+        selection_bar.append(&selection_count);
+        let selection_copy = gtk::Button::with_label(icons::COPY);
+        selection_copy.add_css_class("omg-icon-button");
+        selection_copy.set_tooltip_text(Some("Copy selected messages"));
+        selection_bar.append(&selection_copy);
+        let selection_forward = gtk::Button::with_label(icons::FORWARD);
+        selection_forward.add_css_class("omg-icon-button");
+        selection_forward.set_tooltip_text(Some("Forward selected messages"));
+        selection_bar.append(&selection_forward);
+        let selection_delete = gtk::Button::with_label(icons::TRASH);
+        selection_delete.add_css_class("omg-icon-button");
+        selection_delete.add_css_class("omg-danger");
+        selection_delete.set_tooltip_text(Some("Delete selected messages"));
+        selection_bar.append(&selection_delete);
+        let selection_cancel = gtk::Button::with_label(icons::CLOSE);
+        selection_cancel.add_css_class("omg-icon-button");
+        selection_cancel.set_tooltip_text(Some("Cancel selection"));
+        selection_bar.append(&selection_cancel);
+        widget.append(&selection_bar);
+
+        let recorder = RecorderBar::new();
+        widget.append(&recorder.widget);
+
         let composer_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         composer_box.add_css_class("omg-composer");
         let attach = gtk::Button::with_label(icons::ATTACH);
@@ -708,6 +788,11 @@ impl MessagesView {
         emoji.set_tooltip_text(Some("Emoji"));
         emoji.set_sensitive(false);
         composer_box.append(&emoji);
+        let sticker = gtk::Button::with_label(icons::STICKER);
+        sticker.add_css_class("omg-attach");
+        sticker.set_tooltip_text(Some("Stickers and GIFs"));
+        sticker.set_sensitive(false);
+        composer_box.append(&sticker);
 
         let composer = gtk::TextView::new();
         composer.set_sensitive(false);
@@ -846,11 +931,21 @@ impl MessagesView {
             composer_placeholder,
             composer_cursor,
             equalizer,
+            composer_box,
+            sticker,
             send,
             send_label,
             attach,
             emoji,
             drop_target,
+            selection_bar,
+            selection_count,
+            selection_copy: selection_copy.clone(),
+            selection_forward: selection_forward.clone(),
+            selection_delete,
+            selection: RefCell::new(SelectionBook::default()),
+            selection_mode: Cell::new(false),
+            recorder,
             store: RefCell::new(MessageStore::default()),
             action,
             time_format: RefCell::new("%H:%M".to_string()),
@@ -894,6 +989,12 @@ impl MessagesView {
             available_reactions: RefCell::new(Vec::new()),
             available_reactions_loading: Cell::new(true),
             available_reactions_error: RefCell::new(None),
+            darker_background: RefCell::new(
+                crate::theme::load_colors()
+                    .get("darker_background")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
             effects,
         });
         let view = Self { widget, inner };
@@ -908,7 +1009,14 @@ impl MessagesView {
                 glib::ControlFlow::Continue
             });
         }
-        view.connect_controls(reply_close, edit_close, search_close);
+        view.connect_controls(
+            reply_close,
+            edit_close,
+            search_close,
+            selection_copy,
+            selection_forward,
+            selection_cancel,
+        );
         view
     }
 
@@ -917,6 +1025,9 @@ impl MessagesView {
         reply_close: gtk::Button,
         edit_close: gtk::Button,
         search_close: gtk::Button,
+        selection_copy: gtk::Button,
+        selection_forward: gtk::Button,
+        selection_cancel: gtk::Button,
     ) {
         {
             let action = self.inner.action.clone();
@@ -939,6 +1050,43 @@ impl MessagesView {
                     .composer_popover
                     .show(button, chooser.upcast::<gtk::Popover>());
             });
+        }
+        {
+            let action = self.inner.action.clone();
+            self.inner.sticker.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::Stickers);
+                }
+            });
+        }
+        for (button, event) in [
+            (selection_copy, MessageAction::SelectionCopy),
+            (selection_forward, MessageAction::SelectionForward),
+            (
+                self.inner.selection_delete.clone(),
+                MessageAction::SelectionDelete,
+            ),
+            (selection_cancel, MessageAction::SelectionCancel),
+        ] {
+            let action = self.inner.action.clone();
+            button.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(event.clone());
+                }
+            });
+        }
+        {
+            let action = self.inner.action.clone();
+            self.inner.recorder.set_action(Rc::new(move |event| {
+                let event = match event {
+                    RecorderUiAction::Cancel => MessageAction::RecorderCancel,
+                    RecorderUiAction::Send => MessageAction::RecorderSend,
+                    RecorderUiAction::Retry => MessageAction::RecorderRetry,
+                };
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(event);
+                }
+            }));
         }
         for button in [reply_close, edit_close] {
             let action = self.inner.action.clone();
@@ -1417,7 +1565,12 @@ impl MessagesView {
             )
         };
         revealed.borrow_mut().insert((start, end));
-        apply_message_markup(&label, &message, &revealed);
+        apply_message_markup(
+            &label,
+            &message,
+            &revealed,
+            &self.inner.darker_background.borrow(),
+        );
         true
     }
 
@@ -1565,6 +1718,8 @@ impl MessagesView {
     }
 
     pub fn reset_chat(&self, chat_id: i64, title: &str, epoch: u64) {
+        self.exit_selection_mode();
+        self.hide_recorder();
         self.move_focus_before_removal(&self.widget);
         self.clear_recent_presence();
         self.inner.virtual_mode.set(is_virtual(chat_id));
@@ -1572,6 +1727,7 @@ impl MessagesView {
         self.inner.composer.set_sensitive(composer_enabled);
         self.inner.attach.set_sensitive(composer_enabled);
         self.inner.emoji.set_sensitive(composer_enabled);
+        self.inner.sticker.set_sensitive(composer_enabled);
         self.inner.send.set_sensitive(composer_enabled);
         self.cancel_pending_scroll();
         self.inner.scroll_epoch.set(epoch);
@@ -1618,6 +1774,8 @@ impl MessagesView {
     }
 
     pub fn clear_selection(&self, epoch: u64) {
+        self.exit_selection_mode();
+        self.hide_recorder();
         self.move_focus_before_removal(&self.widget);
         self.clear_recent_presence();
         self.cancel_pending_scroll();
@@ -1652,6 +1810,7 @@ impl MessagesView {
         self.inner.composer.set_sensitive(false);
         self.inner.attach.set_sensitive(false);
         self.inner.emoji.set_sensitive(false);
+        self.inner.sticker.set_sensitive(false);
         self.inner.send.set_sensitive(false);
         self.set_detached(false);
         self.inner.paging.set(false);
@@ -1828,6 +1987,9 @@ impl MessagesView {
     fn merge(&self, messages: Vec<Msg>, is_live: bool, show_unread_divider: bool) -> Vec<i32> {
         let mut inserted = Vec::new();
         for message in messages {
+            if message.deleted {
+                self.drop_selection_ids(&[message.id]);
+            }
             let current_chat = self.inner.store.borrow().chat_id;
             if current_chat != Some(message.chat_id) {
                 continue;
@@ -1863,7 +2025,7 @@ impl MessagesView {
     }
 
     fn build_row(&self, message: &Msg, is_live: bool, show_unread_divider: bool) -> MessageRow {
-        let row_layout = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let row_layout = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         // Same alignment as the clamp, so the bubble sits at the end even if
         // a parent ever hands the clamp the full row width.
         row_layout.set_halign(if message.outgoing {
@@ -1888,6 +2050,19 @@ impl MessagesView {
             "omg-msg-in"
         });
 
+        let selection = gtk::CheckButton::new();
+        selection.add_css_class("omg-message-check");
+        selection.set_valign(gtk::Align::Center);
+        selection.set_visible(self.inner.selection_mode.get() && !message.deleted);
+        selection.set_sensitive(!message.deleted);
+        selection.set_active(self.inner.selection.borrow().ids.contains(&message.id));
+        row_layout.append(&selection);
+
+        let bubble_column = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        bubble_column.set_halign(gtk::Align::Fill);
+        bubble_column.set_hexpand(true);
+        row_layout.append(&bubble_column);
+
         if show_unread_divider {
             let divider = gtk::Revealer::new();
             divider.set_transition_type(gtk::RevealerTransitionType::SlideRight);
@@ -1895,7 +2070,7 @@ impl MessagesView {
             let line = gtk::Label::new(Some("unread"));
             line.add_css_class("omg-unread-divider");
             divider.set_child(Some(&line));
-            row_layout.append(&divider);
+            bubble_column.append(&divider);
             self.inner
                 .effects
                 .unread_divider_added(divider.upcast_ref());
@@ -1904,7 +2079,7 @@ impl MessagesView {
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
         content.add_css_class("omg-msg-content");
-        row_layout.append(&content);
+        bubble_column.append(&content);
 
         let forwarded = gtk::Label::new(
             message
@@ -2018,7 +2193,12 @@ impl MessagesView {
         let text = if message.text.is_empty() {
             None
         } else {
-            let text = formatted_message_label(message, &revealed_spoilers, &self.inner.action);
+            let text = formatted_message_label(
+                message,
+                &revealed_spoilers,
+                &self.inner.action,
+                &self.inner.darker_background.borrow(),
+            );
             text_block.append(&text);
             Some(text)
         };
@@ -2108,8 +2288,37 @@ impl MessagesView {
         }
         widget.add_controller(gesture);
 
+        {
+            let inner = Rc::downgrade(&self.inner);
+            let msg_id = message.id;
+            selection.connect_toggled(move |check| {
+                if let Some(inner) = inner.upgrade() {
+                    MessagesView::set_selected_inner(&inner, msg_id, check.is_active());
+                }
+            });
+        }
+        {
+            let inner = Rc::downgrade(&self.inner);
+            let check = selection.clone();
+            let click = gtk::GestureClick::new();
+            click.set_button(1);
+            click.set_propagation_phase(gtk::PropagationPhase::Capture);
+            click.connect_pressed(move |gesture, _, _, _| {
+                let Some(inner) = inner.upgrade() else { return };
+                if !inner.selection_mode.get() || !check.is_sensitive() {
+                    return;
+                }
+                check.set_active(!check.is_active());
+                if gesture.current_sequence().is_some() {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
+            });
+            widget.add_controller(click);
+        }
+
         let row = MessageRow {
             widget,
+            selection,
             forwarded,
             sender,
             quote,
@@ -2131,6 +2340,9 @@ impl MessagesView {
             media_loading_source,
         };
         set_deleted_rendering(&row, message.deleted);
+        row.selection.set_sensitive(!message.deleted);
+        row.selection
+            .set_visible(self.inner.selection_mode.get() && !message.deleted);
         update_reactions(
             &row,
             message,
@@ -2194,7 +2406,12 @@ impl MessagesView {
             label.remove_css_class("omg-code-animation");
         }
         match (text_label.as_ref(), message.text.is_empty()) {
-            (Some(label), false) => apply_message_markup(label, &message, &row.revealed_spoilers),
+            (Some(label), false) => apply_message_markup(
+                label,
+                &message,
+                &row.revealed_spoilers,
+                &self.inner.darker_background.borrow(),
+            ),
             (Some(label), true) => {
                 self.move_focus_before_removal(label);
                 row.text_block.remove(label);
@@ -2202,8 +2419,12 @@ impl MessagesView {
                 *text_label = None;
             }
             (None, false) => {
-                let label =
-                    formatted_message_label(&message, &row.revealed_spoilers, &self.inner.action);
+                let label = formatted_message_label(
+                    &message,
+                    &row.revealed_spoilers,
+                    &self.inner.action,
+                    &self.inner.darker_background.borrow(),
+                );
                 row.text_block.append(&label);
                 row.text_block.set_visible(true);
                 *text_label = Some(label);
@@ -2226,6 +2447,9 @@ impl MessagesView {
             ));
         }
         set_deleted_rendering(&row, message.deleted);
+        row.selection.set_sensitive(!message.deleted);
+        row.selection
+            .set_visible(self.inner.selection_mode.get() && !message.deleted);
         update_reactions(
             &row,
             &message,
@@ -2613,6 +2837,10 @@ impl MessagesView {
         Self::connect_menu_action(inner, &forward, &popover, MessageAction::Forward(msg_id));
         menu.append(&forward);
 
+        let select = menu_button("Select", false);
+        Self::connect_menu_action(inner, &select, &popover, MessageAction::Select(msg_id));
+        menu.append(&select);
+
         if message.outgoing && message.media.is_none() && !message.text.is_empty() {
             let edit = menu_button("Edit", false);
             Self::connect_menu_action(inner, &edit, &popover, MessageAction::Edit(msg_id));
@@ -2764,7 +2992,10 @@ impl MessagesView {
     }
 
     pub fn cancel_mode(&self) -> bool {
-        if self.inner.edit.borrow().is_some() {
+        if self.inner.selection_mode.get() {
+            self.exit_selection_mode();
+            true
+        } else if self.inner.edit.borrow().is_some() {
             self.cancel_edit();
             true
         } else if self.inner.ai_draft.replace(false) {
@@ -2781,6 +3012,7 @@ impl MessagesView {
     }
 
     pub fn cancel_all_modes(&self) {
+        self.exit_selection_mode();
         self.cancel_edit();
         if self.inner.ai_draft.replace(false) {
             self.set_composer_text("");
@@ -2789,8 +3021,262 @@ impl MessagesView {
         self.cancel_reply();
     }
 
+    /// The composer TextView is about to be hidden (selection or recording
+    /// mode); drop keyboard focus first so GTK delivers its focus-out instead
+    /// of warning at unmap time.
+    fn release_composer_focus(&self) {
+        let composer: gtk::Widget = self.inner.composer.clone().upcast();
+        let focused = composer.is_focus() || composer.focus_child().is_some();
+        if focused {
+            if let Some(window) = composer.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
+                gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+            }
+        }
+    }
+
+    pub fn begin_selection(&self, msg_id: i32) -> bool {
+        // Selection cannot merely hide an active recorder: that would leave
+        // the recorder machine running with no Cancel/Send controls. Ask the
+        // shell to transition the machine first and let the user enter
+        // selection on a subsequent action.
+        if self.inner.recorder.is_visible() {
+            if let Some(callback) = self.inner.action.borrow().as_ref().cloned() {
+                callback(MessageAction::RecorderCancel);
+            }
+            return false;
+        }
+        let selectable = self
+            .inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| !entry.msg.deleted);
+        if !selectable {
+            return false;
+        }
+        self.cancel_edit();
+        self.cancel_reply();
+        self.inner.ai_draft.set(false);
+        self.inner.edit_bar.set_visible(false);
+        self.inner.selection_mode.set(true);
+        self.inner.selection.borrow_mut().set(msg_id, true);
+        let rows = self
+            .inner
+            .store
+            .borrow()
+            .entries
+            .values()
+            .map(|entry| {
+                (
+                    entry.msg.id,
+                    entry.msg.deleted,
+                    entry.row.selection.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (id, deleted, check) in rows {
+            check.set_sensitive(!deleted);
+            check.set_visible(!deleted);
+            check.set_active(id == msg_id);
+        }
+        self.release_composer_focus();
+        self.inner.composer_box.set_visible(false);
+        self.inner.selection_bar.set_visible(true);
+        Self::refresh_selection_inner(&self.inner);
+        true
+    }
+
+    pub fn exit_selection_mode(&self) {
+        if !self.inner.selection_mode.replace(false) {
+            return;
+        }
+        let checks = self
+            .inner
+            .store
+            .borrow()
+            .entries
+            .values()
+            .map(|entry| entry.row.selection.clone())
+            .collect::<Vec<_>>();
+        // D6: remove every checkbox before any caller can tear rows down.
+        for check in checks {
+            check.set_visible(false);
+            check.set_active(false);
+        }
+        self.inner.selection.borrow_mut().ids.clear();
+        self.inner.selection_bar.set_visible(false);
+        if !self.inner.recorder.is_visible() {
+            self.inner.composer_box.set_visible(true);
+        }
+    }
+
+    pub fn set_selected(&self, msg_id: i32, selected: bool) {
+        Self::set_selected_inner(&self.inner, msg_id, selected);
+    }
+
+    pub fn drop_selection_ids(&self, ids: &[i32]) -> bool {
+        let changed = self.inner.selection.borrow_mut().remove_deleted(ids);
+        if !changed {
+            return false;
+        }
+        let checks = {
+            let store = self.inner.store.borrow();
+            ids.iter()
+                .filter_map(|id| {
+                    store
+                        .entries
+                        .get(id)
+                        .map(|entry| entry.row.selection.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for check in checks {
+            check.set_active(false);
+            check.set_sensitive(false);
+            check.set_visible(false);
+        }
+        Self::refresh_selection_inner(&self.inner);
+        true
+    }
+
+    pub fn selection_ids(&self) -> Vec<i32> {
+        let store = self.inner.store.borrow();
+        self.inner.selection.borrow().ordered(&store.order)
+    }
+
+    pub fn selection_count(&self) -> usize {
+        self.inner.selection.borrow().ids.len()
+    }
+
+    pub fn selection_mode(&self) -> bool {
+        self.inner.selection_mode.get()
+    }
+
+    pub fn selection_all_outgoing(&self) -> bool {
+        let ids = self.selection_ids();
+        !ids.is_empty()
+            && ids.iter().all(|id| {
+                self.inner
+                    .store
+                    .borrow()
+                    .entries
+                    .get(id)
+                    .is_some_and(|entry| entry.msg.outgoing && !entry.msg.deleted)
+            })
+    }
+
+    fn set_selected_inner(inner: &Rc<MessagesInner>, msg_id: i32, selected: bool) {
+        if !inner.selection_mode.get() {
+            return;
+        }
+        let selectable = inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| !entry.msg.deleted);
+        if !selectable {
+            return;
+        }
+        inner.selection.borrow_mut().set(msg_id, selected);
+        Self::refresh_selection_inner(inner);
+    }
+
+    fn refresh_selection_inner(inner: &Rc<MessagesInner>) {
+        let ids = {
+            let store = inner.store.borrow();
+            inner.selection.borrow().ordered(&store.order)
+        };
+        let count = ids.len();
+        inner
+            .selection_count
+            .set_label(&format!("{count} selected"));
+        inner.selection_copy.set_sensitive(count > 0);
+        inner.selection_forward.set_sensitive(count > 0);
+        let all_outgoing = count > 0
+            && ids.iter().all(|id| {
+                inner
+                    .store
+                    .borrow()
+                    .entries
+                    .get(id)
+                    .is_some_and(|entry| entry.msg.outgoing && !entry.msg.deleted)
+            });
+        inner.selection_delete.set_sensitive(all_outgoing);
+    }
+
+    pub fn show_sticker_popover(&self, popover: gtk::Popover) {
+        self.inner.composer_popover.show(&self.inner.sticker, popover);
+    }
+
+    pub fn dismiss_composer_popover(&self) {
+        self.inner.composer_popover.dismiss();
+    }
+
+    pub fn show_recorder_starting(&self) {
+        self.exit_selection_mode();
+        self.release_composer_focus();
+        self.inner.composer_box.set_visible(false);
+        self.inner.recorder.show_starting();
+    }
+
+    pub fn show_recorder_recording(&self) {
+        self.release_composer_focus();
+        self.inner.composer_box.set_visible(false);
+        self.inner.recorder.show_recording();
+    }
+
+    pub fn show_recorder_stopping(&self) {
+        self.inner.recorder.show_stopping();
+    }
+
+    pub fn show_recorder_sending(&self) {
+        self.inner.recorder.show_sending();
+    }
+
+    /// A8: Cancel arrived while start/stop was still in flight. The bar stays
+    /// up (and the composer stays locked) until that completion resolves.
+    pub fn show_recorder_cancelling(&self) {
+        self.inner.recorder.show_cancelling();
+    }
+
+    pub fn show_recorder_error(&self, message: &str, retryable: bool) {
+        self.release_composer_focus();
+        self.inner.composer_box.set_visible(false);
+        self.inner.recorder.show_error(message, retryable);
+    }
+
+    pub fn hide_recorder(&self) {
+        self.inner.recorder.hide();
+        if !self.inner.selection_mode.get() {
+            self.inner.composer_box.set_visible(true);
+        }
+    }
+
+    pub fn recorder_visible(&self) -> bool {
+        self.inner.recorder.is_visible()
+    }
+
+    pub fn recorder_status(&self) -> String {
+        self.inner.recorder.status_text()
+    }
+
+    pub fn probe_recorder_cancel(&self) {
+        self.inner.recorder.trigger_cancel();
+    }
+
+    pub fn probe_recorder_send(&self) {
+        self.inner.recorder.trigger_send();
+    }
+
+    pub fn probe_recorder_retry(&self) {
+        self.inner.recorder.trigger_retry();
+    }
+
     pub fn prepare_attachment(&self) {
         self.cancel_reply();
+        self.cancel_edit();
     }
 
     fn cancel_reply(&self) {
@@ -2931,6 +3417,7 @@ impl MessagesView {
         self.inner.composer.set_sensitive(sensitive);
         self.inner.attach.set_sensitive(sensitive);
         self.inner.emoji.set_sensitive(sensitive);
+        self.inner.sticker.set_sensitive(sensitive);
         self.inner.send.set_sensitive(sensitive);
         self.inner
             .drop_target
@@ -3033,6 +3520,7 @@ impl MessagesView {
     }
 
     pub fn remove(&self, msg_id: i32) -> Option<Msg> {
+        self.drop_selection_ids(&[msg_id]);
         self.dismiss_row_popovers();
         self.inner.pending_messages.borrow_mut().remove(&msg_id);
         let entry = {
@@ -3055,6 +3543,7 @@ impl MessagesView {
     }
 
     pub fn animate_deleted(&self, msg_id: i32) -> bool {
+        self.drop_selection_ids(&[msg_id]);
         let row = self
             .inner
             .store
@@ -3078,6 +3567,7 @@ impl MessagesView {
     }
 
     pub fn mark_deleted(&self, msg_id: i32) -> bool {
+        self.drop_selection_ids(&[msg_id]);
         let row = {
             let mut store = self.inner.store.borrow_mut();
             let Some(entry) = store.entries.get_mut(&msg_id) else {
@@ -3087,6 +3577,8 @@ impl MessagesView {
             entry.row.clone()
         };
         set_deleted_rendering(&row, true);
+        row.selection.set_sensitive(false);
+        row.selection.set_visible(false);
         true
     }
 
@@ -3289,14 +3781,33 @@ impl MessagesView {
     }
 
     pub fn probe_click_spoiler(&self, msg_id: i32) -> bool {
-        let label = self
-            .inner
-            .store
-            .borrow()
-            .entries
-            .get(&msg_id)
-            .and_then(|entry| entry.row.text.borrow().as_ref().cloned());
-        let Some(label) = label else { return false };
+        let target = self.inner.store.borrow().entries.get(&msg_id).and_then(|entry| {
+            let label = entry.row.text.borrow().as_ref().cloned()?;
+            let start = entry.msg.spans.iter().find_map(|span| {
+                (matches!(span.kind, SpanKind::Spoiler)
+                    && !entry
+                        .row
+                        .revealed_spoilers
+                        .borrow()
+                        .contains(&(span.start, span.end)))
+                .then_some(span.start)
+            })?;
+            Some((label, entry.msg.text.clone(), start))
+        });
+        let Some((label, text, start)) = target else { return false };
+        let byte_index = text
+            .char_indices()
+            .nth(start)
+            .map(|(index, _)| index)
+            .unwrap_or(text.len()) as i32;
+        let rectangle = label.layout().index_to_pos(byte_index);
+        let (offset_x, offset_y) = label.layout_offsets();
+        let x = f64::from(offset_x)
+            + f64::from(rectangle.x() + rectangle.width().max(gtk::pango::SCALE) / 2)
+                / f64::from(gtk::pango::SCALE);
+        let y = f64::from(offset_y)
+            + f64::from(rectangle.y() + rectangle.height().max(gtk::pango::SCALE) / 2)
+                / f64::from(gtk::pango::SCALE);
         let controllers = label.observe_controllers();
         for index in 0..controllers.n_items() {
             let Some(controller) = controllers.item(index) else {
@@ -3306,7 +3817,7 @@ impl MessagesView {
                 if gesture.name().as_deref() != Some("omg-spoiler-gesture") {
                     continue;
                 }
-                gesture.emit_by_name::<()>("pressed", &[&1_i32, &0_f64, &0_f64]);
+                gesture.emit_by_name::<()>("pressed", &[&1_i32, &x, &y]);
                 return true;
             }
         }
@@ -3757,6 +4268,36 @@ impl MessagesView {
         };
         for (label, message) in rows {
             set_time_label(&label, &message, format);
+        }
+    }
+
+    pub fn refresh_theme(&self) {
+        let darker = crate::theme::load_colors()
+            .get("darker_background")
+            .cloned()
+            .unwrap_or_default();
+        if *self.inner.darker_background.borrow() == darker {
+            return;
+        }
+        *self.inner.darker_background.borrow_mut() = darker.clone();
+        let rows = {
+            let store = self.inner.store.borrow();
+            store
+                .entries
+                .values()
+                .filter_map(|entry| {
+                    entry.row.text.borrow().as_ref().cloned().map(|label| {
+                        (
+                            entry.msg.clone(),
+                            label,
+                            entry.row.revealed_spoilers.clone(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for (message, label, revealed) in rows {
+            apply_message_markup(&label, &message, &revealed, &darker);
         }
     }
 
@@ -4494,9 +5035,10 @@ fn formatted_message_label(
     message: &Msg,
     revealed: &Rc<RefCell<HashSet<(usize, usize)>>>,
     action: &Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    darker_background: &str,
 ) -> gtk::Label {
     let label = message_label(&message.text);
-    apply_message_markup(&label, message, revealed);
+    apply_message_markup(&label, message, revealed, darker_background);
     let link_action = action.clone();
     let msg_id = message.id;
     label.connect_activate_link(move |_, target| {
@@ -4526,11 +5068,31 @@ fn formatted_message_label(
         gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
         let action = action.clone();
         let revealed = revealed.clone();
-        gesture.connect_pressed(move |gesture, _, _, _| {
+        let hit_label = label.clone();
+        let plain_text = message.text.clone();
+        gesture.connect_pressed(move |gesture, _, x, y| {
+            let (offset_x, offset_y) = hit_label.layout_offsets();
+            let layout_x = ((x - f64::from(offset_x)) * f64::from(gtk::pango::SCALE)) as i32;
+            let layout_y = ((y - f64::from(offset_y)) * f64::from(gtk::pango::SCALE)) as i32;
+            let (inside, byte_index, trailing) = hit_label.layout().xy_to_index(layout_x, layout_y);
+            if !inside || byte_index < 0 {
+                return;
+            }
+            let byte_index = (byte_index as usize).min(plain_text.len());
+            // Pango reports a trailing edge as the position *after* the
+            // grapheme. Map that edge back onto the grapheme itself so the
+            // last character of a half-open spoiler range remains clickable.
+            let trailing = trailing.max(0) as usize;
+            let character = plain_text[..byte_index].chars().count()
+                + trailing.saturating_sub(usize::from(trailing > 0));
             let hidden = spoiler_ranges
                 .iter()
                 .copied()
-                .filter(|range| !revealed.borrow().contains(range))
+                .filter(|(start, end)| {
+                    *start <= character
+                        && character < *end
+                        && !revealed.borrow().contains(&(*start, *end))
+                })
                 .collect::<Vec<_>>();
             if hidden.is_empty() {
                 return;
@@ -4555,8 +5117,14 @@ fn apply_message_markup(
     label: &gtk::Label,
     message: &Msg,
     revealed: &Rc<RefCell<HashSet<(usize, usize)>>>,
+    darker_background: &str,
 ) {
-    let rendered = markup::render_with_revealed(&message.text, &message.spans, &revealed.borrow());
+    let rendered = markup::render_with_code_background(
+        &message.text,
+        &message.spans,
+        &revealed.borrow(),
+        darker_background,
+    );
     label.set_markup(&rendered.markup);
     if rendered.has_spoiler {
         label.add_css_class("omg-spoiler");
@@ -4832,7 +5400,7 @@ fn snippet(text: &str, max_chars: usize) -> String {
 mod wave5_tests {
     use chrono::NaiveDate;
 
-    use super::{bubble_width_limit, day_separator_label_at, search_position};
+    use super::{SelectionBook, bubble_width_limit, day_separator_label_at, search_position};
 
     #[test]
     fn day_separator_labels_cover_relative_and_absolute_dates() {
@@ -4865,5 +5433,17 @@ mod wave5_tests {
         assert_eq!(search_position(Some(0), 3), "1 of 3");
         assert_eq!(search_position(Some(2), 3), "3 of 3");
         assert_eq!(search_position(Some(3), 3), "No results");
+    }
+
+    #[test]
+    fn selection_book_drops_deleted_ids_and_keeps_display_order() {
+        let mut selection = SelectionBook::default();
+        selection.set(30, true);
+        selection.set(10, true);
+        selection.set(20, true);
+        assert_eq!(selection.ordered(&[10, 20, 30]), vec![10, 20, 30]);
+        assert!(selection.remove_deleted(&[20, 99]));
+        assert_eq!(selection.ordered(&[10, 20, 30]), vec![10, 30]);
+        assert!(!selection.remove_deleted(&[20, 99]));
     }
 }

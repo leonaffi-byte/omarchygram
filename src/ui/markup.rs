@@ -48,6 +48,27 @@ pub fn render_with_revealed(
     spans: &[Span],
     revealed: &HashSet<(usize, usize)>,
 ) -> RenderedMarkup {
+    render_impl(text, spans, revealed, None)
+}
+
+/// Render inline code on the current theme's darker background. The value is
+/// supplied by `MessagesView` from `theme::load_colors`; Pango cannot resolve
+/// GTK CSS variables inside markup attributes.
+pub fn render_with_code_background(
+    text: &str,
+    spans: &[Span],
+    revealed: &HashSet<(usize, usize)>,
+    darker_background: &str,
+) -> RenderedMarkup {
+    render_impl(text, spans, revealed, Some(darker_background))
+}
+
+fn render_impl(
+    text: &str,
+    spans: &[Span],
+    revealed: &HashSet<(usize, usize)>,
+    code_background: Option<&str>,
+) -> RenderedMarkup {
     let chars: Vec<char> = text.chars().collect();
     let char_count = chars.len();
     let mut safe = spans
@@ -111,16 +132,16 @@ pub fn render_with_revealed(
             .take_while(|(left, right)| left.ordinal == right.ordinal)
             .count();
         for item in active[common..].iter().rev() {
-            out.push_str(&close_tag(item, revealed));
+            out.push_str(&close_tag(item, revealed, code_background));
         }
         for item in &desired[common..] {
-            out.push_str(&open_tag(item, revealed));
+            out.push_str(&open_tag(item, revealed, code_background));
         }
         active = desired;
         escape_char(chars[offset], &mut out);
     }
     for item in active.iter().rev() {
-        out.push_str(&close_tag(item, revealed));
+        out.push_str(&close_tag(item, revealed, code_background));
     }
 
     RenderedMarkup {
@@ -130,14 +151,27 @@ pub fn render_with_revealed(
     }
 }
 
-fn open_tag(item: &SafeSpan<'_>, revealed: &HashSet<(usize, usize)>) -> String {
+fn open_tag(
+    item: &SafeSpan<'_>,
+    revealed: &HashSet<(usize, usize)>,
+    code_background: Option<&str>,
+) -> String {
     let span = item.span;
     match &span.kind {
         SpanKind::Bold => "<b>".into(),
         SpanKind::Italic => "<i>".into(),
         SpanKind::Underline => "<u>".into(),
         SpanKind::Strike => "<s>".into(),
-        SpanKind::Code | SpanKind::Pre(_) => "<tt>".into(),
+        SpanKind::Code => code_background.map_or_else(
+            || "<tt>".into(),
+            |background| {
+                format!(
+                    "<span background=\"{}\"><tt>",
+                    escape_attribute(background)
+                )
+            },
+        ),
+        SpanKind::Pre(_) => "<tt>".into(),
         SpanKind::Link(target) if item.anchor => {
             format!("<a href=\"{}\">", escape_attribute(target))
         }
@@ -149,13 +183,18 @@ fn open_tag(item: &SafeSpan<'_>, revealed: &HashSet<(usize, usize)>) -> String {
     }
 }
 
-fn close_tag(item: &SafeSpan<'_>, revealed: &HashSet<(usize, usize)>) -> String {
+fn close_tag(
+    item: &SafeSpan<'_>,
+    revealed: &HashSet<(usize, usize)>,
+    code_background: Option<&str>,
+) -> String {
     let span = item.span;
     match &span.kind {
         SpanKind::Bold => "</b>".into(),
         SpanKind::Italic => "</i>".into(),
         SpanKind::Underline => "</u>".into(),
         SpanKind::Strike => "</s>".into(),
+        SpanKind::Code if code_background.is_some() => "</tt></span>".into(),
         SpanKind::Code | SpanKind::Pre(_) => "</tt>".into(),
         SpanKind::Link(_) | SpanKind::Mention(_) if item.anchor => "</a>".into(),
         SpanKind::Link(_) | SpanKind::Mention(_) => "</span>".into(),

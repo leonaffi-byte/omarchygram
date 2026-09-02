@@ -144,21 +144,26 @@ impl ForwardDialog {
                 if busy.get() {
                     return;
                 }
-                let state = state.borrow();
-                let targets = state
-                    .dialogs
-                    .iter()
-                    .filter_map(|chat| state.selected.contains(&chat.id).then_some(chat.id))
-                    .collect::<Vec<_>>();
+                // Snapshot under a short borrow: the callback runs shell code
+                // that may re-borrow this state (show_result, present).
+                let (source_chat, ids, targets, generation) = {
+                    let state = state.borrow();
+                    let targets = state
+                        .dialogs
+                        .iter()
+                        .filter_map(|chat| state.selected.contains(&chat.id).then_some(chat.id))
+                        .collect::<Vec<_>>();
+                    (state.source_chat, state.ids.clone(), targets, state.generation)
+                };
                 if targets.is_empty() {
                     return;
                 }
                 if let Some(callback) = action.borrow().as_ref().cloned() {
                     callback(ForwardAction::Submit(ForwardRequest {
-                        source_chat: state.source_chat,
-                        ids: state.ids.clone(),
+                        source_chat,
+                        ids,
                         targets,
-                        generation: state.generation,
+                        generation,
                     }));
                 }
             });

@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
@@ -17,19 +17,29 @@ use crate::ai::{ChatMessage, Prefs, Role};
 use crate::local::Local as LocalServices;
 use crate::os::{self, OsPolicy, Parsed};
 use crate::settings::{Settings, SettingsStore};
-use crate::tg::{AuthState, BackendFlags, ChatInfo, ChatKind, Event, Me, MediaKind, Msg, Tg};
+use crate::tg::{
+    AuthState, BackendFlags, ChatInfo, ChatKind, Event, Me, MediaKind, Msg, MuteMode,
+    SharedKind, Tg,
+};
 use crate::uistate::UiState;
 
 use super::anim::{Effects, RadioGroup, apply_full_phosphor, group_ids, select_radio};
 use super::auth::{AuthAction, AuthView};
 use super::avatar::Avatar;
 use super::chatlist::{ChatList, SearchRetry, SidebarMode, UnreadUpdate};
+use super::contacts::{ContactsAction, ContactsDialog};
 use super::forward::{ForwardAction, ForwardDialog, ForwardRequest};
 use super::icons;
+use super::info_panel::{InfoAction, InfoLayout, InfoPanel};
 use super::keys;
 use super::menus::{self, ChatAction, MainMenuAction, PopoverSlot};
 use super::messages::{MediaState, MessageAction, MessagesView};
+use super::newgroup::{NewGroupAction, NewGroupDialog};
+use super::recorder::{
+    CancelCommand, RecordTarget, RecorderMachine, StartResolution, StopResolution,
+};
 use super::settings_view::SettingsView;
+use super::stickers::{StickerAction, StickerPicker, StickerSend};
 use super::switcher::Switcher;
 use super::viewer::{Viewer, ViewerAction};
 use super::virtual_chat::{
@@ -112,6 +122,22 @@ struct InChatSearchState {
     retry_before: Option<i32>,
 }
 
+#[derive(Clone)]
+struct PendingVoice {
+    target: RecordTarget,
+    path: PathBuf,
+    duration: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RestoredUiState {
+    sidebar_width: i32,
+    sidebar_collapsed: bool,
+    folder_id: i32,
+    info_panel_open: bool,
+    info_width: i32,
+}
+
 struct PendingShellTicket {
     ticket: Option<os::ShellTicket>,
 }
@@ -152,9 +178,14 @@ struct ShellInner {
     auth: AuthView,
     chatlist: ChatList,
     messages: MessagesView,
+    info: InfoPanel,
+    contacts: ContactsDialog,
+    new_group: NewGroupDialog,
+    stickers: StickerPicker,
     forward: ForwardDialog,
     viewer: Viewer,
     paned: gtk::Paned,
+    content_paned: gtk::Paned,
     effects: Rc<Effects>,
     overlay: gtk::Overlay,
     switcher: Switcher,
@@ -179,6 +210,20 @@ struct ShellInner {
     dialogs_reload_timeout: RefCell<Option<glib::SourceId>>,
     window_hooked: Cell<bool>,
     composer_operation: Cell<bool>,
+    /// Identifies the operation that currently owns `composer_operation`
+    /// (C5/A7). A completion may only release the lock it still owns, so a
+    /// late start/stop/send resolution cannot unlock a composer that another
+    /// operation took over after a chat switch.
+    composer_token: Cell<u64>,
+    /// The composer token the recorder machine holds from `begin_start` (or a
+    /// send retry) until its final resolution.
+    recorder_token: Cell<u64>,
+    /// Last text `SelectionCopy` put on the clipboard (probe hook).
+    probe_copied: RefCell<String>,
+    /// Probe hook: milliseconds to hold `record_start` before awaiting it, so
+    /// the A8 cancel-during-Starting path can be exercised deterministically.
+    /// Always 0 outside `--probe`.
+    probe_record_start_delay: Cell<u64>,
     mutations_in_flight: Cell<u32>,
     pending_message_id: Cell<i32>,
     mark_reads: RefCell<HashMap<i64, ReadState>>,
@@ -201,8 +246,17 @@ struct ShellInner {
     ui_state: RefCell<UiState>,
     ui_save_timeout: RefCell<Option<glib::SourceId>>,
     layout_tick: RefCell<Option<gtk::TickCallbackId>>,
+    /// True while the frame-clock tick callback drives the layout. A27
+    /// reparents the info panel between the Paned column and the Overlay
+    /// sheet; doing that inside the frame cycle is not safe, so the tick
+    /// only ever schedules the transition for the next idle.
+    in_layout_tick: Cell<bool>,
+    info_layout_idle: RefCell<Option<glib::SourceId>>,
+    /// Set once in `wire`, so `&self` methods can schedule idle work.
+    weak_self: RefCell<Weak<Self>>,
     probe_window_width: Cell<Option<i32>>,
     applying_sidebar_layout: Cell<bool>,
+    applying_info_layout: Cell<bool>,
     effective_sidebar_collapsed: Cell<bool>,
     main_menu: PopoverSlot,
     me: RefCell<Option<Me>>,
@@ -222,7 +276,11 @@ struct ShellInner {
     reaction_generations: RefCell<HashMap<(i64, i32), u64>>,
     message_change_generations: RefCell<HashMap<(i64, i32), u64>>,
     reaction_retry: RefCell<Option<(i64, i32, String)>>,
-    probe_restored_ui_state: Option<(i32, bool, i32)>,
+    recorder: RefCell<RecorderMachine>,
+    voice_retry: RefCell<Option<PendingVoice>>,
+    caption_dialog: RefCell<Option<gtk::Window>>,
+    probe_notifications: Cell<u64>,
+    probe_restored_ui_state: Option<RestoredUiState>,
     smoke_hook_done: Cell<bool>,
     probe_started: Cell<bool>,
     auth_probe_started: Cell<bool>,
@@ -237,6 +295,10 @@ impl Shell {
         let effects = Effects::new(settings.clone());
         let chatlist = ChatList::new(effects.clone(), tg.clone());
         let messages = MessagesView::new(effects.clone());
+        let info = InfoPanel::new(tg.clone());
+        let contacts = ContactsDialog::new(tg.clone());
+        let new_group = NewGroupDialog::new();
+        let stickers = StickerPicker::new();
         let forward = ForwardDialog::new();
         let viewer = Viewer::new();
         let switcher = Switcher::new();
@@ -267,7 +329,16 @@ impl Shell {
         paned.set_hexpand(true);
         paned.set_vexpand(true);
         paned.set_start_child(Some(&chatlist.widget));
-        paned.set_end_child(Some(&messages.widget));
+        let content_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+        content_paned.add_css_class("omg-handle");
+        content_paned.set_hexpand(true);
+        content_paned.set_vexpand(true);
+        content_paned.set_start_child(Some(&messages.widget));
+        content_paned.set_resize_start_child(true);
+        content_paned.set_shrink_start_child(false);
+        content_paned.set_resize_end_child(false);
+        content_paned.set_shrink_end_child(false);
+        paned.set_end_child(Some(&content_paned));
         paned.set_resize_start_child(false);
         paned.set_shrink_start_child(ui_state.sidebar_collapsed);
         paned.set_position(if ui_state.sidebar_collapsed {
@@ -289,8 +360,11 @@ impl Shell {
         // overlay, so atmosphere/launch layers can never paint over Ctrl+K.
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&stack));
+        overlay.add_overlay(&info.widget);
         overlay.add_overlay(&viewer.widget);
         overlay.add_overlay(&forward.widget);
+        overlay.add_overlay(&contacts.widget);
+        overlay.add_overlay(&new_group.widget);
         overlay.set_hexpand(true);
         overlay.set_vexpand(true);
         let shell_overlay = gtk::Overlay::new();
@@ -316,9 +390,14 @@ impl Shell {
             auth,
             chatlist,
             messages,
+            info,
+            contacts,
+            new_group,
+            stickers,
             forward,
             viewer,
             paned,
+            content_paned,
             effects,
             overlay,
             switcher,
@@ -343,6 +422,10 @@ impl Shell {
             dialogs_reload_timeout: RefCell::new(None),
             window_hooked: Cell::new(false),
             composer_operation: Cell::new(false),
+            composer_token: Cell::new(0),
+            recorder_token: Cell::new(0),
+            probe_copied: RefCell::new(String::new()),
+            probe_record_start_delay: Cell::new(0),
             mutations_in_flight: Cell::new(0),
             pending_message_id: Cell::new(i32::MAX),
             mark_reads: RefCell::new(HashMap::new()),
@@ -365,8 +448,12 @@ impl Shell {
             ui_state: RefCell::new(ui_state),
             ui_save_timeout: RefCell::new(None),
             layout_tick: RefCell::new(None),
+            in_layout_tick: Cell::new(false),
+            info_layout_idle: RefCell::new(None),
+            weak_self: RefCell::new(Weak::new()),
             probe_window_width: Cell::new(None),
             applying_sidebar_layout: Cell::new(false),
+            applying_info_layout: Cell::new(false),
             effective_sidebar_collapsed: Cell::new(false),
             main_menu: PopoverSlot::default(),
             me: RefCell::new(None),
@@ -386,6 +473,10 @@ impl Shell {
             reaction_generations: RefCell::new(HashMap::new()),
             message_change_generations: RefCell::new(HashMap::new()),
             reaction_retry: RefCell::new(None),
+            recorder: RefCell::new(RecorderMachine::default()),
+            voice_retry: RefCell::new(None),
+            caption_dialog: RefCell::new(None),
+            probe_notifications: Cell::new(0),
             probe_restored_ui_state,
             smoke_hook_done: Cell::new(false),
             probe_started: Cell::new(false),
@@ -420,6 +511,7 @@ impl Shell {
 
 impl ShellInner {
     fn wire(this: &Rc<Self>, dialogs_retry: gtk::Button) {
+        *this.weak_self.borrow_mut() = Rc::downgrade(this);
         {
             let weak = Rc::downgrade(this);
             this.auth.set_action(Rc::new(move |action| {
@@ -530,6 +622,52 @@ impl ShellInner {
         }
         {
             let weak = Rc::downgrade(this);
+            this.info.set_action(Rc::new(move |action| {
+                if let Some(this) = weak.upgrade() {
+                    this.handle_info_action(action);
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.contacts.set_action(Rc::new(move |action| {
+                if let Some(this) = weak.upgrade() {
+                    this.handle_contacts_action(action);
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.new_group.set_action(Rc::new(move |action| {
+                if let Some(this) = weak.upgrade() {
+                    this.handle_new_group_action(action);
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.stickers.set_action(Rc::new(move |action| {
+                if let Some(this) = weak.upgrade() {
+                    this.handle_sticker_action(action);
+                }
+            }));
+            let weak = Rc::downgrade(this);
+            this.stickers.popover().connect_closed(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.apply_info_layout(this.current_window_width());
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.switcher.widget.connect_visible_notify(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.apply_info_layout(this.current_window_width());
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(this);
             dialogs_retry.connect_clicked(move |_| {
                 if let Some(this) = weak.upgrade() {
                     this.load_dialogs();
@@ -576,6 +714,21 @@ impl ShellInner {
                 this.schedule_ui_save();
             });
         }
+        {
+            let weak = Rc::downgrade(this);
+            this.content_paned.connect_position_notify(move |paned| {
+                let Some(this) = weak.upgrade() else { return };
+                if this.applying_info_layout.get()
+                    || this.info.layout() != InfoLayout::Column
+                    || paned.width() <= 0
+                {
+                    return;
+                }
+                let width = (paned.width() - paned.position()).max(280);
+                this.ui_state.borrow_mut().info_width = width;
+                this.schedule_ui_save();
+            });
+        }
 
         let global_action: Rc<dyn Fn(&str)> = {
             let weak = Rc::downgrade(this);
@@ -594,8 +747,8 @@ impl ShellInner {
                     "toggle_sidebar" => this.toggle_sidebar(),
                     "reply_last" => this.reply_last(),
                     "saved" => this.clone().open_saved_messages(),
-                    // Package 5D fills these two surfaces.
-                    "chat_info" | "contacts" => {}
+                    "chat_info" => this.toggle_info_panel(),
+                    "contacts" => this.open_contacts(),
                     "jump_to_date" => this.messages.open_jump_calendar(),
                     _ => {}
                 }
@@ -629,6 +782,20 @@ impl ShellInner {
                         this.close_viewer();
                     } else if this.forward.is_open() {
                         this.close_forward();
+                    } else if this.contacts.is_open() {
+                        this.close_contacts();
+                    } else if this.new_group.is_open() {
+                        this.close_new_group();
+                    } else if this.stickers.is_open() {
+                        this.close_stickers();
+                    } else if this.caption_dialog.borrow().is_some() {
+                        this.close_caption_dialog();
+                    } else if this.messages.recorder_visible() {
+                        // Keyboard-first: Esc cancels an active (or failed)
+                        // recording before it touches any panel.
+                        this.cancel_recording();
+                    } else if this.info.layout() == InfoLayout::Overlay {
+                        this.close_info_panel();
                     } else if this.messages.search_is_open() {
                         this.close_in_chat_search();
                     } else if this.switcher.is_open() {
@@ -741,8 +908,13 @@ impl ShellInner {
         if !self.session_ready.replace(false) {
             return;
         }
+        self.cancel_recording();
         self.close_forward();
         self.close_viewer();
+        self.close_contacts();
+        self.close_new_group();
+        self.close_stickers();
+        self.close_caption_dialog();
         if self.messages.search_is_open() {
             self.close_in_chat_search();
         }
@@ -773,7 +945,7 @@ impl ShellInner {
             {
                 glib::timeout_future(Duration::from_millis(25)).await;
             }
-            self.composer_operation.set(false);
+            self.force_release_composer();
             self.messages.stop_send_feedback();
             let next_session = self.session_epoch.get().wrapping_add(1);
             self.session_epoch.set(next_session);
@@ -789,6 +961,8 @@ impl ShellInner {
             match result {
                 Ok(AuthState::NeedPhone) => {
                     self.open_chat.set(None);
+                    self.info.unbind();
+                    self.apply_info_layout(self.current_window_width());
                     self.dialogs_loaded.set(false);
                     self.messages.clear_selection(epoch);
                     self.clear_window_focus();
@@ -822,6 +996,17 @@ impl ShellInner {
         self.messages.set_edit_history(settings.edit_history);
         self.messages.set_ai_enabled(settings.ai.enabled);
         self.chatlist.set_show_avatars(settings.ui.show_avatars);
+        // A32: the info panel's own avatar, its member rows and the contacts
+        // list are bound at their own logical keys, so a show_avatars flip
+        // has to rebind them — placeholders first, then any new download.
+        let avatars_changed = self.info.set_show_avatars(settings.ui.show_avatars);
+        if self.contacts.set_show_avatars(settings.ui.show_avatars) && self.contacts.is_open() {
+            let generation = self.contacts.begin();
+            self.load_contacts(generation);
+        }
+        if avatars_changed {
+            self.bind_info_panel();
+        }
         self.update_clock(settings.header_clock || settings.animation("liveclock"));
         self.effects.sync();
         self.messages.refresh_animations();
@@ -972,16 +1157,25 @@ impl ShellInner {
         } else {
             self.close_forward();
             self.close_viewer();
+            self.close_contacts();
+            self.close_new_group();
+            self.close_stickers();
+            self.close_caption_dialog();
             self.close_in_chat_search();
             self.clear_window_focus();
             self.switcher.close();
             self.stack.set_visible_child_name("settings");
+            self.apply_info_layout(self.current_window_width());
         }
     }
 
     fn open_switcher(&self) {
         self.close_forward();
         self.close_viewer();
+        self.close_contacts();
+        self.close_new_group();
+        self.close_stickers();
+        self.close_caption_dialog();
         self.close_in_chat_search();
         self.close_settings();
         self.switcher.open(self.chatlist.ordered());
@@ -992,6 +1186,7 @@ impl ShellInner {
             self.clear_window_focus();
             self.settings_view.dismiss_transients();
             self.stack.set_visible_child_name("main");
+            self.apply_info_layout(self.current_window_width());
             self.messages.focus_composer();
         } else {
             self.settings_view.dismiss_transients();
@@ -1013,13 +1208,16 @@ impl ShellInner {
                 .map(|window| window.width())
                 .unwrap_or_else(|| paned.width());
             let width = this.probe_window_width.get().unwrap_or(width);
+            this.in_layout_tick.set(true);
             this.apply_sidebar_layout(width);
+            this.in_layout_tick.set(false);
             glib::ControlFlow::Continue
         });
         *self.layout_tick.borrow_mut() = Some(tick);
     }
 
     fn apply_sidebar_layout(&self, window_width: i32) {
+        self.apply_info_layout(window_width);
         let state = self.ui_state.borrow();
         let collapsed = state.sidebar_collapsed || window_width < 640;
         let position = if collapsed {
@@ -1038,6 +1236,126 @@ impl ShellInner {
         self.chatlist.set_collapsed(collapsed);
         self.paned.set_position(position);
         self.applying_sidebar_layout.set(false);
+    }
+
+    fn apply_info_layout(&self, window_width: i32) {
+        let state = self.ui_state.borrow();
+        let desired = state.info_panel_open
+            && self.open_chat.get().is_some_and(|chat_id| !is_virtual(chat_id));
+        let info_width = state.info_width.max(280);
+        drop(state);
+        let overlay_blocked = self.viewer.is_open()
+            || self.forward.is_open()
+            || self.contacts.is_open()
+            || self.new_group.is_open()
+            || self.stickers.is_open()
+            || self.caption_dialog.borrow().is_some()
+            || self.switcher.is_open()
+            || self.settings_open();
+        let target = if !desired {
+            InfoLayout::Hidden
+        } else if window_width >= 1000 {
+            InfoLayout::Column
+        } else if overlay_blocked {
+            InfoLayout::Hidden
+        } else {
+            InfoLayout::Overlay
+        };
+        let info_widget = self.info.widget.clone().upcast::<gtk::Widget>();
+        let column_attached = self
+            .content_paned
+            .end_child()
+            .is_some_and(|child| child == info_widget);
+        if target == self.info.layout() && (target != InfoLayout::Column || column_attached) {
+            if target == InfoLayout::Column {
+                let width = self.content_paned.width();
+                if width > 0 {
+                    self.applying_info_layout.set(true);
+                    self.content_paned
+                        .set_position((width - info_width).max(1));
+                    self.applying_info_layout.set(false);
+                }
+            }
+            return;
+        }
+
+        // A27: from here on the panel is reparented (Paned end child ⇄
+        // Overlay child). The frame-clock tick drives this method on every
+        // frame, and unparenting a widget from inside the frame cycle is not
+        // safe — hand the transition to the next idle instead. The idle
+        // recomputes the target from scratch, so a single pending one is
+        // always enough.
+        if self.in_layout_tick.get() {
+            self.schedule_info_layout();
+            return;
+        }
+        if let Some(source) = self.info_layout_idle.borrow_mut().take() {
+            source.remove();
+        }
+
+        if let Some(root) = self.info.widget.root() {
+            if let Some(focus) = root.focus() {
+                if focus == self.info.widget.clone().upcast::<gtk::Widget>()
+                    || focus.is_ancestor(&self.info.widget)
+                {
+                    root.set_focus(None::<&gtk::Widget>);
+                }
+            }
+        }
+        self.applying_info_layout.set(true);
+        if column_attached {
+            self.content_paned.set_end_child(None::<&gtk::Widget>);
+        }
+        if self
+            .info
+            .widget
+            .parent()
+            .is_some_and(|parent| parent == self.overlay.clone().upcast::<gtk::Widget>())
+        {
+            self.overlay.remove_overlay(&self.info.widget);
+        }
+
+        match target {
+            InfoLayout::Hidden => {
+                self.info.set_layout(InfoLayout::Hidden);
+            }
+            InfoLayout::Column => {
+                self.info.widget.set_halign(gtk::Align::Fill);
+                self.info.widget.set_valign(gtk::Align::Fill);
+                self.info.widget.set_size_request(280, -1);
+                self.content_paned.set_end_child(Some(&self.info.widget));
+                let width = self.content_paned.width();
+                if width > 0 {
+                    self.content_paned
+                        .set_position((width - info_width).max(1));
+                }
+                self.info.set_layout(InfoLayout::Column);
+            }
+            InfoLayout::Overlay => {
+                self.info.widget.set_halign(gtk::Align::End);
+                self.info.widget.set_valign(gtk::Align::Fill);
+                self.info.widget.set_size_request(info_width, -1);
+                self.overlay.add_overlay(&self.info.widget);
+                self.info.set_layout(InfoLayout::Overlay);
+            }
+        }
+        self.applying_info_layout.set(false);
+    }
+
+    /// Queue the A27 info-panel reparent for the next main-loop idle, outside
+    /// the frame cycle. At most one is pending: the idle re-derives the
+    /// target, so a newer request needs no extra source.
+    fn schedule_info_layout(&self) {
+        if self.info_layout_idle.borrow().is_some() {
+            return;
+        }
+        let weak = self.weak_self.borrow().clone();
+        let source = glib::idle_add_local_once(move || {
+            let Some(this) = weak.upgrade() else { return };
+            this.info_layout_idle.borrow_mut().take();
+            this.apply_info_layout(this.current_window_width());
+        });
+        *self.info_layout_idle.borrow_mut() = Some(source);
     }
 
     async fn resize_window_for_probe(
@@ -1083,9 +1401,171 @@ impl ShellInner {
         self.chatlist.focus_search();
     }
 
-    fn open_contacts(&self) {
-        // TODO(5D): replace with the contacts dialog. The menu/action surface
-        // intentionally exists now so the shortcut package can bind it.
+    fn open_contacts(self: &Rc<Self>) {
+        self.close_forward();
+        self.close_viewer();
+        self.close_new_group();
+        self.close_stickers();
+        self.close_caption_dialog();
+        self.switcher.close();
+        self.close_settings();
+        let generation = self.contacts.begin();
+        self.apply_info_layout(self.current_window_width());
+        self.load_contacts(generation);
+    }
+
+    fn load_contacts(self: &Rc<Self>, generation: u64) {
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_contacts().await;
+            let Some(this) = weak.upgrade().filter(|this| {
+                this.is_session_current(session_epoch)
+                    && this.contacts.generation() == generation
+                    && this.contacts.is_open()
+            }) else {
+                return;
+            };
+            match result {
+                Ok(contacts) => {
+                    this.contacts.finish(generation, contacts);
+                }
+                Err(error) => {
+                    this.contacts.fail(generation, &error);
+                }
+            }
+        });
+    }
+
+    fn handle_contacts_action(self: Rc<Self>, action: ContactsAction) {
+        match action {
+            ContactsAction::Close => self.close_contacts(),
+            ContactsAction::Retry => {
+                let generation = self.contacts.begin();
+                self.load_contacts(generation);
+            }
+            ContactsAction::Open(user_id) => {
+                let session_epoch = self.session_epoch.get();
+                // A slow `open_user` must not steal navigation: Esc, a chat
+                // switch or New group all bump the contacts generation.
+                let generation = self.contacts.generation();
+                glib::MainContext::default().spawn_local(async move {
+                    let result = self.tg.open_user(user_id).await;
+                    if !self.is_session_current(session_epoch)
+                        || !self.contacts.is_open()
+                        || self.contacts.generation() != generation
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(summary) => {
+                            let chat_id = summary.id;
+                            self.bump_dialogs_revision();
+                            self.chatlist.set_summary(summary);
+                            self.close_contacts();
+                            self.open_chat(chat_id);
+                        }
+                        Err(error) => {
+                            self.contacts.show_action_error(&error);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    fn close_contacts(&self) {
+        if self.contacts.is_open() {
+            self.contacts.close();
+            self.messages.focus_composer();
+            self.apply_info_layout(self.current_window_width());
+        }
+    }
+
+    fn open_new_group(self: &Rc<Self>) {
+        self.close_forward();
+        self.close_viewer();
+        self.close_contacts();
+        self.close_stickers();
+        self.close_caption_dialog();
+        self.switcher.close();
+        self.close_settings();
+        let generation = self.new_group.begin();
+        self.apply_info_layout(self.current_window_width());
+        self.load_new_group_contacts(generation);
+    }
+
+    fn load_new_group_contacts(self: &Rc<Self>, generation: u64) {
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_contacts().await;
+            let Some(this) = weak.upgrade().filter(|this| {
+                this.is_session_current(session_epoch)
+                    && this.new_group.generation() == generation
+                    && this.new_group.is_open()
+            }) else {
+                return;
+            };
+            match result {
+                Ok(contacts) => {
+                    this.new_group.finish_contacts(generation, contacts);
+                }
+                Err(error) => {
+                    this.new_group.fail_contacts(generation, &error);
+                }
+            }
+        });
+    }
+
+    fn handle_new_group_action(self: Rc<Self>, action: NewGroupAction) {
+        match action {
+            NewGroupAction::Close => self.close_new_group(),
+            NewGroupAction::RetryContacts => {
+                // A33: the section returns to its loading state before the
+                // reload starts, without wiping the title or the selection.
+                self.new_group.begin_retry();
+                let generation = self.new_group.generation();
+                self.load_new_group_contacts(generation);
+            }
+            NewGroupAction::Create { title, user_ids } => {
+                let generation = self.new_group.generation();
+                let Some(session_epoch) = self.begin_mutation() else {
+                    return;
+                };
+                self.new_group.set_busy(true);
+                glib::MainContext::default().spawn_local(async move {
+                    let result = self.tg.create_group(&title, user_ids).await;
+                    self.finish_mutation();
+                    if !self.is_session_current(session_epoch)
+                        || !self.new_group.is_open()
+                        || self.new_group.generation() != generation
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(summary) => {
+                            let chat_id = summary.id;
+                            self.bump_dialogs_revision();
+                            self.chatlist.set_summary(summary);
+                            self.close_new_group();
+                            self.open_chat(chat_id);
+                        }
+                        Err(error) => self.new_group.show_create_error(&error),
+                    }
+                });
+            }
+        }
+    }
+
+    fn close_new_group(&self) {
+        if self.new_group.is_open() {
+            self.new_group.close();
+            self.messages.focus_composer();
+            self.apply_info_layout(self.current_window_width());
+        }
     }
 
     fn open_saved_messages(self: Rc<Self>) {
@@ -1097,7 +1577,46 @@ impl ShellInner {
         });
         if let Some(chat_id) = saved {
             self.open_chat(chat_id);
+            return;
         }
+        let session_epoch = self.session_epoch.get();
+        // Same staleness rule as ContactsAction::Open: any navigation while
+        // the lookup is in flight bumps the epoch and wins over it.
+        let epoch = self.epoch.get();
+        glib::MainContext::default().spawn_local(async move {
+            // Hoist the clone: a `match` scrutinee temporary would keep the
+            // RefCell borrow alive across the await below.
+            let cached = self.me.borrow().clone();
+            let me = match cached {
+                Some(me) => Ok(me),
+                None => self.tg.get_me().await,
+            };
+            let result = match me {
+                Ok(me) => self.tg.open_user(me.id).await,
+                Err(error) => Err(error),
+            };
+            if !self.is_session_current(session_epoch) || self.epoch.get() != epoch {
+                return;
+            }
+            match result {
+                Ok(summary) => {
+                    let chat_id = summary.id;
+                    self.bump_dialogs_revision();
+                    self.chatlist.set_summary(summary);
+                    self.open_chat(chat_id);
+                }
+                Err(error) => {
+                    self.messages.show_error(&error);
+                }
+            }
+        });
+    }
+
+    fn current_window_width(&self) -> i32 {
+        self.probe_window_width
+            .get()
+            .or_else(|| self.window().map(|window| window.width()))
+            .unwrap_or(1100)
     }
 
     fn schedule_ui_save(self: &Rc<Self>) {
@@ -1345,9 +1864,7 @@ impl ShellInner {
         match action {
             MainMenuAction::Saved => self.open_saved_messages(),
             MainMenuAction::Contacts => self.open_contacts(),
-            MainMenuAction::NewGroup => {
-                // TODO(5D): open the dedicated new-group flow.
-            }
+            MainMenuAction::NewGroup => self.open_new_group(),
             MainMenuAction::Archived => self.chatlist.show_archived(),
             MainMenuAction::Settings | MainMenuAction::Shortcuts => self.toggle_settings(),
             MainMenuAction::About => {
@@ -1395,7 +1912,11 @@ impl ShellInner {
             }
             return;
         }
-        if matches!(action, ChatAction::Info | ChatAction::JumpToDate) {
+        if matches!(action, ChatAction::Info) {
+            self.toggle_info_panel();
+            return;
+        }
+        if matches!(action, ChatAction::JumpToDate) {
             return;
         }
         if matches!(action, ChatAction::ClearHistory | ChatAction::Delete) {
@@ -1408,6 +1929,9 @@ impl ShellInner {
         if let ChatAction::Mute(mode) = action {
             let muted = !matches!(mode, crate::tg::MuteMode::Unmute);
             self.pending_mutes.borrow_mut().insert(chat_id, muted);
+            if self.info.chat_id() == Some(chat_id) {
+                self.info.set_notifications(!muted);
+            }
         }
         if let ChatAction::MarkUnread(unread) = action {
             if unread {
@@ -1438,9 +1962,6 @@ impl ShellInner {
             if !this.session_ready.get() || this.session_epoch.get() != session_epoch {
                 return;
             }
-            if matches!(action, ChatAction::Mute(_)) {
-                this.pending_mutes.borrow_mut().remove(&chat_id);
-            }
             match result {
                 Ok(()) if matches!(action, ChatAction::MarkUnread(true)) => {
                     this.bump_dialogs_revision();
@@ -1452,6 +1973,28 @@ impl ShellInner {
                 }
                 Ok(()) => {}
                 Err(error) => {
+                    if let ChatAction::Mute(mode) = action {
+                        let failed_intent = !matches!(mode, MuteMode::Unmute);
+                        let still_current = this
+                            .pending_mutes
+                            .borrow()
+                            .get(&chat_id)
+                            .copied()
+                            == Some(failed_intent);
+                        if still_current {
+                            this.pending_mutes.borrow_mut().remove(&chat_id);
+                        }
+                        let muted = this
+                            .pending_mutes
+                            .borrow()
+                            .get(&chat_id)
+                            .copied()
+                            .or_else(|| this.chatlist.summary(chat_id).map(|summary| summary.muted))
+                            .unwrap_or(false);
+                        if this.info.chat_id() == Some(chat_id) {
+                            this.info.set_notifications(!muted);
+                        }
+                    }
                     if matches!(action, ChatAction::MarkUnread(true)) {
                         this.manual_unread_hold.borrow_mut().remove(&chat_id);
                     }
@@ -1507,6 +2050,7 @@ impl ShellInner {
                     self.bump_dialogs_revision();
                     self.chatlist.remove_chat(chat_id);
                     if self.is_current(chat_id, view_epoch) {
+                        self.cancel_recording();
                         self.close_forward();
                         self.close_viewer();
                         self.close_in_chat_search();
@@ -1544,6 +2088,836 @@ impl ShellInner {
                     }
                 }
                 Err(error) => eprintln!("get_chat_info({chat_id}): {error}"),
+            }
+        });
+    }
+
+    fn toggle_info_panel(self: &Rc<Self>) {
+        let desired = !self.ui_state.borrow().info_panel_open;
+        self.ui_state.borrow_mut().info_panel_open = desired;
+        self.schedule_ui_save();
+        if desired {
+            self.bind_info_panel();
+        } else {
+            self.info.unbind();
+        }
+        self.apply_info_layout(self.current_window_width());
+    }
+
+    fn close_info_panel(self: &Rc<Self>) {
+        if !self.ui_state.borrow().info_panel_open {
+            return;
+        }
+        self.ui_state.borrow_mut().info_panel_open = false;
+        self.info.unbind();
+        self.apply_info_layout(self.current_window_width());
+        self.schedule_ui_save();
+    }
+
+    fn bind_info_panel(self: &Rc<Self>) {
+        if !self.ui_state.borrow().info_panel_open {
+            return;
+        }
+        let Some(chat_id) = self.open_chat.get().filter(|chat_id| !is_virtual(*chat_id)) else {
+            self.info.unbind();
+            self.apply_info_layout(self.current_window_width());
+            return;
+        };
+        let Some(mut summary) = self.chatlist.summary(chat_id) else {
+            return;
+        };
+        if let Some(muted) = self.pending_mutes.borrow().get(&chat_id).copied() {
+            summary.muted = muted;
+        }
+        let generation = self.info.bind(&summary);
+        self.apply_info_layout(self.current_window_width());
+        if summary.kind == ChatKind::Group {
+            self.load_info_members(0);
+        }
+        self.load_info_shared_request();
+        if let Some(mut info) = self.chat_info.borrow().get(&chat_id).cloned() {
+            if let Some(muted) = self.pending_mutes.borrow().get(&chat_id).copied() {
+                info.muted = muted;
+            }
+            self.info.finish_info(chat_id, generation, &info);
+            return;
+        }
+        self.load_info_details(chat_id, generation);
+    }
+
+    fn load_info_details(self: &Rc<Self>, chat_id: i64, generation: u64) {
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_chat_info(chat_id).await;
+            let Some(this) = weak.upgrade().filter(|this| this.is_session_current(session_epoch))
+            else {
+                return;
+            };
+            match result {
+                Ok(info) => {
+                    this.chat_info.borrow_mut().insert(chat_id, info.clone());
+                    let mut visible = info;
+                    if let Some(muted) = this.pending_mutes.borrow().get(&chat_id).copied() {
+                        visible.muted = muted;
+                    }
+                    this.info.finish_info(chat_id, generation, &visible);
+                }
+                Err(error) => {
+                    this.info.fail_info(chat_id, generation, &error);
+                }
+            }
+        });
+    }
+
+    fn load_info_members(self: &Rc<Self>, offset: usize) {
+        let Some((chat_id, generation, offset)) = self.info.begin_members(offset) else {
+            return;
+        };
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_members(chat_id, offset as i32, 50).await;
+            let Some(this) = weak.upgrade().filter(|this| this.is_session_current(session_epoch))
+            else {
+                return;
+            };
+            match result {
+                Ok(members) => {
+                    this.info
+                        .finish_members(chat_id, generation, offset, members);
+                }
+                Err(error) => {
+                    this.info
+                        .fail_members(chat_id, generation, offset, &error);
+                }
+            }
+        });
+    }
+
+    fn load_info_shared_request(self: &Rc<Self>) {
+        let Some(request) = self.info.begin_shared_page() else {
+            return;
+        };
+        self.load_info_shared(request);
+    }
+
+    fn load_info_shared(
+        self: &Rc<Self>,
+        request: (i64, u64, u64, SharedKind, Option<i32>),
+    ) {
+        let (chat_id, bind_generation, shared_generation, kind, before_id) = request;
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_shared_media(chat_id, kind, before_id).await;
+            let Some(this) = weak.upgrade().filter(|this| this.is_session_current(session_epoch))
+            else {
+                return;
+            };
+            match result {
+                Ok(messages) => {
+                    let photos = (kind == SharedKind::Photos).then(|| messages.clone());
+                    if !this.info.finish_shared(
+                        chat_id,
+                        bind_generation,
+                        shared_generation,
+                        kind,
+                        before_id,
+                        messages,
+                    ) {
+                        return;
+                    }
+                    if let Some(photos) = photos {
+                        for message in photos {
+                            this.load_info_thumbnail(
+                                chat_id,
+                                bind_generation,
+                                shared_generation,
+                                message.id,
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    this.info.fail_shared(
+                        chat_id,
+                        bind_generation,
+                        shared_generation,
+                        kind,
+                        &error,
+                    );
+                }
+            }
+        });
+    }
+
+    fn load_info_thumbnail(
+        self: &Rc<Self>,
+        chat_id: i64,
+        bind_generation: u64,
+        shared_generation: u64,
+        msg_id: i32,
+    ) {
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let Ok(Some(path)) = tg.download_media(chat_id, msg_id).await else {
+                return;
+            };
+            let decode_path = path.clone();
+            let Ok(Ok(texture)) = gio::spawn_blocking(move || {
+                gdk::Texture::from_filename(&decode_path)
+            })
+            .await
+            else {
+                return;
+            };
+            if let Some(this) = weak.upgrade() {
+                this.info.set_thumbnail(
+                    chat_id,
+                    bind_generation,
+                    shared_generation,
+                    msg_id,
+                    path,
+                    &texture,
+                );
+            }
+        });
+    }
+
+    fn handle_info_action(self: Rc<Self>, action: InfoAction) {
+        match action {
+            InfoAction::Close => {
+                self.close_info_panel();
+            }
+            InfoAction::RetryInfo => {
+                if let (Some(chat_id), generation) =
+                    (self.info.chat_id(), self.info.bind_generation())
+                {
+                    self.load_info_details(chat_id, generation);
+                }
+            }
+            InfoAction::SetNotifications(enabled) => {
+                if let Some(chat_id) = self.info.chat_id() {
+                    self.handle_chat_action(
+                        chat_id,
+                        ChatAction::Mute(if enabled {
+                            MuteMode::Unmute
+                        } else {
+                            MuteMode::Forever
+                        }),
+                    );
+                }
+            }
+            InfoAction::OpenMember(user_id) => self.open_mention(user_id),
+            InfoAction::MoreMembers | InfoAction::RetryMembers => {
+                self.load_info_members(self.info.members_count());
+            }
+            InfoAction::SelectShared(kind) => {
+                if let Some(request) = self.info.begin_shared(kind) {
+                    self.load_info_shared(request);
+                }
+            }
+            InfoAction::MoreShared | InfoAction::RetryShared => {
+                self.load_info_shared_request();
+            }
+            InfoAction::OpenMedia(msg_id) => self.open_shared_media(msg_id),
+        }
+    }
+
+    fn open_shared_media(self: &Rc<Self>, msg_id: i32) {
+        let Some(chat_id) = self.info.chat_id() else {
+            return;
+        };
+        let messages = self.info.shared_messages();
+        let Some(message) = messages.iter().find(|message| message.id == msg_id).cloned() else {
+            return;
+        };
+        match self.info.shared_kind() {
+            SharedKind::Photos if message.media == Some(MediaKind::Photo) => {
+                self.close_forward();
+                self.close_viewer();
+                let generation = self.viewer_generation.get().wrapping_add(1);
+                self.viewer_generation.set(generation);
+                if self.viewer.present(
+                    chat_id,
+                    messages,
+                    msg_id,
+                    self.info.shared_path(msg_id),
+                    generation,
+                ) {
+                    self.apply_info_layout(self.current_window_width());
+                    self.clone().load_viewer_media(msg_id, generation);
+                }
+            }
+            SharedKind::Links => {
+                let target = message
+                    .webpage
+                    .as_ref()
+                    .map(|preview| preview.url.as_str())
+                    .unwrap_or(message.text.as_str());
+                self.open_link(target);
+            }
+            SharedKind::Files | SharedKind::Voice | SharedKind::Music => {
+                let bind_generation = self.info.bind_generation();
+                let shared_generation = self.info.shared_generation();
+                let kind = self.info.shared_kind();
+                let session_epoch = self.session_epoch.get();
+                let tg = self.tg.clone();
+                let weak = Rc::downgrade(self);
+                glib::MainContext::default().spawn_local(async move {
+                    let result = tg.download_media(chat_id, msg_id).await;
+                    let Some(this) = weak.upgrade().filter(|this| {
+                        this.is_session_current(session_epoch)
+                            && this.info.is_bound(chat_id)
+                            && this.info.bind_generation() == bind_generation
+                            && this.info.shared_generation() == shared_generation
+                            && this.info.shared_kind() == kind
+                    }) else {
+                        return;
+                    };
+                    match result {
+                        Ok(Some(path)) => this.launch_media(&path),
+                        Ok(None) => this.messages.show_error("Media unavailable"),
+                        Err(error) => this.messages.show_error(&error),
+                    }
+                });
+            }
+            SharedKind::Photos => {}
+        }
+    }
+
+    fn open_stickers(self: &Rc<Self>) {
+        if self.open_chat.get().is_none_or(is_virtual)
+            || self.composer_operation.get()
+            || self.messages.is_busy()
+            || self.messages.selection_mode()
+        {
+            return;
+        }
+        self.close_forward();
+        self.close_viewer();
+        self.close_contacts();
+        self.close_new_group();
+        let generation = self.stickers.begin();
+        self.messages
+            .show_sticker_popover(self.stickers.popover());
+        self.apply_info_layout(self.current_window_width());
+        self.load_sticker_packs(generation);
+    }
+
+    fn close_stickers(&self) {
+        if self.stickers.is_open() {
+            self.messages.dismiss_composer_popover();
+        }
+        self.stickers.close();
+        self.apply_info_layout(self.current_window_width());
+    }
+
+    fn load_sticker_packs(self: &Rc<Self>, generation: u64) {
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_sticker_packs().await;
+            let Some(this) = weak.upgrade().filter(|this| {
+                this.is_session_current(session_epoch)
+                    && this.stickers.generation() == generation
+                    && this.stickers.is_open()
+            }) else {
+                return;
+            };
+            match result {
+                Ok(packs) => {
+                    this.stickers.finish_packs(generation, packs);
+                }
+                Err(error) => {
+                    this.stickers.fail_packs(generation, &error);
+                }
+            }
+        });
+    }
+
+    fn load_sticker_pack(self: &Rc<Self>, pack_id: String) {
+        let (generation, content_generation, key) = self.stickers.begin_pack(&pack_id);
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            if key == "gifs" {
+                let result = tg.get_saved_gifs().await;
+                let Some(this) = weak.upgrade().filter(|this| {
+                    this.is_session_current(session_epoch)
+                        && this.stickers.is_open()
+                        && this.stickers.generation() == generation
+                        && this.stickers.content_generation() == content_generation
+                }) else {
+                    return;
+                };
+                match result {
+                    Ok(gifs) => {
+                        let ids = gifs.iter().map(|gif| gif.id).collect::<Vec<_>>();
+                        if this
+                            .stickers
+                            .finish_gifs(generation, content_generation, gifs)
+                        {
+                            for id in ids {
+                                this.download_gif_card(generation, content_generation, id);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        this.stickers
+                            .fail_pack(generation, content_generation, "gifs", &error);
+                    }
+                }
+                return;
+            }
+            let result = tg.get_stickers(&key).await;
+            let Some(this) = weak.upgrade().filter(|this| {
+                this.is_session_current(session_epoch)
+                    && this.stickers.is_open()
+                    && this.stickers.generation() == generation
+                    && this.stickers.content_generation() == content_generation
+            }) else {
+                return;
+            };
+            match result {
+                Ok(stickers) => {
+                    let static_ids = stickers
+                        .iter()
+                        .filter_map(|sticker| (!sticker.animated).then_some(sticker.id))
+                        .collect::<Vec<_>>();
+                    if this.stickers.finish_stickers(
+                        generation,
+                        content_generation,
+                        &key,
+                        stickers,
+                    ) {
+                        for sticker_id in static_ids {
+                            this.download_sticker_cell(
+                                generation,
+                                content_generation,
+                                key.clone(),
+                                sticker_id,
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    this.stickers
+                        .fail_pack(generation, content_generation, &key, &error);
+                }
+            }
+        });
+    }
+
+    fn download_sticker_cell(
+        self: &Rc<Self>,
+        generation: u64,
+        content_generation: u64,
+        pack_id: String,
+        sticker_id: i64,
+    ) {
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            // A32/A33: a missing file, a download error or an undecodable
+            // image must be visible on the cell, not silently swallowed.
+            let unavailable = |this: Option<Rc<Self>>| {
+                if let Some(this) = this {
+                    this.stickers.mark_unavailable(
+                        generation,
+                        content_generation,
+                        &pack_id,
+                        sticker_id,
+                    );
+                }
+            };
+            let path = match tg.download_sticker(sticker_id).await {
+                Ok(Some(path)) => path,
+                Ok(None) | Err(_) => return unavailable(weak.upgrade()),
+            };
+            let decode_path = path.clone();
+            let decoded =
+                gio::spawn_blocking(move || gdk::Texture::from_filename(&decode_path)).await;
+            let Ok(Ok(texture)) = decoded else {
+                return unavailable(weak.upgrade());
+            };
+            if let Some(this) = weak.upgrade() {
+                this.stickers.set_sticker_texture(
+                    generation,
+                    content_generation,
+                    &pack_id,
+                    sticker_id,
+                    path,
+                    &texture,
+                );
+            }
+        });
+    }
+
+    fn download_gif_card(
+        self: &Rc<Self>,
+        generation: u64,
+        content_generation: u64,
+        gif_id: i64,
+    ) {
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.download_gif(gif_id).await;
+            let Some(this) = weak.upgrade() else { return };
+            // GIF cells carry no preview surface yet; when the file is not
+            // there the card says so instead of pretending to be loading.
+            if !matches!(result, Ok(Some(_))) {
+                this.stickers
+                    .mark_unavailable(generation, content_generation, "gifs", gif_id);
+            }
+        });
+    }
+
+    fn handle_sticker_action(self: Rc<Self>, action: StickerAction) {
+        match action {
+            StickerAction::RetryPacks => {
+                let generation = self.stickers.begin();
+                self.load_sticker_packs(generation);
+            }
+            StickerAction::SelectPack(pack_id) => self.load_sticker_pack(pack_id),
+            StickerAction::RetryPack => {
+                let pack_id = self.stickers.current_pack();
+                if !pack_id.is_empty() {
+                    self.load_sticker_pack(pack_id);
+                }
+            }
+            StickerAction::Send(send) => self.send_sticker_or_gif(send),
+            StickerAction::RetrySend => {
+                if let Some(send) = self.stickers.retry_send() {
+                    self.send_sticker_or_gif(send);
+                }
+            }
+        }
+    }
+
+    fn send_sticker_or_gif(self: Rc<Self>, send: StickerSend) {
+        if self.composer_operation.get() || self.messages.is_busy() {
+            return;
+        }
+        let Some(chat_id) = self.open_chat.get().filter(|chat_id| !is_virtual(*chat_id)) else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        let title = self.title_for(chat_id);
+        let Some(session_epoch) = self.begin_mutation() else {
+            return;
+        };
+        let token = self.acquire_composer();
+        self.messages.set_busy(true);
+        glib::MainContext::default().spawn_local(async move {
+            let result = match send {
+                StickerSend::Sticker(sticker_id) => {
+                    self.tg.send_sticker(chat_id, sticker_id).await
+                }
+                StickerSend::Gif(gif_id) => self.tg.send_gif(chat_id, gif_id).await,
+            };
+            self.finish_mutation();
+            if !self.is_session_current(session_epoch) {
+                return;
+            }
+            // A7: only the operation that still owns the lock may clear it
+            // (and the busy state it took with it).
+            if self.release_composer(token) {
+                self.messages.set_busy(false);
+            }
+            match result {
+                Ok(message) => {
+                    self.stickers.finish_send();
+                    self.remember_last(&message);
+                    self.dialog_upsert(
+                        chat_id,
+                        &title,
+                        &message_preview(&message),
+                        Some(message.ts),
+                        UnreadUpdate::Delta(0),
+                    );
+                    if self.is_current(chat_id, epoch) {
+                        let inserted = self.messages.merge_event(message);
+                        self.post_render(inserted);
+                    }
+                }
+                Err(error) => {
+                    if self.is_current(chat_id, epoch) {
+                        self.stickers.fail_send(send, &error);
+                    }
+                }
+            }
+        });
+    }
+
+    fn start_recording(self: &Rc<Self>) {
+        if self.composer_operation.get()
+            || self.messages.is_busy()
+            || self.open_chat.get().is_none_or(is_virtual)
+        {
+            return;
+        }
+        let target = RecordTarget {
+            chat_id: self.open_chat.get().unwrap_or_default(),
+            epoch: self.epoch.get(),
+        };
+        if !self.recorder.borrow_mut().begin_start(target) {
+            return;
+        }
+        self.close_stickers();
+        self.voice_retry.borrow_mut().take();
+        let token = self.acquire_composer();
+        self.recorder_token.set(token);
+        self.messages.clear_error();
+        self.messages.show_recorder_starting();
+        let local = self.local.clone();
+        let session_epoch = self.session_epoch.get();
+        let start_delay = self.probe_record_start_delay.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            if start_delay > 0 {
+                glib::timeout_future(Duration::from_millis(start_delay)).await;
+            }
+            let result = local.record_start().await;
+            let Some(this) = weak.upgrade() else { return };
+            let resolution = this
+                .recorder
+                .borrow_mut()
+                .resolve_start(target, result.is_ok());
+            match resolution {
+                StartResolution::Recording(_) => {
+                    if this.is_session_current(session_epoch)
+                        && this.is_current(target.chat_id, target.epoch)
+                    {
+                        this.messages.show_recorder_recording();
+                    } else {
+                        this.cancel_recording();
+                    }
+                }
+                StartResolution::CancelNow(_) => {
+                    // The backend slot only frees once `record_cancel`
+                    // returns; hold the lock until then so the next
+                    // `record_start` cannot race it.
+                    local.record_cancel().await;
+                    if this.release_composer(token)
+                        && this.is_current(target.chat_id, target.epoch)
+                    {
+                        this.messages.hide_recorder();
+                    }
+                }
+                StartResolution::Failed(_) => {
+                    if this.release_composer(token)
+                        && this.is_session_current(session_epoch)
+                        && this.is_current(target.chat_id, target.epoch)
+                    {
+                        this.messages
+                            .show_recorder_error(&recording_error(result.err().as_deref()), false);
+                    }
+                }
+                StartResolution::Stale => {
+                    this.release_composer(token);
+                }
+            }
+        });
+    }
+
+    fn cancel_recording(self: &Rc<Self>) {
+        self.voice_retry.borrow_mut().take();
+        let token = self.recorder_token.get();
+        match self.recorder.borrow_mut().cancel() {
+            CancelCommand::Now(target) => {
+                // Hide the bar at once, but keep the composer locked until the
+                // backend recording slot is actually released: `record_start`
+                // fails while a cancel is still in flight.
+                if self.is_current(target.chat_id, target.epoch) {
+                    self.messages.hide_recorder();
+                    // The composer is visible again but still locked until the
+                    // backend slot is free; show that instead of dropping input.
+                    self.messages.set_busy(true);
+                }
+                let local = self.local.clone();
+                let weak = Rc::downgrade(self);
+                glib::MainContext::default().spawn_local(async move {
+                    local.record_cancel().await;
+                    if let Some(this) = weak.upgrade() {
+                        if this.release_composer(token) && this.is_current(target.chat_id, target.epoch) {
+                            this.messages.set_busy(false);
+                        }
+                    }
+                });
+            }
+            CancelCommand::Deferred => {
+                // A8: the outstanding start/stop completion owns both the
+                // backend cancel and this lock. Releasing here would unlock a
+                // composer that is still mid-operation, so keep the lock and
+                // the bar until that completion resolves. A chat switch hides
+                // the departed view's bar through `reset_chat`.
+                self.messages.show_recorder_cancelling();
+            }
+            CancelCommand::None => {
+                if self.messages.recorder_visible() {
+                    self.release_composer(token);
+                    self.messages.hide_recorder();
+                }
+            }
+        }
+    }
+
+    fn stop_and_send_recording(self: &Rc<Self>) {
+        let Some(target) = self.recorder.borrow_mut().begin_stop() else {
+            return;
+        };
+        self.messages.show_recorder_stopping();
+        let local = self.local.clone();
+        let session_epoch = self.session_epoch.get();
+        let token = self.recorder_token.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = local.record_stop().await;
+            let Some(this) = weak.upgrade() else { return };
+            let resolution = this
+                .recorder
+                .borrow_mut()
+                .resolve_stop(target, result.is_ok());
+            match resolution {
+                StopResolution::Sending(_) => {
+                    if let Ok((path, duration)) = result {
+                        this.send_voice_pending(
+                            PendingVoice {
+                                target,
+                                path,
+                                duration,
+                            },
+                            session_epoch,
+                        );
+                    }
+                }
+                StopResolution::Cancelled(_) => {
+                    local.record_cancel().await;
+                    if this.release_composer(token)
+                        && this.is_current(target.chat_id, target.epoch)
+                    {
+                        this.messages.hide_recorder();
+                    }
+                }
+                StopResolution::Failed(_) => {
+                    if this.release_composer(token)
+                        && this.is_session_current(session_epoch)
+                        && this.is_current(target.chat_id, target.epoch)
+                    {
+                        this.messages
+                            .show_recorder_error(&recording_error(result.err().as_deref()), false);
+                    }
+                }
+                StopResolution::Stale => {
+                    this.release_composer(token);
+                }
+            }
+        });
+    }
+
+    fn retry_voice(self: &Rc<Self>) {
+        // C5/A7: a retry is a composer operation like any other and must not
+        // take the lock (nor the recorder token) from one already running.
+        if self.composer_operation.get() || self.messages.is_busy() {
+            return;
+        }
+        let Some(pending) = self.voice_retry.borrow().clone() else {
+            return;
+        };
+        if !self.is_current(pending.target.chat_id, pending.target.epoch)
+            || !self.recorder.borrow_mut().retry_send(pending.target)
+        {
+            return;
+        }
+        self.recorder_token.set(self.acquire_composer());
+        self.send_voice_pending(pending, self.session_epoch.get());
+    }
+
+    fn send_voice_pending(
+        self: &Rc<Self>,
+        pending: PendingVoice,
+        session_epoch: u64,
+    ) {
+        let token = self.recorder_token.get();
+        let Some(mutation_epoch) = self.begin_mutation() else {
+            self.recorder.borrow_mut().finish_send(pending.target);
+            self.release_composer(token);
+            return;
+        };
+        self.messages.show_recorder_sending();
+        let title = self.title_for(pending.target.chat_id);
+        let weak = Rc::downgrade(self);
+        let tg = self.tg.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg
+                .send_voice(
+                    pending.target.chat_id,
+                    pending.path.clone(),
+                    pending.duration,
+                )
+                .await;
+            let Some(this) = weak.upgrade() else { return };
+            this.finish_mutation();
+            let finished = this.recorder.borrow_mut().finish_send(pending.target);
+            if finished {
+                this.release_composer(token);
+            }
+            if mutation_epoch != session_epoch || !this.is_session_current(session_epoch) {
+                return;
+            }
+            // The machine already discarded this send (cancelled via Esc or
+            // selection mode): never touch a bar that may belong to a newer
+            // recording, and never re-arm a retry for it.
+            if !finished {
+                if let Ok(message) = result {
+                    this.remember_last(&message);
+                    this.dialog_upsert(
+                        pending.target.chat_id,
+                        &title,
+                        &message_preview(&message),
+                        Some(message.ts),
+                        UnreadUpdate::Delta(0),
+                    );
+                    if this.is_current(pending.target.chat_id, pending.target.epoch) {
+                        let inserted = this.messages.merge_event(message);
+                        this.post_render(inserted);
+                    }
+                }
+                return;
+            }
+            match result {
+                Ok(message) => {
+                    this.voice_retry.borrow_mut().take();
+                    this.remember_last(&message);
+                    this.dialog_upsert(
+                        pending.target.chat_id,
+                        &title,
+                        &message_preview(&message),
+                        Some(message.ts),
+                        UnreadUpdate::Delta(0),
+                    );
+                    if this.is_current(pending.target.chat_id, pending.target.epoch) {
+                        let inserted = this.messages.merge_event(message);
+                        this.post_render(inserted);
+                        this.messages.hide_recorder();
+                    }
+                }
+                Err(error) => {
+                    *this.voice_retry.borrow_mut() = Some(pending.clone());
+                    if this.is_current(pending.target.chat_id, pending.target.epoch) {
+                        this.messages
+                            .show_recorder_error(&recording_error(Some(&error)), true);
+                    }
+                }
             }
         });
     }
@@ -1792,6 +3166,19 @@ impl ShellInner {
                             .map(|dialog| (dialog.id, dialog.last_time))
                             .collect();
                     this.chatlist.set_chats(dialogs);
+                    this.pending_mutes.borrow_mut().retain(|chat_id, intent| {
+                        this.chatlist
+                            .summary(*chat_id)
+                            .is_none_or(|summary| summary.muted != *intent)
+                    });
+                    if let Some(chat_id) = this.info.chat_id() {
+                        let cached = this.chatlist.summary(chat_id).map(|summary| summary.muted);
+                        let muted = effective_mute(
+                            this.pending_mutes.borrow().get(&chat_id).copied(),
+                            cached,
+                        );
+                        this.info.set_notifications(!muted);
+                    }
                     let mut event_messages: Vec<Msg> =
                         this.last_by_chat.borrow().values().cloned().collect();
                     event_messages.sort_by_key(|message| message.ts);
@@ -1957,6 +3344,69 @@ impl ShellInner {
                 }
             });
         }
+        if std::env::var("OMG_SMOKE_INFO").is_ok_and(|value| !value.is_empty()) {
+            let weak = Rc::downgrade(self);
+            glib::MainContext::default().spawn_local(async move {
+                let Some(this) = weak.upgrade() else { return };
+                let chat_id = this
+                    .chatlist
+                    .ordered()
+                    .into_iter()
+                    .find_map(|(id, title)| (title == "Arch Linux ARM").then_some(id));
+                let Some(chat_id) = chat_id else { return };
+                this.clone().open_chat(chat_id);
+                if !this.ui_state.borrow().info_panel_open {
+                    this.toggle_info_panel();
+                }
+                let _ = poll_until(8_000, || {
+                    this.info.is_bound(chat_id)
+                        && this.info.members_count() > 0
+                        && this.info.shared_state_text() != "Loading shared media…"
+                })
+                .await;
+            });
+        }
+        if std::env::var("OMG_SMOKE_STICKERS").is_ok_and(|value| !value.is_empty()) {
+            let weak = Rc::downgrade(self);
+            glib::MainContext::default().spawn_local(async move {
+                let Some(this) = weak.upgrade() else { return };
+                if this.open_chat.get().is_none() {
+                    if let Some(chat_id) = this
+                        .chatlist
+                        .ordered()
+                        .into_iter()
+                        .find_map(|(id, title)| (title == "Marta").then_some(id))
+                    {
+                        this.clone().open_chat(chat_id);
+                    }
+                }
+                if poll_until(8_000, || !this.messages.is_loading()).await {
+                    this.open_stickers();
+                }
+            });
+        }
+        if std::env::var("OMG_SMOKE_RECORDING").is_ok_and(|value| !value.is_empty()) {
+            let weak = Rc::downgrade(self);
+            glib::MainContext::default().spawn_local(async move {
+                let Some(this) = weak.upgrade() else { return };
+                if this.open_chat.get().is_none() {
+                    if let Some(chat_id) = this
+                        .chatlist
+                        .ordered()
+                        .into_iter()
+                        .find_map(|(id, title)| (title == "Marta").then_some(id))
+                    {
+                        this.clone().open_chat(chat_id);
+                    }
+                }
+                if poll_until(8_000, || !this.messages.is_loading()).await {
+                    this.start_recording();
+                }
+            });
+        }
+        if std::env::var("OMG_SMOKE_CONTACTS").is_ok_and(|value| !value.is_empty()) {
+            self.open_contacts();
+        }
     }
 
     fn install_window_hook(self: &Rc<Self>) {
@@ -2024,6 +3474,7 @@ impl ShellInner {
             let source = glib::timeout_add_local_once(Duration::from_millis(220), move || {
                 let Some(this) = weak.upgrade() else { return };
                 this.theme_switch_timeout.borrow_mut().take();
+                this.messages.refresh_theme();
                 this.effects.theme_switched(&this.overlay);
             });
             *this.theme_switch_timeout.borrow_mut() = Some(source);
@@ -2100,6 +3551,9 @@ impl ShellInner {
                 }
             }
             Event::MessageDeleted { chat_id, msg_ids } => {
+                // A20: bookkeeping changes before viewer/row animation or
+                // tombstone rendering touches any selected row.
+                self.messages.drop_selection_ids(&msg_ids);
                 let viewer_closed = self.viewer.remove_deleted(chat_id, &msg_ids);
                 if viewer_closed {
                     self.close_viewer();
@@ -2249,17 +3703,12 @@ impl ShellInner {
     }
 
     fn notify(&self, message: &Msg) {
-        let muted = self
-            .pending_mutes
-            .borrow()
-            .get(&message.chat_id)
-            .copied()
-            .or_else(|| {
-                self.chatlist
-                    .summary(message.chat_id)
-                    .map(|chat| chat.muted)
-            })
-            .unwrap_or(false);
+        let muted = effective_mute(
+            self.pending_mutes.borrow().get(&message.chat_id).copied(),
+            self.chatlist
+                .summary(message.chat_id)
+                .map(|chat| chat.muted),
+        );
         if muted {
             return;
         }
@@ -2287,6 +3736,8 @@ impl ShellInner {
         let notification = gio::Notification::new(title.as_str());
         notification.set_body(Some(body.as_str()));
         application.send_notification(Some(&format!("chat-{}", message.chat_id)), &notification);
+        self.probe_notifications
+            .set(self.probe_notifications.get().wrapping_add(1));
     }
 
     fn open_chat(self: Rc<Self>, chat_id: i64) {
@@ -2299,11 +3750,16 @@ impl ShellInner {
         self.switcher.close();
         self.close_forward();
         self.close_viewer();
+        self.close_contacts();
+        self.close_new_group();
+        self.close_stickers();
+        self.close_caption_dialog();
         self.close_in_chat_search();
         self.reaction_retry.borrow_mut().take();
         if self.open_chat.get() == Some(chat_id) {
             return;
         }
+        self.cancel_recording();
         self.main_menu.dismiss();
         self.chatlist.dismiss_popovers();
         self.messages.dismiss_owned_popovers();
@@ -2337,6 +3793,7 @@ impl ShellInner {
             self.messages.set_read_outbox(known);
         }
         self.restore_draft(chat_id);
+        self.bind_info_panel();
         self.load_chat_info(chat_id, epoch);
         self.load_pinned(chat_id);
         let recent = self
@@ -2376,6 +3833,8 @@ impl ShellInner {
         }
         let epoch = self.bump_epoch();
         self.open_chat.set(Some(chat_id));
+        self.info.unbind();
+        self.apply_info_layout(self.current_window_width());
         self.chatlist.select_chat(chat_id);
         self.messages
             .reset_chat(chat_id, virtual_title(chat_id), epoch);
@@ -2404,8 +3863,12 @@ impl ShellInner {
         if self.open_chat.get() != Some(chat_id) {
             return;
         }
+        // `reset_chat` hides the recorder bar; the machine has to be
+        // transitioned with it or the composer stays locked with no controls.
+        self.cancel_recording();
         self.close_forward();
         self.close_viewer();
+        self.close_stickers();
         if self.messages.search_is_open() {
             self.close_in_chat_search();
         }
@@ -2514,9 +3977,11 @@ impl ShellInner {
         }
         match action {
             MessageAction::Submit => self.submit_composer(),
-            MessageAction::Mic => {
-                // TODO(5D): replace with the serialized voice-recorder state machine.
-            }
+            MessageAction::Mic => self.start_recording(),
+            MessageAction::Stickers => self.open_stickers(),
+            MessageAction::RecorderCancel => self.cancel_recording(),
+            MessageAction::RecorderSend => self.stop_and_send_recording(),
+            MessageAction::RecorderRetry => self.retry_voice(),
             MessageAction::DraftChanged => self.composer_draft_changed(),
             MessageAction::DraftRetry => {
                 if let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
@@ -2564,6 +4029,30 @@ impl ShellInner {
             MessageAction::Edit(msg_id) => self.messages.begin_edit(msg_id),
             MessageAction::EditHistory(msg_id) => self.open_edit_history(msg_id),
             MessageAction::Forward(msg_id) => self.open_forward(vec![msg_id]),
+            MessageAction::Select(msg_id) => {
+                self.close_stickers();
+                self.messages.begin_selection(msg_id);
+            }
+            MessageAction::SelectionForward => {
+                let ids = self.messages.selection_ids();
+                self.open_forward(ids);
+            }
+            MessageAction::SelectionDelete => self.confirm_delete_selected(),
+            MessageAction::SelectionCopy => {
+                let text = self
+                    .messages
+                    .selection_ids()
+                    .into_iter()
+                    .filter_map(|msg_id| self.messages.message(msg_id))
+                    .map(|message| message.text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    self.widget.clipboard().set_text(&text);
+                    *self.probe_copied.borrow_mut() = text;
+                }
+            }
+            MessageAction::SelectionCancel => self.messages.exit_selection_mode(),
             MessageAction::Reaction { msg_id, emoji } => {
                 if let Some(emoji) = emoji {
                     self.send_reaction(msg_id, emoji);
@@ -3044,6 +4533,7 @@ impl ShellInner {
             self.chatlist.ordered_summaries(),
             generation,
         );
+        self.apply_info_layout(self.current_window_width());
     }
 
     fn close_forward(&self) {
@@ -3059,6 +4549,7 @@ impl ShellInner {
             self.messages.focus_composer();
         }
         self.forward.close();
+        self.apply_info_layout(self.current_window_width());
     }
 
     fn handle_forward_action(self: Rc<Self>, action: ForwardAction) {
@@ -3154,6 +4645,7 @@ impl ShellInner {
             .viewer
             .present(chat_id, photos, msg_id, path, generation)
         {
+            self.apply_info_layout(self.current_window_width());
             self.clone().load_viewer_media(msg_id, generation);
         }
     }
@@ -3171,6 +4663,7 @@ impl ShellInner {
             self.messages.focus_composer();
         }
         self.viewer.close();
+        self.apply_info_layout(self.current_window_width());
     }
 
     fn handle_viewer_action(self: Rc<Self>, action: ViewerAction) {
@@ -3178,7 +4671,7 @@ impl ShellInner {
             ViewerAction::Load { msg_id, generation } => self.load_viewer_media(msg_id, generation),
             ViewerAction::Open { msg_id, generation } => {
                 if self.viewer_generation.get() == generation {
-                    if let Some(path) = self.messages.media_path(msg_id) {
+                    if let Some(path) = self.viewer_media_path(msg_id) {
                         self.launch_media(&path);
                     }
                 }
@@ -3192,12 +4685,12 @@ impl ShellInner {
         if self.viewer_generation.get() != generation || !self.viewer.is_open() {
             return;
         }
-        if let Some(path) = self.messages.media_path(msg_id) {
+        if let Some(path) = self.viewer_media_path(msg_id) {
             self.viewer.set_path(msg_id, generation, path);
             return;
         }
         let weak = Rc::downgrade(&self);
-        self.messages.on_media_ready(msg_id, move |path| {
+        let registered = self.messages.on_media_ready(msg_id, move |path| {
             if let Some(this) = weak
                 .upgrade()
                 .filter(|this| this.viewer_generation.get() == generation && this.viewer.is_open())
@@ -3205,6 +4698,10 @@ impl ShellInner {
                 this.viewer.set_path(msg_id, generation, path);
             }
         });
+        if !registered {
+            self.load_shared_viewer_media(msg_id, generation);
+            return;
+        }
         if matches!(
             self.messages.media_state(msg_id),
             Some(MediaState::NotStarted | MediaState::Failed)
@@ -3213,11 +4710,69 @@ impl ShellInner {
         }
     }
 
+    fn viewer_media_path(&self, msg_id: i32) -> Option<PathBuf> {
+        self.messages
+            .media_path(msg_id)
+            .or_else(|| self.info.shared_path(msg_id))
+    }
+
+    fn load_shared_viewer_media(self: Rc<Self>, msg_id: i32, generation: u64) {
+        let Some(chat_id) = self.viewer.chat_id() else { return };
+        let bind_generation = self.info.bind_generation();
+        let shared_generation = self.info.shared_generation();
+        if !self.info.is_bound(chat_id)
+            || self.info.shared_kind() != SharedKind::Photos
+            || !self
+                .info
+                .shared_messages()
+                .iter()
+                .any(|message| message.id == msg_id)
+        {
+            return;
+        }
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(&self);
+        glib::MainContext::default().spawn_local(async move {
+            let Ok(Some(path)) = tg.download_media(chat_id, msg_id).await else {
+                if let Some(this) = weak.upgrade() {
+                    this.viewer
+                        .show_error(msg_id, generation, "Image unavailable");
+                }
+                return;
+            };
+            let decode_path = path.clone();
+            let Ok(Ok(texture)) = gio::spawn_blocking(move || {
+                gdk::Texture::from_filename(&decode_path)
+            })
+            .await
+            else {
+                return;
+            };
+            let Some(this) = weak.upgrade().filter(|this| {
+                this.viewer_generation.get() == generation
+                    && this.viewer.is_open()
+                    && this.viewer.chat_id() == Some(chat_id)
+            }) else {
+                return;
+            };
+            if this.info.set_thumbnail(
+                chat_id,
+                bind_generation,
+                shared_generation,
+                msg_id,
+                path.clone(),
+                &texture,
+            ) {
+                this.viewer.set_path(msg_id, generation, path);
+            }
+        });
+    }
+
     fn save_viewer_media(self: Rc<Self>, msg_id: i32, generation: u64) {
         if self.viewer_generation.get() != generation {
             return;
         }
-        let Some(source_path) = self.messages.media_path(msg_id) else {
+        let Some(source_path) = self.viewer_media_path(msg_id) else {
             return;
         };
         let Some(window) = self.window() else { return };
@@ -3866,7 +5421,7 @@ impl ShellInner {
         let Some(session_epoch) = self.begin_mutation() else {
             return;
         };
-        self.composer_operation.set(true);
+        let token = self.acquire_composer();
         self.messages.clear_error();
         self.messages.set_busy(true);
         self.messages.start_send_feedback();
@@ -3881,7 +5436,7 @@ impl ShellInner {
                 if !self.is_session_current(session_epoch) {
                     return;
                 }
-                self.composer_operation.set(false);
+                let owns_composer = self.release_composer(token);
                 match result {
                     Ok(message) => {
                         let message = self.apply_tombstone(message);
@@ -3912,8 +5467,10 @@ impl ShellInner {
                         }
                     }
                 }
-                self.messages.stop_send_feedback();
-                self.messages.set_busy(false);
+                if owns_composer {
+                    self.messages.stop_send_feedback();
+                    self.messages.set_busy(false);
+                }
             });
             return;
         }
@@ -3941,7 +5498,7 @@ impl ShellInner {
             if !self.is_session_current(session_epoch) {
                 return;
             }
-            self.composer_operation.set(false);
+            let owns_composer = self.release_composer(token);
             match result {
                 Ok(message) => {
                     let message = self.apply_tombstone(message);
@@ -3974,8 +5531,10 @@ impl ShellInner {
                     }
                 }
             }
-            self.messages.stop_send_feedback();
-            self.messages.set_busy(false);
+            if owns_composer {
+                self.messages.stop_send_feedback();
+                self.messages.set_busy(false);
+            }
         });
     }
 
@@ -3994,21 +5553,18 @@ impl ShellInner {
         };
         let epoch = self.epoch.get();
         let session_epoch = self.session_epoch.get();
-        let caption = self.messages.composer_text();
         let title = self.title_for(chat_id);
-        self.composer_operation.set(true);
+        let token = self.acquire_composer();
         self.messages.clear_error();
         self.messages.set_busy(true);
         let dialog = gtk::FileDialog::new();
         glib::MainContext::default().spawn_local(async move {
             match dialog.open_future(Some(&window)).await {
                 Ok(file) => {
-                    self.send_file_snapshot(file, chat_id, epoch, session_epoch, caption, title)
-                        .await;
+                    self.open_caption_dialog(file, chat_id, epoch, session_epoch, token, title);
                 }
                 Err(error) if error.matches(gio::IOErrorEnum::Cancelled) => {
-                    if self.is_session_current(session_epoch) {
-                        self.composer_operation.set(false);
+                    if self.is_session_current(session_epoch) && self.release_composer(token) {
                         self.messages.set_busy(false);
                     }
                 }
@@ -4017,8 +5573,7 @@ impl ShellInner {
                     if self.is_session_current(session_epoch) && self.is_current(chat_id, epoch) {
                         self.messages.show_error(error.message());
                     }
-                    if self.is_session_current(session_epoch) {
-                        self.composer_operation.set(false);
+                    if self.is_session_current(session_epoch) && self.release_composer(token) {
                         self.messages.set_busy(false);
                     }
                 }
@@ -4038,15 +5593,159 @@ impl ShellInner {
         };
         let epoch = self.epoch.get();
         let session_epoch = self.session_epoch.get();
-        let caption = self.messages.composer_text();
         let title = self.title_for(chat_id);
-        self.composer_operation.set(true);
+        let token = self.acquire_composer();
         self.messages.clear_error();
         self.messages.set_busy(true);
-        glib::MainContext::default().spawn_local(async move {
-            self.send_file_snapshot(file, chat_id, epoch, session_epoch, caption, title)
-                .await;
+        self.open_caption_dialog(file, chat_id, epoch, session_epoch, token, title);
+    }
+
+    fn open_caption_dialog(
+        self: Rc<Self>,
+        file: gio::File,
+        chat_id: i64,
+        epoch: u64,
+        session_epoch: u64,
+        token: u64,
+        title: String,
+    ) {
+        let Some(path) = file.path() else {
+            if self.is_current(chat_id, epoch) {
+                self.messages.show_error("only local files can be sent");
+            }
+            if self.release_composer(token) {
+                self.messages.set_busy(false);
+            }
+            return;
+        };
+        let Some(window) = self.window() else {
+            if self.release_composer(token) {
+                self.messages.set_busy(false);
+            }
+            return;
+        };
+        self.close_forward();
+        self.close_viewer();
+        self.close_contacts();
+        self.close_new_group();
+        self.close_stickers();
+        self.close_caption_dialog();
+
+        let dialog = gtk::Window::builder()
+            .title("Send file")
+            .transient_for(&window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .default_width(380)
+            .resizable(false)
+            .build();
+        dialog.add_css_class("omg-window");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.add_css_class("omg-caption-dialog");
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let file_label = gtk::Label::new(Some(filename));
+        file_label.set_halign(gtk::Align::Start);
+        file_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        content.append(&file_label);
+        let composer_snapshot = self.messages.composer_text();
+        let caption = gtk::Entry::new();
+        caption.set_placeholder_text(Some("Caption"));
+        caption.set_text(&composer_snapshot);
+        caption.set_activates_default(true);
+        content.append(&caption);
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Cancel");
+        let send = gtk::Button::with_label("Send");
+        send.add_css_class("suggested-action");
+        actions.append(&cancel);
+        actions.append(&send);
+        content.append(&actions);
+        dialog.set_child(Some(&content));
+
+        let accepted = Rc::new(Cell::new(false));
+        let weak = Rc::downgrade(&self);
+        let accepted_for_close = accepted.clone();
+        dialog.connect_close_request(move |dialog| {
+            // The caption Entry lives in this dialog's own toplevel, so its
+            // GtkText only gets a focus-out if THIS window drops the focus
+            // while the entry is still mapped. Without it GTK warns from the
+            // cursor-blink tick after the window is gone.
+            gtk::prelude::GtkWindowExt::set_focus(dialog, None::<&gtk::Widget>);
+            if let Some(this) = weak.upgrade() {
+                this.caption_dialog.borrow_mut().take();
+                this.apply_info_layout(this.current_window_width());
+                if !accepted_for_close.get() && this.release_composer(token) {
+                    this.messages.set_busy(false);
+                    this.messages.focus_composer();
+                }
+            }
+            glib::Propagation::Proceed
         });
+        let dialog_for_cancel = dialog.clone();
+        cancel.connect_clicked(move |_| dialog_for_cancel.close());
+
+        let weak = Rc::downgrade(&self);
+        let dialog_for_send = dialog.clone();
+        let caption_for_send = caption.clone();
+        send.connect_clicked(move |_| {
+            let Some(this) = weak.upgrade() else { return };
+            if !this.is_session_current(session_epoch) || !this.is_current(chat_id, epoch) {
+                dialog_for_send.close();
+                return;
+            }
+            accepted.set(true);
+            this.caption_dialog.borrow_mut().take();
+            gtk::prelude::GtkWindowExt::set_focus(&dialog_for_send, None::<&gtk::Widget>);
+            dialog_for_send.close();
+            this.apply_info_layout(this.current_window_width());
+            let caption = caption_for_send.text().to_string();
+            let this_for_send = this.clone();
+            let file = file.clone();
+            let title = title.clone();
+            let composer_snapshot = composer_snapshot.clone();
+            glib::MainContext::default().spawn_local(async move {
+                this_for_send
+                    .send_file_snapshot(
+                        file,
+                        chat_id,
+                        epoch,
+                        session_epoch,
+                        token,
+                        caption,
+                        composer_snapshot,
+                        title,
+                    )
+                    .await;
+            });
+        });
+        let send_for_activate = send.clone();
+        caption.connect_activate(move |_| send_for_activate.emit_clicked());
+        let escape = gtk::EventControllerKey::new();
+        let dialog_for_escape = dialog.clone();
+        escape.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                dialog_for_escape.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        dialog.add_controller(escape);
+        *self.caption_dialog.borrow_mut() = Some(dialog.clone());
+        self.apply_info_layout(self.current_window_width());
+        dialog.present();
+        caption.grab_focus();
+    }
+
+    fn close_caption_dialog(&self) {
+        if let Some(dialog) = self.caption_dialog.borrow_mut().take() {
+            dialog.close();
+        }
     }
 
     async fn send_file_snapshot(
@@ -4055,7 +5754,9 @@ impl ShellInner {
         chat_id: i64,
         epoch: u64,
         session_epoch: u64,
+        token: u64,
         caption: String,
+        composer_snapshot: String,
         title: String,
     ) {
         if !self.is_session_current(session_epoch) || self.begin_mutation().is_none() {
@@ -4066,8 +5767,7 @@ impl ShellInner {
                 self.messages.show_error("only local files can be sent");
             }
             self.finish_mutation();
-            self.composer_operation.set(false);
-            if self.is_session_current(session_epoch) {
+            if self.release_composer(token) && self.is_session_current(session_epoch) {
                 self.messages.set_busy(false);
             }
             return;
@@ -4077,7 +5777,7 @@ impl ShellInner {
         if !self.is_session_current(session_epoch) {
             return;
         }
-        self.composer_operation.set(false);
+        let owns_composer = self.release_composer(token);
         match result {
             Ok(message) => {
                 let message = self.apply_tombstone(message);
@@ -4097,7 +5797,7 @@ impl ShellInner {
                 }
                 let epoch_is_current = self.is_current(chat_id, epoch);
                 self.messages
-                    .complete_text_operation(&caption, epoch_is_current);
+                    .complete_text_operation(&composer_snapshot, epoch_is_current);
             }
             Err(error) => {
                 shell_log!("send_file({chat_id}): {error}");
@@ -4107,7 +5807,9 @@ impl ShellInner {
                 }
             }
         }
-        self.messages.set_busy(false);
+        if owns_composer {
+            self.messages.set_busy(false);
+        }
     }
 
     fn delete_message(self: Rc<Self>, msg_id: i32) {
@@ -4166,6 +5868,71 @@ impl ShellInner {
                 }
             }
             self.finish_chat_mutation();
+        });
+    }
+
+    fn confirm_delete_selected(self: Rc<Self>) {
+        if !self.messages.selection_all_outgoing() {
+            return;
+        }
+        let ids = self.messages.selection_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let Some(chat_id) = self.open_chat.get().filter(|chat_id| !is_virtual(*chat_id)) else {
+            return;
+        };
+        let Some(window) = self.window() else { return };
+        let dialog = gtk::AlertDialog::builder()
+            .message(format!("Delete {} selected messages?", ids.len()))
+            .buttons(["Cancel", "Delete"])
+            .default_button(0)
+            .cancel_button(0)
+            .build();
+        let epoch = self.epoch.get();
+        let title = self.title_for(chat_id);
+        glib::MainContext::default().spawn_local(async move {
+            if dialog.choose_future(Some(&window)).await.ok() != Some(1)
+                || !self.is_current(chat_id, epoch)
+            {
+                return;
+            }
+            let Some(session_epoch) = self.begin_mutation() else {
+                return;
+            };
+            let result = self.tg.delete_messages(chat_id, ids.clone()).await;
+            self.finish_mutation();
+            if !self.is_session_current(session_epoch) || !self.is_current(chat_id, epoch) {
+                return;
+            }
+            match result {
+                Ok(()) => {
+                    let last_was_deleted = self
+                        .messages
+                        .last_id()
+                        .is_some_and(|id| ids.contains(&id));
+                    let next_last = self.messages.last_excluding(&ids);
+                    self.messages.drop_selection_ids(&ids);
+                    for msg_id in &ids {
+                        self.messages.remove(*msg_id);
+                    }
+                    self.messages.exit_selection_mode();
+                    if last_was_deleted {
+                        let (preview, time) = next_last
+                            .as_ref()
+                            .map(|message| (message_preview(message), Some(message.ts)))
+                            .unwrap_or_else(|| (String::new(), None));
+                        self.dialog_upsert(
+                            chat_id,
+                            &title,
+                            &preview,
+                            time,
+                            UnreadUpdate::Delta(0),
+                        );
+                    }
+                }
+                Err(error) => self.messages.show_error(&error),
+            }
         });
     }
 
@@ -4803,6 +6570,33 @@ impl ShellInner {
         next
     }
 
+    /// Take the C5/A7 composer lock and return the token that owns it.
+    fn acquire_composer(&self) -> u64 {
+        let token = self.composer_token.get().wrapping_add(1);
+        self.composer_token.set(token);
+        self.composer_operation.set(true);
+        token
+    }
+
+    /// Release the composer lock only when `token` still owns it. A late
+    /// completion whose chat/epoch moved on (A7/A8) therefore leaves the lock
+    /// — and the busy state that goes with it — to whoever took it since.
+    fn release_composer(&self, token: u64) -> bool {
+        if self.composer_token.get() != token {
+            return false;
+        }
+        self.composer_operation.set(false);
+        true
+    }
+
+    /// Drop the lock whoever owns it and invalidate every outstanding token
+    /// (session reset / logout).
+    fn force_release_composer(&self) {
+        self.composer_token
+            .set(self.composer_token.get().wrapping_add(1));
+        self.composer_operation.set(false);
+    }
+
     fn begin_mutation(&self) -> Option<u64> {
         if !self.session_ready.get() {
             return None;
@@ -5057,7 +6851,14 @@ impl ShellInner {
             return;
         }
 
-        if let Some((width, explicitly_collapsed, folder_id)) = self.probe_restored_ui_state {
+        if let Some(restored) = self.probe_restored_ui_state {
+            let RestoredUiState {
+                sidebar_width: width,
+                sidebar_collapsed: explicitly_collapsed,
+                folder_id,
+                info_panel_open,
+                info_width,
+            } = restored;
             probe_step("restored UI state");
             if !poll_until(3500, || {
                 let window_width = self.window().map(|window| window.width()).unwrap_or(1100);
@@ -5070,6 +6871,8 @@ impl ShellInner {
                 self.ui_state.borrow().sidebar_width == width
                     && self.ui_state.borrow().sidebar_collapsed == explicitly_collapsed
                     && self.ui_state.borrow().folder_id == folder_id
+                    && self.ui_state.borrow().info_panel_open == info_panel_open
+                    && self.ui_state.borrow().info_width == info_width
                     && self.chatlist.mode() == SidebarMode::Dialogs(folder_id)
                     && self.effective_sidebar_collapsed.get() == collapsed
                     && self.paned.position() == position
@@ -5530,6 +7333,7 @@ impl ShellInner {
         let spoiler = self.messages.rendered_markup(208).unwrap_or_default();
         if !formatted.contains("<b>")
             || !formatted.contains("<tt>")
+            || !formatted.contains("<span background=")
             || !formatted.contains("<a href=")
             || !preformatted.contains("<tt>")
             || !self.messages.message_has_pre_block(207)
@@ -5914,6 +7718,22 @@ impl ShellInner {
         .await
         {
             probe_fail("restore Marta after daily-use probe");
+            return;
+        }
+
+        let mom_for_wave5d = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find_map(|(id, title)| (title == "Mom").then_some(id));
+        let Some(mom_for_wave5d) = mom_for_wave5d else {
+            probe_fail("find Mom for regular-use probe");
+            return;
+        };
+        if !self
+            .run_wave5d_probe(group, marta, deni_for_draft, mom_for_wave5d)
+            .await
+        {
             return;
         }
 
@@ -6858,6 +8678,820 @@ impl ShellInner {
         };
         application.quit();
     }
+
+    async fn run_wave5d_probe(
+        self: &Rc<Self>,
+        group: i64,
+        marta: i64,
+        deni: i64,
+        mom: i64,
+    ) -> bool {
+        if self
+            .probe_restored_ui_state
+            .is_some_and(|restored| restored.info_panel_open)
+        {
+            probe_step("info desired state restored and bound");
+            let Some(current) = self.open_chat.get() else {
+                probe_fail("restored info selected chat");
+                return false;
+            };
+            let expected_width = self
+                .probe_restored_ui_state
+                .map(|restored| restored.info_width)
+                .unwrap_or(320);
+            if !poll_until(1_500, || {
+                self.info.is_bound(current)
+                    && match self.info.layout() {
+                        InfoLayout::Column => {
+                            (self.content_paned.width() - self.content_paned.position()
+                                - expected_width)
+                                .abs()
+                                <= 1
+                        }
+                        InfoLayout::Overlay => (self.info.widget.width() - expected_width).abs() <= 1,
+                        InfoLayout::Hidden => false,
+                    }
+            })
+            .await
+            {
+                probe_fail("restored info binding");
+                return false;
+            }
+            // A27/A36: a restored-open panel is bound AND on screen, not just
+            // flagged open in the state file.
+            if !self.ui_state.borrow().info_panel_open || !self.info.widget.is_visible() {
+                probe_fail("restored info panel visible");
+                return false;
+            }
+        }
+
+        probe_step("info panel Arch Linux ARM");
+        self.clone().open_chat(group);
+        if !self.ui_state.borrow().info_panel_open {
+            self.toggle_info_panel();
+        }
+        if !poll_until(1_000, || self.info.is_bound(group)).await {
+            probe_fail("info panel bind group");
+            return false;
+        }
+
+        if environment_listed("OMG_MOCK_SLOW", "GetMembers")
+            || environment_listed("OMG_MOCK_SLOW", "GetSharedMedia")
+        {
+            probe_step("info stale chat switch");
+            self.clone().open_chat(marta);
+            glib::timeout_future(Duration::from_millis(1_800)).await;
+            if !self.info.is_bound(marta) || self.info.members_count() != 0 {
+                probe_fail("info stale group fill");
+                return false;
+            }
+            self.clone().open_chat(group);
+            if !poll_until(1_000, || self.info.is_bound(group)).await {
+                probe_fail("info rebind group");
+                return false;
+            }
+        }
+
+        if !poll_until(4_000, || {
+            (self.info.members_count() == 42 || self.info.members_retry_visible())
+                && (self.info.shared_retry_visible()
+                    || !self.info.shared_state_text().starts_with("Loading"))
+        })
+        .await
+        {
+            probe_fail("info section settlement");
+            return false;
+        }
+        if self.info.members_retry_visible() {
+            probe_step("members error retry");
+            if !self
+                .info
+                .members_state_text()
+                .contains("mock: transient failure")
+            {
+                probe_fail("members section error");
+                return false;
+            }
+            self.info.trigger_members_retry();
+        }
+        if self.info.shared_retry_visible() {
+            probe_step("shared media error retry");
+            if !self
+                .info
+                .shared_state_text()
+                .contains("mock: transient failure")
+            {
+                probe_fail("shared media section error");
+                return false;
+            }
+            self.info.trigger_shared_retry();
+        }
+        if !poll_until(4_000, || {
+            self.info.members_count() == 42
+                && !self.info.members_retry_visible()
+                && !self.info.shared_retry_visible()
+                && !self.info.shared_state_text().starts_with("Loading")
+        })
+        .await
+        {
+            probe_fail("info members/shared retry success");
+            return false;
+        }
+
+        let Some(window) = self.window() else {
+            probe_fail("info resize window");
+            return false;
+        };
+        probe_step("info boundary 999 overlay");
+        self.resize_window_for_probe(&window, 999).await;
+        if !poll_until(1_000, || self.info.layout() == InfoLayout::Overlay).await {
+            probe_fail("info overlay at 999");
+            return false;
+        }
+        probe_step("info boundary 1000 column");
+        self.resize_window_for_probe(&window, 1000).await;
+        if !poll_until(1_000, || self.info.layout() == InfoLayout::Column).await {
+            probe_fail("info column at 1000");
+            return false;
+        }
+
+        // A27 stress: several overlay⇄column reparents inside a single
+        // main-loop turn, with no frame in between.
+        probe_step("info layout flip 999/1000");
+        for width in [999, 1000, 999, 1000, 999] {
+            self.probe_window_width.set(Some(width));
+            self.apply_sidebar_layout(width);
+        }
+        if self.info.layout() != InfoLayout::Overlay {
+            probe_fail("info flip settled on overlay");
+            return false;
+        }
+        if !poll_until(1_000, || self.info.widget.is_visible()).await {
+            probe_fail("info flip left the panel unmapped");
+            return false;
+        }
+        self.resize_window_for_probe(&window, 1100).await;
+        if !poll_until(1_000, || {
+            self.info.layout() == InfoLayout::Column && self.info.is_bound(group)
+        })
+        .await
+        {
+            probe_fail("info flip restores the column");
+            return false;
+        }
+
+        if environment_listed("OMG_MOCK_SLOW", "GetSharedMedia") {
+            probe_step("shared media stale tab switch");
+            self.info.probe_select_shared(SharedKind::Files);
+            self.info.probe_select_shared(SharedKind::Links);
+            self.info.probe_select_shared(SharedKind::Voice);
+            if !poll_until(4_000, || {
+                self.info.shared_kind() == SharedKind::Voice
+                    && !self.info.shared_state_text().starts_with("Loading")
+            })
+            .await
+            {
+                probe_fail("shared media stale tab result");
+                return false;
+            }
+        }
+        for (label, kind) in [
+            ("Files", SharedKind::Files),
+            ("Links", SharedKind::Links),
+            ("Voice", SharedKind::Voice),
+        ] {
+            probe_step(&format!("shared media {label}"));
+            self.info.probe_select_shared(kind);
+            if !poll_until(4_000, || {
+                self.info.shared_kind() == kind
+                    && (self.info.shared_retry_visible()
+                        || !self.info.shared_state_text().starts_with("Loading"))
+            })
+            .await
+            {
+                probe_fail("shared media tab");
+                return false;
+            }
+            if self.info.shared_retry_visible() {
+                self.info.trigger_shared_retry();
+                if !poll_until(4_000, || {
+                    !self.info.shared_retry_visible()
+                        && !self.info.shared_state_text().starts_with("Loading")
+                })
+                .await
+                {
+                    probe_fail("shared media tab retry");
+                    return false;
+                }
+            }
+        }
+
+        probe_step("info notifications switch");
+        self.info.probe_toggle_notifications(false);
+        if !poll_until(1_000, || !self.info.notifications_enabled()).await {
+            probe_fail("info notifications mute");
+            return false;
+        }
+        self.info.probe_toggle_notifications(true);
+        if !poll_until(1_000, || self.info.notifications_enabled()).await {
+            probe_fail("info notifications unmute");
+            return false;
+        }
+
+        self.clone().open_chat(marta);
+        if !poll_until(4_000, || {
+            self.open_chat.get() == Some(marta) && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("stickers open chat");
+            return false;
+        }
+        probe_step("sticker popover");
+        self.open_stickers();
+        if !poll_until(4_000, || {
+            self.stickers.stickers_ready() || self.stickers.retry_visible()
+        })
+        .await
+        {
+            probe_fail("sticker packs settlement");
+            return false;
+        }
+        if self.stickers.retry_visible() {
+            probe_step("sticker packs error retry");
+            if !self
+                .stickers
+                .error_text()
+                .contains("mock: transient failure")
+            {
+                probe_fail("sticker packs section error");
+                return false;
+            }
+            self.stickers.trigger_retry();
+            if !poll_until(4_000, || self.stickers.stickers_ready()).await {
+                probe_fail("sticker packs retry");
+                return false;
+            }
+        }
+
+        let Some(omarchy_pack) = self.stickers.probe_pack_id_by_title("Omarchy") else {
+            probe_fail("Omarchy sticker pack listed");
+            return false;
+        };
+        if environment_listed("OMG_MOCK_SLOW", "GetStickers") {
+            probe_step("sticker stale pack switch");
+            self.stickers.probe_select_pack(&omarchy_pack);
+            self.stickers.probe_select_pack("recent");
+            if !poll_until(4_000, || {
+                self.stickers.current_pack() == "recent" && self.stickers.stickers_ready()
+            })
+            .await
+            {
+                probe_fail("sticker stale pack result");
+                return false;
+            }
+        }
+        self.stickers.probe_select_pack(&omarchy_pack);
+        if !poll_until(4_000, || {
+            self.stickers.current_pack() == omarchy_pack && self.stickers.stickers_ready()
+        })
+        .await
+        {
+            probe_fail("Omarchy sticker pack");
+            return false;
+        }
+        if self.stickers.sticker_sendable(9104) {
+            probe_fail("animated sticker sendability");
+            return false;
+        }
+        if environment_listed("OMG_MOCK_SLOW", "DownloadSticker") {
+            probe_step("sticker stale image fill");
+            if !poll_until(4_000, || self.stickers.downloaded_ids().contains(&9101)).await {
+                probe_fail("sticker image download");
+                return false;
+            }
+            if self
+                .stickers
+                .downloaded_ids()
+                .iter()
+                .any(|id| (9000..9100).contains(id))
+            {
+                probe_fail("sticker stale image applied");
+                return false;
+            }
+        }
+        probe_step("GIF cards report unavailable");
+        // No mp4 fixture exists for either saved GIF, so both cards must say
+        // so instead of looking like they are still loading (A33).
+        self.stickers.probe_select_pack("gifs");
+        if !poll_until(4_000, || {
+            self.stickers.current_pack() == "gifs"
+                && self.stickers.unavailable_ids() == vec![9201, 9202]
+        })
+        .await
+        {
+            probe_fail("GIF unavailable markers");
+            return false;
+        }
+        self.stickers.probe_select_pack("recent");
+        if !poll_until(4_000, || self.stickers.sticker_sendable(9002)).await {
+            probe_fail("recent sticker 9002");
+            return false;
+        }
+        probe_step("send sticker 9002");
+        if !self.stickers.probe_send_sticker(9002) {
+            probe_fail("sticker send action");
+            return false;
+        }
+        if !poll_until(4_000, || {
+            self.stickers.retry_visible()
+                || self.messages.last_message().is_some_and(|message| {
+                    message.outgoing
+                        && message.media == Some(MediaKind::Sticker)
+                        && message.sticker_emoji.as_deref() == Some("👍")
+                })
+        })
+        .await
+        {
+            probe_fail("sticker send settlement");
+            return false;
+        }
+        if self.stickers.retry_visible() {
+            probe_step("sticker send error retry");
+            if !self
+                .stickers
+                .error_text()
+                .contains("mock: transient failure")
+            {
+                probe_fail("sticker send error");
+                return false;
+            }
+            self.stickers.trigger_retry();
+        }
+        if !poll_until(4_000, || {
+            self.messages.last_message().is_some_and(|message| {
+                message.outgoing
+                    && message.media == Some(MediaKind::Sticker)
+                    && message.sticker_emoji.as_deref() == Some("👍")
+            })
+        })
+        .await
+        {
+            probe_fail("sticker retry success");
+            return false;
+        }
+        self.close_stickers();
+
+        // A8: Cancel while `record_start` is still in flight. The bar and the
+        // C5 lock must survive until the start resolves, and nothing may be
+        // sent. The delay hook makes the Starting window deterministic.
+        probe_step("recording cancel during start");
+        let voice_before = self.messages.last_message().map(|message| message.id);
+        self.probe_record_start_delay.set(500);
+        self.start_recording();
+        if !poll_until(1_500, || {
+            self.messages.recorder_status() == "Starting microphone…"
+        })
+        .await
+        {
+            self.probe_record_start_delay.set(0);
+            probe_fail("recording starting state");
+            return false;
+        }
+        self.messages.probe_recorder_cancel();
+        if self.messages.recorder_status() != "Cancelling…"
+            || !self.messages.recorder_visible()
+            || !self.composer_operation.get()
+        {
+            self.probe_record_start_delay.set(0);
+            probe_fail("deferred cancel holds the bar and the composer lock");
+            return false;
+        }
+        if !poll_until(4_000, || {
+            !self.messages.recorder_visible() && !self.composer_operation.get()
+        })
+        .await
+        {
+            self.probe_record_start_delay.set(0);
+            probe_fail("deferred cancel settlement");
+            return false;
+        }
+        self.probe_record_start_delay.set(0);
+        if self.messages.last_message().map(|message| message.id) != voice_before {
+            probe_fail("deferred cancel sent a message");
+            return false;
+        }
+
+        probe_step("recording start cancel");
+        self.start_recording();
+        if !poll_until(4_000, || self.messages.recorder_status() == "Recording").await {
+            probe_fail("recording start");
+            return false;
+        }
+        self.messages.probe_recorder_cancel();
+        // The composer stays locked until the backend recording slot is
+        // released, so the next start cannot race the cancel.
+        if !poll_until(2_000, || {
+            !self.messages.recorder_visible() && !self.composer_operation.get()
+        })
+        .await
+        {
+            probe_fail("recording cancel");
+            return false;
+        }
+
+        probe_step("recording stop send");
+        self.start_recording();
+        if !poll_until(4_000, || self.messages.recorder_status() == "Recording").await {
+            probe_fail("recording restart");
+            return false;
+        }
+        self.messages.probe_recorder_send();
+        if !poll_until(4_000, || {
+            self.messages
+                .recorder_status()
+                .contains("mock: transient failure")
+                || self.messages.last_message().is_some_and(|message| {
+                    message.outgoing
+                        && message.media == Some(MediaKind::Voice)
+                        && message.duration == Some(1)
+                })
+        })
+        .await
+        {
+            probe_fail("voice send settlement");
+            return false;
+        }
+        if self
+            .messages
+            .recorder_status()
+            .contains("mock: transient failure")
+        {
+            probe_step("voice send error retry");
+            self.messages.probe_recorder_retry();
+        }
+        if !poll_until(4_000, || {
+            self.messages.last_message().is_some_and(|message| {
+                message.outgoing
+                    && message.media == Some(MediaKind::Voice)
+                    && message.duration == Some(1)
+            })
+        })
+        .await
+        {
+            probe_fail("voice retry success");
+            return false;
+        }
+
+        if environment_listed("OMG_MOCK_SLOW", "GetContacts") {
+            probe_step("contacts stale close");
+            self.open_contacts();
+            glib::timeout_future(Duration::from_millis(80)).await;
+            self.close_contacts();
+            glib::timeout_future(Duration::from_millis(1_700)).await;
+            if self.contacts.is_open() || self.contacts.count() != 0 {
+                probe_fail("contacts stale fill");
+                return false;
+            }
+        }
+        probe_step("contacts Sam Rivera");
+        self.open_contacts();
+        if !poll_until(4_000, || self.contacts.count() == 5 || self.contacts.retry_visible()).await {
+            probe_fail("contacts settlement");
+            return false;
+        }
+        if self.contacts.retry_visible() {
+            probe_step("contacts error retry");
+            if !self.contacts.error_text().contains("mock: transient failure") {
+                probe_fail("contacts section error");
+                return false;
+            }
+            self.contacts.trigger_retry();
+            if !poll_until(4_000, || self.contacts.count() == 5).await {
+                probe_fail("contacts retry");
+                return false;
+            }
+        }
+        if !self.contacts.probe_open("Sam Rivera")
+            || !poll_until(4_000, || {
+                self.messages.header_title() == "Sam Rivera" && !self.messages.is_loading()
+            })
+            .await
+        {
+            probe_fail("contacts open Sam Rivera");
+            return false;
+        }
+
+        probe_step("new group Test");
+        self.open_new_group();
+        if !poll_until(4_000, || {
+            self.new_group.contact_count() == 5 || self.new_group.retry_visible()
+        })
+        .await
+        {
+            probe_fail("new group contacts settlement");
+            return false;
+        }
+        if self.new_group.retry_visible() {
+            self.new_group.trigger_retry();
+            if !poll_until(4_000, || self.new_group.contact_count() == 5).await {
+                probe_fail("new group contacts retry");
+                return false;
+            }
+        }
+        self.new_group.probe_set_title("Test");
+        if !self.new_group.probe_select("Sam Rivera") || !self.new_group.probe_select("Mom") {
+            probe_fail("new group member selection");
+            return false;
+        }
+        self.new_group.probe_submit();
+        if !poll_until(4_000, || {
+            !self.new_group.is_open()
+                || self
+                    .new_group
+                    .error_text()
+                    .contains("mock: transient failure")
+        })
+        .await
+        {
+            probe_fail("new group create settlement");
+            return false;
+        }
+        if self.new_group.is_open() {
+            probe_step("new group create error retry");
+            if self.new_group.title_text() != "Test" || self.new_group.selected_count() != 2 {
+                probe_fail("new group retained input");
+                return false;
+            }
+            self.new_group.probe_submit();
+        }
+        if !poll_until(4_000, || {
+            !self.new_group.is_open()
+                && self.messages.header_title() == "Test"
+                && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("new group retry success");
+            return false;
+        }
+        let Some(test_chat) = self.open_chat.get() else {
+            probe_fail("new group selected chat");
+            return false;
+        };
+
+        self.messages.set_composer_text("selection one");
+        self.clone().submit_composer();
+        if !poll_until(3_000, || {
+            self.messages.find_outgoing_text("selection one").is_some()
+        })
+        .await
+        {
+            probe_fail("first selection message");
+            return false;
+        }
+        self.messages.set_composer_text("selection two");
+        self.clone().submit_composer();
+        if !poll_until(3_000, || {
+            self.messages.find_outgoing_text("selection two").is_some()
+        })
+        .await
+        {
+            probe_fail("second selection message");
+            return false;
+        }
+        let first = self
+            .messages
+            .find_outgoing_text("selection one")
+            .unwrap_or_default();
+        let second = self
+            .messages
+            .find_outgoing_text("selection two")
+            .unwrap_or_default();
+        probe_step("multi-select copy forward cancel");
+        if !self.messages.begin_selection(first) {
+            probe_fail("selection mode start");
+            return false;
+        }
+        self.messages.set_selected(second, true);
+        if self.messages.selection_ids() != vec![first, second] {
+            probe_fail("selection display order");
+            return false;
+        }
+        self.clone()
+            .handle_message_action(MessageAction::SelectionCopy);
+        if self.probe_copied.borrow().as_str() != "selection one\nselection two" {
+            probe_fail("selection copy text");
+            return false;
+        }
+        self.clone()
+            .handle_message_action(MessageAction::SelectionForward);
+        if !poll_until(1_000, || self.forward.is_open()).await
+            || !self.forward.probe_select("Mom")
+        {
+            probe_fail("selection forward Mom target");
+            return false;
+        }
+        // Closing the picker must not forward anything — checked below, once
+        // the submitted forward has put us in Mom.
+        self.close_forward();
+        self.clone()
+            .handle_message_action(MessageAction::SelectionCancel);
+        if self.messages.selection_mode() {
+            probe_fail("selection cancel");
+            return false;
+        }
+
+        probe_step("multi-select forward submit");
+        if !self.messages.begin_selection(first) {
+            probe_fail("forward selection start");
+            return false;
+        }
+        self.messages.set_selected(second, true);
+        self.clone()
+            .handle_message_action(MessageAction::SelectionForward);
+        if !poll_until(1_000, || self.forward.is_open()).await
+            || !self.forward.probe_select("Mom")
+        {
+            probe_fail("forward submit Mom target");
+            return false;
+        }
+        self.forward.probe_submit();
+        if environment_listed("OMG_MOCK_FAIL_ONCE", "ForwardMessages") {
+            // The one-shot failure may already have been consumed by the
+            // earlier 5C forward step; accept either a transient error
+            // (then retry) or a direct success.
+            let outcome = poll_until(3_800, || {
+                !self.forward.is_open()
+                    || self
+                        .forward
+                        .probe_status()
+                        .contains("mock: transient failure")
+            })
+            .await;
+            if !outcome {
+                probe_fail("selection forward transient error");
+                return false;
+            }
+            if self.forward.is_open() {
+                self.forward.probe_submit();
+            }
+        }
+        let forwarded_copies = |text: &str| {
+            self.messages
+                .messages()
+                .into_iter()
+                .filter(|message| message.text == text && message.forwarded_from.is_some())
+                .count()
+        };
+        if !poll_until(5_000, || {
+            !self.forward.is_open()
+                && self.open_chat.get() == Some(mom)
+                && !self.messages.is_loading()
+                && forwarded_copies("selection one") > 0
+                && forwarded_copies("selection two") > 0
+        })
+        .await
+        {
+            probe_fail("selection forward delivered both messages");
+            return false;
+        }
+        // Exactly one copy each: the picker that was closed without
+        // submitting forwarded nothing.
+        if forwarded_copies("selection one") != 1 || forwarded_copies("selection two") != 1 {
+            probe_fail("cancelled forward picker sent messages");
+            return false;
+        }
+        self.clone().open_chat(test_chat);
+        if !poll_until(4_000, || {
+            self.open_chat.get() == Some(test_chat)
+                && !self.messages.is_loading()
+                && self.messages.find_outgoing_text("selection one").is_some()
+        })
+        .await
+        {
+            probe_fail("restore group after forward submit");
+            return false;
+        }
+        let first = self
+            .messages
+            .find_outgoing_text("selection one")
+            .unwrap_or_default();
+
+        probe_step("selection delete event bookkeeping");
+        self.messages.set_composer_text("delete");
+        self.clone().submit_composer();
+        let trigger = if poll_until(3_000, || {
+            self.messages.find_outgoing_text("delete").is_some()
+        })
+        .await
+        {
+            self.messages.find_outgoing_text("delete").unwrap_or_default()
+        } else {
+            probe_fail("delete trigger send");
+            return false;
+        };
+        let reply = if poll_until(3_500, || {
+            self.messages
+                .find_incoming_text_after("(mock reply) got it", trigger)
+                .is_some()
+        })
+        .await
+        {
+            self.messages
+                .find_incoming_text_after("(mock reply) got it", trigger)
+                .unwrap_or_default()
+        } else {
+            probe_fail("delete trigger reply");
+            return false;
+        };
+        if !self.messages.begin_selection(first) {
+            probe_fail("delete selection start");
+            return false;
+        }
+        self.messages.set_selected(reply, true);
+        if self.messages.selection_count() != 2 {
+            probe_fail("delete selection initial count");
+            return false;
+        }
+        if !poll_until(4_000, || {
+            self.messages.selection_count() == 1
+                && !self.messages.selection_ids().contains(&reply)
+        })
+        .await
+        {
+            probe_fail("deleted id left selection");
+            return false;
+        }
+        self.messages.exit_selection_mode();
+
+        probe_step("muted incoming suppresses notification");
+        if self
+            .chatlist
+            .summary(deni)
+            .is_none_or(|summary| !summary.muted)
+        {
+            probe_fail("muted chat fixture");
+            return false;
+        }
+        self.clone().open_chat(deni);
+        if !poll_until(3_500, || {
+            self.open_chat.get() == Some(deni) && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("open muted chat");
+            return false;
+        }
+        self.messages.set_composer_text("mute notification probe");
+        self.clone().submit_composer();
+        if !poll_until(3_000, || {
+            self.messages
+                .find_outgoing_text("mute notification probe")
+                .is_some()
+        })
+        .await
+        {
+            probe_fail("muted reply trigger");
+            return false;
+        }
+        self.clone().open_chat(marta);
+        let notifications_before = self.probe_notifications.get();
+        glib::timeout_future(Duration::from_millis(2_800)).await;
+        if self.probe_notifications.get() != notifications_before {
+            probe_fail("muted chat notification emitted");
+            return false;
+        }
+
+        probe_step("Saved messages action");
+        self.clone().open_saved_messages();
+        if !poll_until(3_500, || {
+            self.messages.header_title() == "Saved Messages" && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("Saved messages open");
+            return false;
+        }
+        self.clone().open_chat(marta);
+        if !poll_until(3_500, || {
+            self.open_chat.get() == Some(marta) && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("restore Marta after regular-use probe");
+            return false;
+        }
+        if self.info.chat_id() != Some(marta) {
+            probe_fail("info panel chat-switch rebind");
+            return false;
+        }
+        if test_chat == marta || test_chat == group || test_chat == deni || test_chat == mom {
+            probe_fail("new group identity");
+            return false;
+        }
+        true
+    }
 }
 
 impl Drop for ShellInner {
@@ -6898,7 +9532,7 @@ fn clock_text() -> String {
 /// shell-owned fields from the process's initial environment when both are
 /// present. `/proc/self/environ` is the initial environment on Linux and is
 /// unaffected by the smoke override performed before GTK starts.
-fn load_shell_ui_state(probe: bool) -> (UiState, Option<(i32, bool, i32)>) {
+fn load_shell_ui_state(probe: bool) -> (UiState, Option<RestoredUiState>) {
     let mut state = UiState::load();
     if !probe {
         return (state, None);
@@ -6916,11 +9550,15 @@ fn load_shell_ui_state(probe: bool) -> (UiState, Option<(i32, bool, i32)>) {
     state.sidebar_width = external.sidebar_width;
     state.sidebar_collapsed = external.sidebar_collapsed;
     state.folder_id = external.folder_id;
-    let restored = Some((
-        state.sidebar_width,
-        state.sidebar_collapsed,
-        state.folder_id,
-    ));
+    state.info_panel_open = external.info_panel_open;
+    state.info_width = external.info_width.max(280);
+    let restored = Some(RestoredUiState {
+        sidebar_width: state.sidebar_width,
+        sidebar_collapsed: state.sidebar_collapsed,
+        folder_id: state.folder_id,
+        info_panel_open: state.info_panel_open,
+        info_width: state.info_width,
+    });
     (state, restored)
 }
 
@@ -6945,9 +9583,13 @@ pub fn clamp_sidebar_width(saved_width: i32, window_width: i32) -> i32 {
     saved_width.clamp(220, maximum)
 }
 
+fn effective_mute(pending_intent: Option<bool>, cached_summary: Option<bool>) -> bool {
+    pending_intent.or(cached_summary).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod wave5_tests {
-    use super::clamp_sidebar_width;
+    use super::{clamp_sidebar_width, effective_mute};
 
     #[test]
     fn sidebar_width_is_clamped_to_minimum_and_window_fraction() {
@@ -6955,6 +9597,14 @@ mod wave5_tests {
         assert_eq!(clamp_sidebar_width(700, 1000), 450);
         assert_eq!(clamp_sidebar_width(100, 1000), 220);
         assert_eq!(clamp_sidebar_width(300, 400), 220);
+    }
+
+    #[test]
+    fn pending_mute_intent_precedes_stale_cached_summary() {
+        assert!(effective_mute(Some(true), Some(false)));
+        assert!(!effective_mute(Some(false), Some(true)));
+        assert!(effective_mute(None, Some(true)));
+        assert!(!effective_mute(None, None));
     }
 }
 
@@ -6997,6 +9647,15 @@ fn message_content(message: &Msg) -> String {
         message_preview(message)
     } else {
         message.text.clone()
+    }
+}
+
+fn recording_error(error: Option<&str>) -> String {
+    let error = error.unwrap_or("could not record a voice message");
+    if error.contains("ffmpeg") {
+        "ffmpeg is not installed — run: sudo pacman -S ffmpeg".to_string()
+    } else {
+        error.to_string()
     }
 }
 
