@@ -124,6 +124,18 @@ one in settings.
   `GEMINI_API_KEY`) work as a fallback. Groq and OpenAI also provide
   transcription. Keys never appear in logs or error messages.
 
+## Animations
+
+Settings → **Animations** lists 54 optional effects in the terminal/phosphor
+style — typewriter and decode message reveals, pager-wipe chat switches,
+braille typing spinners, badge pops and rolls, CRT power-on, boot log,
+scanlines, vignette, matrix rain in the empty state, cursor comet, theme
+morph, and more. Every effect is an individual toggle with a Preview button;
+three presets (Purist = all off, Subtle, Full phosphor) set a whole mood at
+once. Mutually exclusive styles (message entry, send feedback, chat switch)
+are one-of groups. All effects respect GTK's reduced-motion setting
+(`gtk-enable-animations`). Everything is off by default.
+
 ## Theming
 
 Colors come from `~/.local/state/omarchy/current/theme/colors.toml`, the file
