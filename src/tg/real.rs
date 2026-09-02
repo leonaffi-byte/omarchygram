@@ -16,9 +16,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use grammers_client::client::UpdatesConfiguration;
-use grammers_client::media::{Document, Media};
+use grammers_client::media::{ChatPhoto, Document, Media};
+use grammers_client::peer::Role;
+use grammers_client::peer::Peer;
 use grammers_client::message::{InputMessage, Message};
 use grammers_client::session::storages::SqliteSession;
 use grammers_client::session::types::{PeerId, PeerRef};
@@ -30,8 +32,9 @@ use tokio::sync::mpsc;
 
 use super::archive::Archive;
 use super::{
-    paths, reject, to_markdown, AuthState, BackendFlags, ChatSummary, Command, Event, Me, MediaKind, Msg, Reaction,
-    Span, SpanKind, TgError,
+    parse_markdown, paths, reject, to_markdown, AuthState, BackendFlags, ChatInfo, ChatKind, ChatSummary, Command,
+    Contact, Event, Folder, Gif, Me, MediaKind, Member, MemberRole, Msg, MuteMode, Presence, Reaction, SharedKind,
+    Span, SpanKind, Sticker, StickerPack, TgError, WebPreview,
 };
 
 /// Shared between the command loop, spawned data tasks, and the update loop.
@@ -42,6 +45,23 @@ struct Ctx {
     /// Local archive (always on; anti-delete/edit-history read from it).
     archive: Option<Archive>,
     flags: Mutex<BackendFlags>,
+    /// chat/user id -> profile photo id (for download_avatar).
+    photos: Mutex<HashMap<i64, i64>>,
+    /// Raw documents seen in sticker/gif lists, by document id.
+    documents: Mutex<HashMap<i64, tl::types::Document>>,
+    /// Sticker set id -> access hash.
+    sticker_sets: Mutex<HashMap<i64, i64>>,
+    /// Per-dialog facts from the last get_dialogs (folder membership).
+    meta: Mutex<HashMap<i64, DialogMeta>>,
+}
+
+#[derive(Clone, Copy)]
+struct DialogMeta {
+    kind: ChatKind,
+    contact: bool,
+    muted: bool,
+    unread: bool,
+    archived: bool,
 }
 
 impl Ctx {
@@ -123,6 +143,10 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                 }
             },
             flags: Mutex::new(BackendFlags::default()),
+            photos: Mutex::new(HashMap::new()),
+            documents: Mutex::new(HashMap::new()),
+            sticker_sets: Mutex::new(HashMap::new()),
+            meta: Mutex::new(HashMap::new()),
         }),
         events,
         update_loop_started: false,
@@ -207,14 +231,7 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             let _ = respond.send(edit_text(&client, &ctx, chat_id, msg_id, &text).await);
         }
         Command::DeleteMessages { chat_id, ids, respond } => {
-            let mut r = Ok(());
-            for id in ids {
-                if let Err(e) = delete_message(&client, &ctx, chat_id, id).await {
-                    r = Err(e);
-                    break;
-                }
-            }
-            let _ = respond.send(r);
+            let _ = respond.send(delete_messages(&client, &ctx, chat_id, &ids).await);
         }
         Command::MarkRead { chat_id, up_to, respond } => {
             let _ = respond.send(mark_read(&client, &ctx, chat_id, up_to).await);
@@ -232,8 +249,110 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
         Command::GetMe(tx) => {
             let _ = tx.send(get_me(&client).await);
         }
-        // Wave 5 commands not yet implemented for the real backend.
-        other => reject(other, "not available yet in this build"),
+        Command::GetMessages { chat_id, ids, respond } => {
+            let _ = respond.send(get_messages(&client, &ctx, chat_id, &ids).await);
+        }
+        Command::DownloadAvatar { chat_id, respond } => {
+            let _ = respond.send(download_avatar(&client, &ctx, chat_id).await);
+        }
+        Command::SendVoice { chat_id, path, duration, respond } => {
+            let _ = respond.send(send_voice(&client, &ctx, chat_id, &path, duration).await);
+        }
+        Command::SendSticker { chat_id, sticker_id, respond } => {
+            let _ = respond.send(send_document_by_id(&client, &ctx, chat_id, sticker_id).await);
+        }
+        Command::SendGif { chat_id, gif_id, respond } => {
+            let _ = respond.send(send_document_by_id(&client, &ctx, chat_id, gif_id).await);
+        }
+        Command::ForwardMessages { from_chat, ids, to_chat, respond } => {
+            let _ = respond.send(forward_messages(&client, &ctx, from_chat, &ids, to_chat).await);
+        }
+        Command::SearchMessages { chat_id, query, before_id, respond } => {
+            let _ = respond.send(search_messages(&client, &ctx, chat_id, &query, before_id, None).await);
+        }
+        Command::SearchGlobal { query, respond } => {
+            let _ = respond.send(search_global(&client, &ctx, &query).await);
+        }
+        Command::SearchChats { query, respond } => {
+            let _ = respond.send(search_chats(&client, &ctx, &query).await);
+        }
+        Command::GetPinnedMessage { chat_id, respond } => {
+            let _ = respond.send(get_pinned_message(&client, &ctx, chat_id).await);
+        }
+        Command::PinMessage { chat_id, msg_id, pinned, respond } => {
+            let _ = respond.send(pin_message(&client, &ctx, chat_id, msg_id, pinned).await);
+        }
+        Command::SendReaction { chat_id, msg_id, emoji, respond } => {
+            let _ = respond.send(send_reaction(&client, &ctx, chat_id, msg_id, emoji).await);
+        }
+        Command::GetAvailableReactions(tx) => {
+            let _ = tx.send(available_reactions(&client).await);
+        }
+        Command::SetPinned { chat_id, pinned, respond } => {
+            let _ = respond.send(set_pinned(&client, &ctx, chat_id, pinned).await);
+        }
+        Command::SetMuted { chat_id, mode, respond } => {
+            let _ = respond.send(set_muted(&client, &ctx, chat_id, mode).await);
+        }
+        Command::SetArchived { chat_id, archived, respond } => {
+            let _ = respond.send(set_archived(&client, &ctx, chat_id, archived).await);
+        }
+        Command::MarkUnread { chat_id, unread, respond } => {
+            let _ = respond.send(mark_unread(&client, &ctx, chat_id, unread).await);
+        }
+        Command::DeleteChat { chat_id, respond } => {
+            let _ = respond.send(delete_chat(&client, &ctx, chat_id).await);
+        }
+        Command::ClearHistory { chat_id, respond } => {
+            let _ = respond.send(clear_history(&client, &ctx, chat_id).await);
+        }
+        Command::SaveDraft { chat_id, text, reply_to: _, respond } => {
+            let _ = respond.send(save_draft(&client, &ctx, chat_id, &text).await);
+        }
+        Command::GetChatInfo { chat_id, respond } => {
+            let _ = respond.send(get_chat_info(&client, &ctx, chat_id).await);
+        }
+        Command::GetMembers { chat_id, offset, limit, respond } => {
+            let _ = respond.send(get_members(&client, &ctx, chat_id, offset, limit).await);
+        }
+        Command::GetSharedMedia { chat_id, kind, before_id, respond } => {
+            let filter = match kind {
+                SharedKind::Photos => tl::enums::MessagesFilter::InputMessagesFilterPhotos,
+                SharedKind::Files => tl::enums::MessagesFilter::InputMessagesFilterDocument,
+                SharedKind::Links => tl::enums::MessagesFilter::InputMessagesFilterUrl,
+                SharedKind::Voice => tl::enums::MessagesFilter::InputMessagesFilterVoice,
+                SharedKind::Music => tl::enums::MessagesFilter::InputMessagesFilterMusic,
+            };
+            let _ = respond.send(search_messages(&client, &ctx, chat_id, "", before_id, Some(filter)).await);
+        }
+        Command::GetContacts(tx) => {
+            let _ = tx.send(get_contacts(&client, &ctx).await);
+        }
+        Command::OpenUser { user_id, respond } => {
+            let _ = respond.send(open_user(&client, &ctx, user_id).await);
+        }
+        Command::CreateGroup { title, user_ids, respond } => {
+            let _ = respond.send(create_group(&client, &ctx, &title, &user_ids).await);
+        }
+        Command::GetFolders(tx) => {
+            let _ = tx.send(get_folders(&client, &ctx).await);
+        }
+        Command::GetStickerPacks(tx) => {
+            let _ = tx.send(sticker_packs(&client, &ctx).await);
+        }
+        Command::GetStickers { pack_id, respond } => {
+            let _ = respond.send(stickers_of(&client, &ctx, &pack_id).await);
+        }
+        Command::DownloadSticker { sticker_id, respond } => {
+            let _ = respond.send(download_document_by_id(&client, &ctx, sticker_id, true).await);
+        }
+        Command::GetSavedGifs(tx) => {
+            let _ = tx.send(saved_gifs(&client, &ctx).await);
+        }
+        Command::DownloadGif { gif_id, respond } => {
+            let _ = respond.send(download_document_by_id(&client, &ctx, gif_id, false).await);
+        }
+        other => reject(other, "auth commands are handled serially"),
     }
 }
 
@@ -414,43 +533,195 @@ impl Backend {
 }
 
 async fn get_dialogs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<ChatSummary>, TgError> {
-    let mut iter = client.iter_dialogs().limit(50);
+    let mut iter = client.iter_dialogs().limit(200);
     let mut out = Vec::new();
+    let now = Local::now().timestamp() as i32;
     while let Some(dialog) = iter.next().await.map_err(|e| e.to_string())? {
         let chat_id = dialog.peer_id().bot_api_dialog_id_unchecked();
-        let title = dialog.peer().name().unwrap_or("Unknown").to_string();
+        let facts = describe_peer(dialog.peer());
+        let title = facts
+            .title_override
+            .clone()
+            .unwrap_or_else(|| dialog.peer().name().unwrap_or("Unknown").to_string());
         ctx.remember(chat_id, dialog.peer_ref(), Some(&title));
-        let last = dialog.last_message.as_ref();
-        let preview = last
-            .map(|m| {
-                if m.text().is_empty() {
-                    media_placeholder(m.media().as_ref()).to_string()
-                } else {
-                    m.text().to_string()
-                }
-            })
-            .unwrap_or_default();
-        let unread = match &dialog.raw {
-            tl::enums::Dialog::Dialog(d) => d.unread_count,
-            tl::enums::Dialog::Folder(_) => 0,
-        };
-        if let Some(m) = last {
-            // convert() registers media AND records the message in the archive,
-            // so a message deleted before its chat is ever opened is recoverable.
-            let _ = convert(ctx, m, chat_id);
+        if let Some(pid) = facts.photo_id {
+            ctx.photos.lock().unwrap().insert(chat_id, pid);
         }
+        let last = dialog.last_message.as_ref();
+        // convert() registers media AND records the message in the archive,
+        // so a message deleted before its chat is ever opened is recoverable.
+        let last_msg = last.map(|m| convert(ctx, m, chat_id));
+        let raw = match &dialog.raw {
+            tl::enums::Dialog::Dialog(d) => Some(d),
+            tl::enums::Dialog::Folder(_) => None,
+        };
+        let (unread, mentions, unread_mark, pinned, rin, rout, folder, muted, draft) = match raw {
+            Some(d) => (
+                d.unread_count,
+                d.unread_mentions_count,
+                d.unread_mark,
+                d.pinned,
+                d.read_inbox_max_id,
+                d.read_outbox_max_id,
+                d.folder_id,
+                is_muted(&d.notify_settings, now),
+                draft_text(d.draft.as_ref()),
+            ),
+            None => (0, 0, false, false, 0, 0, None, false, String::new()),
+        };
+        let archived = folder == Some(1);
+        ctx.meta.lock().unwrap().insert(
+            chat_id,
+            DialogMeta { kind: facts.kind, contact: facts.contact, muted, unread: unread > 0, archived },
+        );
+        let last_sender = match (facts.kind, last) {
+            (ChatKind::Group, Some(m)) => {
+                if m.outgoing() {
+                    "You".to_string()
+                } else {
+                    m.sender()
+                        .and_then(|p| p.name())
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                }
+            }
+            _ => String::new(),
+        };
         out.push(ChatSummary {
             id: chat_id,
             title,
-            last_message: preview,
+            kind: facts.kind,
+            username: facts.username.clone(),
+            last_message: last_msg.as_ref().map(preview_of).unwrap_or_default(),
+            last_sender,
             last_time: last.map(|m| m.date().with_timezone(&Local)),
             last_msg_id: last.map(|m| m.id()).unwrap_or(0),
             last_outgoing: last.is_some_and(|m| m.outgoing()),
             unread,
-            ..ChatSummary::default()
+            mentions,
+            unread_mark,
+            read_inbox_max_id: rin,
+            read_outbox_max_id: rout,
+            pinned,
+            muted,
+            archived,
+            presence: facts.presence,
+            has_photo: facts.photo_id.is_some(),
+            draft,
         });
     }
     Ok(out)
+}
+
+struct PeerFacts {
+    kind: ChatKind,
+    presence: Presence,
+    photo_id: Option<i64>,
+    username: String,
+    contact: bool,
+    title_override: Option<String>,
+}
+
+fn describe_peer(peer: &Peer) -> PeerFacts {
+    match peer {
+        Peer::User(u) => PeerFacts {
+            kind: if u.is_self() {
+                ChatKind::Saved
+            } else if u.is_bot() {
+                ChatKind::Bot
+            } else {
+                ChatKind::User
+            },
+            presence: presence_from(u.status()),
+            photo_id: u.photo().map(|p| p.photo_id),
+            username: u.username().unwrap_or("").to_string(),
+            contact: u.contact(),
+            title_override: if u.is_self() { Some("Saved Messages".to_string()) } else { None },
+        },
+        Peer::Group(g) => PeerFacts {
+            kind: ChatKind::Group,
+            presence: Presence::Unknown,
+            photo_id: g.photo().map(|p| p.photo_id),
+            username: g.username().unwrap_or("").to_string(),
+            contact: false,
+            title_override: None,
+        },
+        Peer::Channel(c) => PeerFacts {
+            kind: if c.raw.megagroup { ChatKind::Group } else { ChatKind::Channel },
+            presence: Presence::Unknown,
+            photo_id: c.photo().map(|p| p.photo_id),
+            username: c.username().unwrap_or("").to_string(),
+            contact: false,
+            title_override: None,
+        },
+    }
+}
+
+fn presence_from(status: &tl::enums::UserStatus) -> Presence {
+    use tl::enums::UserStatus as S;
+    match status {
+        S::Empty => Presence::Unknown,
+        S::Online(_) => Presence::Online,
+        S::Offline(o) => Local
+            .timestamp_opt(o.was_online as i64, 0)
+            .single()
+            .map(Presence::LastSeen)
+            .unwrap_or(Presence::LongAgo),
+        S::Recently(_) => Presence::Recently,
+        S::LastWeek(_) => Presence::LastWeek,
+        S::LastMonth(_) => Presence::LastMonth,
+    }
+}
+
+fn is_muted(settings: &tl::enums::PeerNotifySettings, now: i32) -> bool {
+    let tl::enums::PeerNotifySettings::Settings(s) = settings;
+    s.mute_until.is_some_and(|t| t > now)
+}
+
+fn draft_text(draft: Option<&tl::enums::DraftMessage>) -> String {
+    match draft {
+        Some(tl::enums::DraftMessage::Message(d)) => d.message.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Bot-API dialog id of a raw peer.
+fn peer_chat_id(p: &tl::enums::Peer) -> i64 {
+    match p {
+        tl::enums::Peer::User(u) => u.user_id,
+        tl::enums::Peer::Chat(c) => -c.chat_id,
+        tl::enums::Peer::Channel(c) => -1_000_000_000_000 - c.channel_id,
+    }
+}
+
+fn input_peer_chat_id(p: &tl::enums::InputPeer) -> Option<i64> {
+    match p {
+        tl::enums::InputPeer::User(u) => Some(u.user_id),
+        tl::enums::InputPeer::Chat(c) => Some(-c.chat_id),
+        tl::enums::InputPeer::Channel(c) => Some(-1_000_000_000_000 - c.channel_id),
+        _ => None,
+    }
+}
+
+fn preview_of(m: &Msg) -> String {
+    if !m.text.is_empty() {
+        return m.text.clone();
+    }
+    match m.media {
+        Some(MediaKind::Photo) => "[photo]".into(),
+        Some(MediaKind::Sticker) => format!("{} [sticker]", m.sticker_emoji.clone().unwrap_or_default()).trim().to_string(),
+        Some(MediaKind::Voice) => "[voice message]".into(),
+        Some(MediaKind::Document) => "[file]".into(),
+        Some(MediaKind::Video) => "[video]".into(),
+        Some(MediaKind::Gif) => "[GIF]".into(),
+        Some(MediaKind::Audio) => "[audio]".into(),
+        Some(MediaKind::VideoNote) => "[video message]".into(),
+        Some(MediaKind::Unsupported) => "[unsupported]".into(),
+        None => String::new(),
+    }
 }
 
 async fn get_history(
@@ -637,7 +908,7 @@ async fn send_text(
     reply_to: Option<i32>,
 ) -> Result<Msg, TgError> {
     let peer = ctx.peer(chat_id)?;
-    let input = InputMessage::new().text(text).reply_to(reply_to);
+    let input = input_from_markdown(ctx, text).reply_to(reply_to);
     let sent = client
         .send_message(peer, input)
         .await
@@ -683,7 +954,7 @@ async fn edit_text(
 ) -> Result<Msg, TgError> {
     let peer = ctx.peer(chat_id)?;
     client
-        .edit_message(peer, msg_id, InputMessage::new().text(text))
+        .edit_message(peer, msg_id, input_from_markdown(ctx, text))
         .await
         .map_err(|e| format!("edit failed: {e}"))?;
     // Re-fetch so the returned Msg carries the server's view (edited flag).
@@ -695,20 +966,6 @@ async fn edit_text(
         Some(m) => Ok(convert(ctx, &m, chat_id)),
         None => Err("edited message vanished".into()),
     }
-}
-
-async fn delete_message(
-    client: &Client,
-    ctx: &Arc<Ctx>,
-    chat_id: i64,
-    msg_id: i32,
-) -> Result<(), TgError> {
-    let peer = ctx.peer(chat_id)?;
-    client
-        .delete_messages(peer, &[msg_id])
-        .await
-        .map_err(|e| format!("delete failed: {e}"))?;
-    Ok(())
 }
 
 async fn mark_read(
@@ -747,28 +1004,6 @@ async fn mark_read(
     Ok(())
 }
 
-fn media_placeholder(media: Option<&Media>) -> &'static str {
-    match media {
-        Some(Media::Photo(_)) => "[photo]",
-        Some(Media::Sticker(_)) => "[sticker]",
-        Some(Media::Document(d)) if is_voice(d) => "[voice message]",
-        Some(_) => "[file]",
-        None => "",
-    }
-}
-
-fn is_voice(d: &Document) -> bool {
-    // Telegram's own flag, not a filename/mime guess.
-    if let Some(tl::enums::Document::Document(doc)) = d.raw.document.as_ref() {
-        for attr in &doc.attributes {
-            if let tl::enums::DocumentAttribute::Audio(a) = attr {
-                return a.voice;
-            }
-        }
-    }
-    false
-}
-
 fn register_media(ctx: &Ctx, m: &Message, chat_id: i64) {
     if let Some(media) = m.media() {
         ctx.media.lock().unwrap().insert((chat_id, m.id()), media);
@@ -776,16 +1011,7 @@ fn register_media(ctx: &Ctx, m: &Message, chat_id: i64) {
 }
 
 fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
-    let (media_kind, doc_name) = match m.media() {
-        Some(Media::Photo(_)) => (Some(MediaKind::Photo), None),
-        Some(Media::Sticker(_)) => (Some(MediaKind::Sticker), None),
-        Some(Media::Document(ref d)) if is_voice(d) => (Some(MediaKind::Voice), None),
-        Some(Media::Document(ref d)) => (
-            Some(MediaKind::Document),
-            Some(d.name().filter(|n| !n.is_empty()).unwrap_or("file").to_string()),
-        ),
-        _ => (None, None),
-    };
+    let mi = media_info(m.media().as_ref());
     register_media(ctx, m, chat_id);
 
     let reactions = match &m.raw {
@@ -845,14 +1071,20 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
         markdown,
         ts: m.date().with_timezone(&Local),
         outgoing: m.outgoing(),
-        media: media_kind,
-        doc_name,
+        media: mi.kind,
+        doc_name: mi.doc_name,
+        doc_size: mi.doc_size,
+        duration: mi.duration,
+        photo_size: mi.photo_size,
+        sticker_emoji: mi.sticker_emoji,
+        webpage: mi.webpage,
+        forwarded_from: forwarded_from(ctx, m),
+        views: m.view_count(),
         reply_to: m.reply_to_message_id(),
         reactions,
         edited: m.edit_date().is_some() && !m.edit_hide(),
         deleted: false,
         pinned: m.pinned(),
-        ..Msg::default()
     };
     if let Some(archive) = &ctx.archive {
         archive.record(msg.clone());
@@ -973,6 +1205,11 @@ async fn consume_updates(
                         }
                     }
                 }
+                if let Some(ev) = event_from_raw(&raw.raw) {
+                    if events.send(ev).await.is_err() {
+                        return;
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -1028,4 +1265,1023 @@ fn typing_from_raw(ctx: &Ctx, raw: &tl::enums::Update) -> Option<(i64, String)> 
         }
         _ => None,
     }
+}
+
+
+// ===================== wave 5: media facts, markdown, avatars =====================
+
+#[derive(Default)]
+struct MediaInfo {
+    kind: Option<MediaKind>,
+    doc_name: Option<String>,
+    doc_size: Option<u64>,
+    duration: Option<u32>,
+    photo_size: Option<(i32, i32)>,
+    sticker_emoji: Option<String>,
+    webpage: Option<WebPreview>,
+}
+
+/// (voice, audio, video, round, animated) from Telegram's own attributes.
+fn doc_flags(d: &Document) -> (bool, bool, bool, bool, bool) {
+    let mut f = (false, false, false, false, false);
+    if let Some(tl::enums::Document::Document(doc)) = d.raw.document.as_ref() {
+        for attr in &doc.attributes {
+            match attr {
+                tl::enums::DocumentAttribute::Audio(a) => {
+                    if a.voice {
+                        f.0 = true
+                    } else {
+                        f.1 = true
+                    }
+                }
+                tl::enums::DocumentAttribute::Video(v) => {
+                    f.2 = true;
+                    if v.round_message {
+                        f.3 = true;
+                    }
+                }
+                tl::enums::DocumentAttribute::Animated => f.4 = true,
+                _ => {}
+            }
+        }
+    }
+    f
+}
+
+fn media_info(media: Option<&Media>) -> MediaInfo {
+    let mut mi = MediaInfo::default();
+    match media {
+        Some(Media::Photo(p)) => {
+            mi.kind = Some(MediaKind::Photo);
+            mi.doc_size = p.size().map(|s| s as u64);
+        }
+        Some(Media::Sticker(s)) => {
+            mi.kind = Some(MediaKind::Sticker);
+            mi.sticker_emoji = Some(s.emoji().to_string());
+        }
+        Some(Media::Document(d)) => {
+            let (voice, audio, video, round, animated) = doc_flags(d);
+            mi.kind = Some(if voice {
+                MediaKind::Voice
+            } else if round {
+                MediaKind::VideoNote
+            } else if animated {
+                MediaKind::Gif
+            } else if video {
+                MediaKind::Video
+            } else if audio {
+                MediaKind::Audio
+            } else {
+                MediaKind::Document
+            });
+            if !voice {
+                mi.doc_name = Some(d.name().filter(|n| !n.is_empty()).unwrap_or("file").to_string());
+            }
+            mi.doc_size = d.size().map(|s| s as u64);
+            mi.duration = d.duration().map(|s| s.round() as u32);
+            mi.photo_size = d.resolution();
+        }
+        Some(Media::WebPage(w)) => {
+            if let tl::enums::WebPage::Page(p) = &w.raw.webpage {
+                mi.webpage = Some(WebPreview {
+                    url: p.url.clone(),
+                    site_name: p.site_name.clone().unwrap_or_default(),
+                    title: p.title.clone().unwrap_or_default(),
+                    description: p.description.clone().unwrap_or_default(),
+                });
+            }
+        }
+        Some(_) => mi.kind = Some(MediaKind::Unsupported),
+        None => {}
+    }
+    mi
+}
+
+fn forwarded_from(ctx: &Ctx, m: &Message) -> Option<String> {
+    let tl::enums::MessageFwdHeader::Header(h) = m.forward_header()?;
+    let name = h
+        .from_name
+        .clone()
+        .or_else(|| h.from_id.as_ref().and_then(|p| ctx.titles.lock().unwrap().get(&peer_chat_id(p)).cloned()))
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(name)
+}
+
+/// Char index -> UTF-16 offset map for `text` (Telegram entity offsets).
+fn utf16_offsets(text: &str) -> Vec<i32> {
+    let mut out = Vec::with_capacity(text.len() + 1);
+    let mut acc = 0i32;
+    for c in text.chars() {
+        out.push(acc);
+        acc += c.len_utf16() as i32;
+    }
+    out.push(acc);
+    out
+}
+
+fn entities_from_spans(text: &str, spans: &[Span]) -> Vec<tl::enums::MessageEntity> {
+    use tl::enums::MessageEntity as E;
+    let map = utf16_offsets(text);
+    let at = |i: usize| map.get(i).copied().unwrap_or(*map.last().unwrap_or(&0));
+    spans
+        .iter()
+        .filter_map(|s| {
+            let offset = at(s.start);
+            let length = at(s.end) - offset;
+            if length <= 0 {
+                return None;
+            }
+            Some(match &s.kind {
+                SpanKind::Bold => E::Bold(tl::types::MessageEntityBold { offset, length }),
+                SpanKind::Italic => E::Italic(tl::types::MessageEntityItalic { offset, length }),
+                SpanKind::Underline => E::Underline(tl::types::MessageEntityUnderline { offset, length }),
+                SpanKind::Strike => E::Strike(tl::types::MessageEntityStrike { offset, length }),
+                SpanKind::Code => E::Code(tl::types::MessageEntityCode { offset, length }),
+                SpanKind::Pre(lang) => E::Pre(tl::types::MessageEntityPre { offset, length, language: lang.clone() }),
+                SpanKind::Link(url) => E::TextUrl(tl::types::MessageEntityTextUrl { offset, length, url: url.clone() }),
+                SpanKind::Spoiler => E::Spoiler(tl::types::MessageEntitySpoiler { offset, length }),
+                SpanKind::Blockquote => E::Blockquote(tl::types::MessageEntityBlockquote { collapsed: false, offset, length }),
+                SpanKind::Mention(_) => return None,
+            })
+        })
+        .collect()
+}
+
+/// Composer text -> InputMessage, parsing Telegram-style markers unless the
+/// user turned markdown off.
+fn input_from_markdown(ctx: &Ctx, text: &str) -> InputMessage {
+    if !ctx.flags.lock().unwrap().markdown_send {
+        return InputMessage::new().text(text);
+    }
+    let (plain, spans) = parse_markdown(text);
+    if spans.is_empty() {
+        InputMessage::new().text(text)
+    } else {
+        let entities = entities_from_spans(&plain, &spans);
+        InputMessage::new().text(plain).fmt_entities(entities)
+    }
+}
+
+fn input_peer(ctx: &Ctx, chat_id: i64) -> Result<tl::enums::InputPeer, TgError> {
+    Ok(ctx.peer(chat_id)?.into())
+}
+
+fn private_dir(dir: &std::path::Path) -> Result<(), TgError> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    Ok(())
+}
+
+async fn download_avatar(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<Option<PathBuf>, TgError> {
+    let Some(photo_id) = ctx.photos.lock().unwrap().get(&chat_id).copied() else {
+        return Ok(None);
+    };
+    let dir = paths::avatar_dir();
+    private_dir(&dir)?;
+    let path = dir.join(format!("{chat_id}_{photo_id}.jpg"));
+    if path.exists() {
+        return Ok(Some(path));
+    }
+    let peer = input_peer(ctx, chat_id)?;
+    let location = ChatPhoto {
+        raw: tl::enums::InputFileLocation::InputPeerPhotoFileLocation(tl::types::InputPeerPhotoFileLocation {
+            big: false,
+            peer,
+            photo_id,
+        }),
+    };
+    client
+        .download_media(&location, &path)
+        .await
+        .map_err(|e| format!("avatar download failed: {e}"))?;
+    chmod_600(&path);
+    Ok(Some(path))
+}
+
+/// Decode a webp (stickers) into a png next to it; GdkPixbuf has no webp loader here.
+fn webp_to_png(path: &std::path::Path, png: &std::path::Path) -> Result<(), TgError> {
+    let mut reader = image::ImageReader::open(path)
+        .map_err(|e| e.to_string())?
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader.decode().map_err(|e| format!("sticker decode failed: {e}"))?;
+    img.save(png).map_err(|e| e.to_string())?;
+    chmod_600(png);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// Stickers/gifs from the cached raw documents (see `remember_documents`).
+async fn download_document_by_id(client: &Client, ctx: &Arc<Ctx>, id: i64, sticker: bool) -> Result<Option<PathBuf>, TgError> {
+    let Some(doc) = ctx.documents.lock().unwrap().get(&id).cloned() else {
+        return Err("unknown sticker or gif — open the picker again".into());
+    };
+    let dir = paths::media_dir();
+    private_dir(&dir)?;
+    let mime = doc.mime_type.as_str();
+    if sticker && mime != "image/webp" && mime != "image/png" {
+        // .tgs / .webm stickers cannot be rendered here.
+        return Ok(None);
+    }
+    let ext = match mime {
+        "image/webp" => "webp",
+        "image/png" => "png",
+        "video/mp4" => "mp4",
+        "image/gif" => "gif",
+        _ => "bin",
+    };
+    let stem = format!("doc_{id}");
+    let final_path = dir.join(format!("{stem}.{}", if ext == "webp" { "png" } else { ext }));
+    if final_path.exists() {
+        return Ok(Some(final_path));
+    }
+    let path = dir.join(format!("{stem}.{ext}"));
+    let location = ChatPhoto {
+        raw: tl::enums::InputFileLocation::InputDocumentFileLocation(tl::types::InputDocumentFileLocation {
+            id: doc.id,
+            access_hash: doc.access_hash,
+            file_reference: doc.file_reference.clone(),
+            thumb_size: String::new(),
+        }),
+    };
+    client
+        .download_media(&location, &path)
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
+    chmod_600(&path);
+    if ext == "webp" {
+        webp_to_png(&path, &final_path)?;
+    }
+    Ok(Some(final_path))
+}
+
+fn remember_documents(ctx: &Ctx, docs: &[tl::enums::Document]) -> Vec<tl::types::Document> {
+    let mut out = Vec::new();
+    let mut cache = ctx.documents.lock().unwrap();
+    for d in docs {
+        if let tl::enums::Document::Document(d) = d {
+            cache.insert(d.id, d.clone());
+            out.push(d.clone());
+        }
+    }
+    out
+}
+
+fn sticker_from_doc(d: &tl::types::Document) -> Sticker {
+    let emoji = d
+        .attributes
+        .iter()
+        .find_map(|a| match a {
+            tl::enums::DocumentAttribute::Sticker(s) => Some(s.alt.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    Sticker { id: d.id, emoji, animated: d.mime_type != "image/webp" && d.mime_type != "image/png" }
+}
+
+// ===================== wave 5: messages =====================
+
+async fn get_messages(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, ids: &[i32]) -> Result<Vec<Msg>, TgError> {
+    let peer = ctx.peer(chat_id)?;
+    let fetched = client.get_messages_by_id(peer, ids).await.map_err(|e| e.to_string())?;
+    Ok(fetched.into_iter().flatten().map(|m| convert(ctx, &m, chat_id)).collect())
+}
+
+async fn delete_messages(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, ids: &[i32]) -> Result<(), TgError> {
+    let peer = ctx.peer(chat_id)?;
+    client
+        .delete_messages(peer, ids)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("delete failed: {e}"))
+}
+
+async fn forward_messages(client: &Client, ctx: &Arc<Ctx>, from_chat: i64, ids: &[i32], to_chat: i64) -> Result<Vec<Msg>, TgError> {
+    let from = ctx.peer(from_chat)?;
+    let to = ctx.peer(to_chat)?;
+    let sent = client
+        .forward_messages(to, ids, from)
+        .await
+        .map_err(|e| format!("forward failed: {e}"))?;
+    Ok(sent.into_iter().flatten().map(|m| convert(ctx, &m, to_chat)).collect())
+}
+
+async fn search_messages(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    chat_id: i64,
+    query: &str,
+    before_id: Option<i32>,
+    filter: Option<tl::enums::MessagesFilter>,
+) -> Result<Vec<Msg>, TgError> {
+    let peer = ctx.peer(chat_id)?;
+    let mut iter = client.search_messages(peer).query(query).limit(50);
+    if let Some(f) = filter {
+        iter = iter.filter(f);
+    }
+    if let Some(b) = before_id {
+        iter = iter.offset_id(b);
+    }
+    let mut out = Vec::new();
+    while let Some(m) = iter.next().await.map_err(|e| e.to_string())? {
+        out.push(convert(ctx, &m, chat_id));
+        if out.len() >= 50 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+async fn search_global(client: &Client, ctx: &Arc<Ctx>, query: &str) -> Result<Vec<Msg>, TgError> {
+    if query.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    let mut iter = client.search_all_messages().query(query).limit(50);
+    let mut out = Vec::new();
+    while let Some(m) = iter.next().await.map_err(|e| e.to_string())? {
+        let chat_id = m.peer_id().bot_api_dialog_id_unchecked();
+        remember_from_message(ctx, &m, chat_id).await;
+        out.push(convert(ctx, &m, chat_id));
+        if out.len() >= 50 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Public usernames and contacts not in the dialog list.
+async fn search_chats(client: &Client, ctx: &Arc<Ctx>, query: &str) -> Result<Vec<ChatSummary>, TgError> {
+    let q = query.trim().trim_start_matches('@');
+    if q.len() < 3 {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    // Contacts by name (cheap, cached by Telegram).
+    if let Ok(contacts) = get_contacts(client, ctx).await {
+        let ql = q.to_lowercase();
+        for c in contacts {
+            let known = ctx.meta.lock().unwrap().contains_key(&c.user_id);
+            if !known && (c.name.to_lowercase().contains(&ql) || c.username.to_lowercase().contains(&ql)) {
+                out.push(ChatSummary {
+                    id: c.user_id,
+                    title: c.name,
+                    kind: ChatKind::User,
+                    username: c.username,
+                    presence: c.presence,
+                    has_photo: c.has_photo,
+                    ..ChatSummary::default()
+                });
+            }
+        }
+    }
+    // Exact public username.
+    if !q.contains(char::is_whitespace) {
+        if let Ok(Some(peer)) = client.resolve_username(q).await {
+            let id = peer.id().bot_api_dialog_id_unchecked();
+            if !out.iter().any(|c| c.id == id) {
+                let facts = describe_peer(&peer);
+                let title = facts.title_override.clone().unwrap_or_else(|| peer.name().unwrap_or(q).to_string());
+                if let Ok(Some(r)) = peer_ref_of(&peer).await {
+                    ctx.remember(id, r, Some(&title));
+                }
+                if let Some(pid) = facts.photo_id {
+                    ctx.photos.lock().unwrap().insert(id, pid);
+                }
+                out.push(ChatSummary {
+                    id,
+                    title,
+                    kind: facts.kind,
+                    username: facts.username,
+                    presence: facts.presence,
+                    has_photo: facts.photo_id.is_some(),
+                    ..ChatSummary::default()
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn peer_ref_of(peer: &Peer) -> Result<Option<PeerRef>, TgError> {
+    match peer {
+        Peer::User(u) => u.to_ref().await.map_err(|e| e.to_string()),
+        Peer::Group(g) => g.to_ref().await.map_err(|e| e.to_string()),
+        Peer::Channel(c) => c.to_ref().await.map_err(|e| e.to_string()),
+    }
+}
+
+async fn get_pinned_message(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<Option<Msg>, TgError> {
+    let peer = ctx.peer(chat_id)?;
+    let m = client.get_pinned_message(peer).await.map_err(|e| e.to_string())?;
+    Ok(m.map(|m| convert(ctx, &m, chat_id)))
+}
+
+async fn pin_message(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, msg_id: i32, pinned: bool) -> Result<(), TgError> {
+    let peer = ctx.peer(chat_id)?;
+    let r = if pinned {
+        client.pin_message(peer, msg_id).await
+    } else {
+        client.unpin_message(peer, msg_id).await
+    };
+    r.map_err(|e| format!("pin failed: {e}"))
+}
+
+async fn send_reaction(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, msg_id: i32, emoji: Option<String>) -> Result<(), TgError> {
+    use grammers_client::message::InputReactions;
+    let peer = ctx.peer(chat_id)?;
+    let reactions = match emoji {
+        Some(e) => InputReactions::emoticon(e),
+        None => InputReactions::remove(),
+    };
+    client
+        .send_reactions(peer, msg_id, reactions)
+        .await
+        .map_err(|e| format!("reaction failed: {e}"))
+}
+
+async fn available_reactions(client: &Client) -> Result<Vec<String>, TgError> {
+    let r = client
+        .invoke(&tl::functions::messages::GetAvailableReactions { hash: 0 })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(match r {
+        tl::enums::messages::AvailableReactions::Reactions(r) => r
+            .reactions
+            .into_iter()
+            .filter_map(|a| {
+                let tl::enums::AvailableReaction::Reaction(a) = a;
+                (!a.inactive && !a.premium).then_some(a.reaction)
+            })
+            .collect(),
+        _ => vec![],
+    })
+}
+
+async fn send_voice(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, path: &std::path::Path, duration: u32) -> Result<Msg, TgError> {
+    use grammers_client::media::Attribute;
+    let peer = ctx.peer(chat_id)?;
+    let uploaded = client.upload_file(path).await.map_err(|e| format!("upload failed: {e}"))?;
+    let input = InputMessage::new()
+        .document(uploaded)
+        .mime_type("audio/ogg")
+        .attribute(Attribute::Voice { duration: std::time::Duration::from_secs(duration as u64), waveform: None });
+    let sent = client.send_message(peer, input).await.map_err(|e| format!("send failed: {e}"))?;
+    Ok(convert(ctx, &sent, chat_id))
+}
+
+async fn send_document_by_id(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, id: i64) -> Result<Msg, TgError> {
+    let Some(doc) = ctx.documents.lock().unwrap().get(&id).cloned() else {
+        return Err("unknown sticker or gif — open the picker again".into());
+    };
+    let peer = ctx.peer(chat_id)?;
+    let media = tl::enums::InputMedia::Document(tl::types::InputMediaDocument {
+        spoiler: false,
+        id: tl::enums::InputDocument::Document(tl::types::InputDocument {
+            id: doc.id,
+            access_hash: doc.access_hash,
+            file_reference: doc.file_reference.clone(),
+        }),
+        video_cover: None,
+        video_timestamp: None,
+        ttl_seconds: None,
+        query: None,
+    });
+    let sent = client
+        .send_message(peer, InputMessage::new().media(media))
+        .await
+        .map_err(|e| format!("send failed: {e}"))?;
+    Ok(convert(ctx, &sent, chat_id))
+}
+
+// ===================== wave 5: chat actions =====================
+
+fn dialog_peer(ctx: &Ctx, chat_id: i64) -> Result<tl::enums::InputDialogPeer, TgError> {
+    Ok(tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer: input_peer(ctx, chat_id)? }))
+}
+
+async fn set_pinned(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, pinned: bool) -> Result<(), TgError> {
+    client
+        .invoke(&tl::functions::messages::ToggleDialogPin { pinned, peer: dialog_peer(ctx, chat_id)? })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("pin failed: {e}"))
+}
+
+async fn set_muted(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, mode: MuteMode) -> Result<(), TgError> {
+    let until = match mode {
+        MuteMode::Unmute => 0,
+        MuteMode::Forever => i32::MAX,
+        MuteMode::Hours(h) => (Local::now().timestamp() as i32).saturating_add((h as i32).saturating_mul(3600)),
+    };
+    client
+        .invoke(&tl::functions::account::UpdateNotifySettings {
+            peer: tl::enums::InputNotifyPeer::Peer(tl::types::InputNotifyPeer { peer: input_peer(ctx, chat_id)? }),
+            settings: tl::enums::InputPeerNotifySettings::Settings(tl::types::InputPeerNotifySettings {
+                show_previews: None,
+                silent: None,
+                mute_until: Some(until),
+                sound: None,
+                stories_muted: None,
+                stories_hide_sender: None,
+                stories_sound: None,
+            }),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("mute failed: {e}"))?;
+    if let Some(m) = ctx.meta.lock().unwrap().get_mut(&chat_id) {
+        m.muted = mode != MuteMode::Unmute;
+    }
+    Ok(())
+}
+
+async fn set_archived(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, archived: bool) -> Result<(), TgError> {
+    client
+        .invoke(&tl::functions::folders::EditPeerFolders {
+            folder_peers: vec![tl::enums::InputFolderPeer::Peer(tl::types::InputFolderPeer {
+                peer: input_peer(ctx, chat_id)?,
+                folder_id: if archived { 1 } else { 0 },
+            })],
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("archive failed: {e}"))?;
+    if let Some(m) = ctx.meta.lock().unwrap().get_mut(&chat_id) {
+        m.archived = archived;
+    }
+    Ok(())
+}
+
+async fn mark_unread(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, unread: bool) -> Result<(), TgError> {
+    client
+        .invoke(&tl::functions::messages::MarkDialogUnread { unread, parent_peer: None, peer: dialog_peer(ctx, chat_id)? })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("mark unread failed: {e}"))
+}
+
+async fn delete_chat(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<(), TgError> {
+    let peer = ctx.peer(chat_id)?;
+    client.delete_dialog(peer).await.map_err(|e| format!("delete chat failed: {e}"))
+}
+
+async fn clear_history(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<(), TgError> {
+    let peer = ctx.peer(chat_id)?;
+    if peer.id.kind() == grammers_client::session::types::PeerKind::Channel {
+        client
+            .invoke(&tl::functions::channels::DeleteHistory { for_everyone: false, channel: peer.into(), max_id: 0 })
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("clear history failed: {e}"))
+    } else {
+        client
+            .invoke(&tl::functions::messages::DeleteHistory {
+                just_clear: true,
+                revoke: false,
+                peer: peer.into(),
+                max_id: 0,
+                min_date: None,
+                max_date: None,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("clear history failed: {e}"))
+    }
+}
+
+async fn save_draft(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, text: &str) -> Result<(), TgError> {
+    client
+        .invoke(&tl::functions::messages::SaveDraft {
+            no_webpage: false,
+            invert_media: false,
+            reply_to: None,
+            peer: input_peer(ctx, chat_id)?,
+            message: text.to_string(),
+            entities: None,
+            media: None,
+            effect: None,
+            suggested_post: None,
+            rich_message: None,
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("draft not saved: {e}"))
+}
+
+// ===================== wave 5: info, contacts, groups, folders =====================
+
+fn user_facts(u: &tl::types::User) -> (String, String, String, Presence, bool, bool) {
+    let name = format!("{} {}", u.first_name.clone().unwrap_or_default(), u.last_name.clone().unwrap_or_default())
+        .trim()
+        .to_string();
+    let presence = u.status.as_ref().map(presence_from).unwrap_or_default();
+    let has_photo = matches!(u.photo, Some(tl::enums::UserProfilePhoto::Photo(_)));
+    (
+        name,
+        u.username.clone().unwrap_or_default(),
+        u.phone.clone().unwrap_or_default(),
+        presence,
+        has_photo,
+        u.contact,
+    )
+}
+
+async fn get_chat_info(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<ChatInfo, TgError> {
+    use grammers_client::session::types::PeerKind;
+    let peer = ctx.peer(chat_id)?;
+    let title = ctx.titles.lock().unwrap().get(&chat_id).cloned().unwrap_or_default();
+    let meta = ctx.meta.lock().unwrap().get(&chat_id).copied();
+    let now = Local::now().timestamp() as i32;
+    match peer.id.kind() {
+        PeerKind::User => {
+            let r = client
+                .invoke(&tl::functions::users::GetFullUser { id: peer.into() })
+                .await
+                .map_err(|e| e.to_string())?;
+            let tl::enums::users::UserFull::Full(full) = r;
+            let tl::enums::UserFull::Full(f) = full.full_user;
+            let user = full.users.into_iter().find_map(|u| match u {
+                tl::enums::User::User(u) if u.id == chat_id => Some(u),
+                _ => None,
+            });
+            let (name, username, phone, presence, has_photo, contact) =
+                user.as_ref().map(user_facts).unwrap_or((title.clone(), String::new(), String::new(), Presence::Unknown, false, false));
+            Ok(ChatInfo {
+                id: chat_id,
+                title: if name.is_empty() { title } else { name },
+                kind: meta.map(|m| m.kind).unwrap_or(ChatKind::User),
+                username,
+                phone,
+                about: f.about.unwrap_or_default(),
+                members: None,
+                presence,
+                has_photo,
+                muted: is_muted(&f.notify_settings, now),
+                is_contact: contact,
+            })
+        }
+        PeerKind::Chat => {
+            let r = client
+                .invoke(&tl::functions::messages::GetFullChat { chat_id: peer.id.bare_id_unchecked() })
+                .await
+                .map_err(|e| e.to_string())?;
+            let tl::enums::messages::ChatFull::Full(full) = r;
+            let (about, members, muted) = match full.full_chat {
+                tl::enums::ChatFull::Full(f) => (
+                    f.about,
+                    match &f.participants {
+                        tl::enums::ChatParticipants::Participants(p) => Some(p.participants.len() as i32),
+                        _ => None,
+                    },
+                    is_muted(&f.notify_settings, now),
+                ),
+                tl::enums::ChatFull::ChannelFull(f) => (f.about, f.participants_count, is_muted(&f.notify_settings, now)),
+            };
+            Ok(ChatInfo {
+                id: chat_id,
+                title,
+                kind: ChatKind::Group,
+                about,
+                members,
+                muted,
+                ..ChatInfo::default()
+            })
+        }
+        PeerKind::Channel => {
+            let r = client
+                .invoke(&tl::functions::channels::GetFullChannel { channel: peer.into() })
+                .await
+                .map_err(|e| e.to_string())?;
+            let tl::enums::messages::ChatFull::Full(full) = r;
+            let (about, members, muted) = match full.full_chat {
+                tl::enums::ChatFull::ChannelFull(f) => (f.about, f.participants_count, is_muted(&f.notify_settings, now)),
+                tl::enums::ChatFull::Full(f) => (f.about, None, is_muted(&f.notify_settings, now)),
+            };
+            let username = full
+                .chats
+                .iter()
+                .find_map(|c| match c {
+                    tl::enums::Chat::Channel(c) => c.username.clone(),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Ok(ChatInfo {
+                id: chat_id,
+                title,
+                kind: meta.map(|m| m.kind).unwrap_or(ChatKind::Channel),
+                username,
+                about,
+                members,
+                muted,
+                ..ChatInfo::default()
+            })
+        }
+    }
+}
+
+async fn get_members(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, offset: i32, limit: i32) -> Result<Vec<Member>, TgError> {
+    let peer = ctx.peer(chat_id)?;
+    let mut iter = client.iter_participants(peer);
+    let mut seen = 0;
+    let mut out = Vec::new();
+    while let Some(p) = iter.next().await.map_err(|e| e.to_string())? {
+        seen += 1;
+        if seen <= offset {
+            continue;
+        }
+        let user_id = p.user.id().bot_api_dialog_id_unchecked();
+        if let Ok(Some(r)) = p.user.to_ref().await {
+            ctx.remember(user_id, r, Some(&p.user.full_name()));
+        }
+        if let Some(photo) = p.user.photo() {
+            ctx.photos.lock().unwrap().insert(user_id, photo.photo_id);
+        }
+        out.push(Member {
+            user_id,
+            name: p.user.full_name(),
+            username: p.user.username().unwrap_or("").to_string(),
+            presence: presence_from(p.user.status()),
+            role: match p.role {
+                Role::Creator(_) => MemberRole::Creator,
+                Role::Admin(_) => MemberRole::Admin,
+                _ => MemberRole::Member,
+            },
+        });
+        if out.len() as i32 >= limit.max(1) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+async fn get_contacts(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<Contact>, TgError> {
+    let r = client
+        .invoke(&tl::functions::contacts::GetContacts { hash: 0 })
+        .await
+        .map_err(|e| e.to_string())?;
+    let tl::enums::contacts::Contacts::Contacts(c) = r else {
+        return Ok(vec![]);
+    };
+    let mut out = Vec::new();
+    for u in c.users {
+        let tl::enums::User::User(raw) = u else { continue };
+        let (name, username, phone, presence, has_photo, _) = user_facts(&raw);
+        let id = raw.id;
+        if let Some(tl::enums::UserProfilePhoto::Photo(p)) = &raw.photo {
+            ctx.photos.lock().unwrap().insert(id, p.photo_id);
+        }
+        let user = grammers_client::peer::User::from_raw(client, tl::enums::User::User(raw));
+        if let Ok(Some(r)) = user.to_ref().await {
+            ctx.remember(id, r, Some(&name));
+        }
+        out.push(Contact { user_id: id, name, username, phone, presence, has_photo });
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
+}
+
+async fn open_user(client: &Client, ctx: &Arc<Ctx>, user_id: i64) -> Result<ChatSummary, TgError> {
+    if ctx.peer(user_id).is_err() {
+        // Saved Messages or a user we have not cached yet.
+        let me = client.get_me().await.map_err(|e| e.to_string())?;
+        if me.id().bot_api_dialog_id_unchecked() == user_id {
+            if let Ok(Some(r)) = me.to_ref().await {
+                ctx.remember(user_id, r, Some("Saved Messages"));
+            }
+        } else {
+            // Contacts fill the peer cache.
+            let _ = get_contacts(client, ctx).await;
+        }
+    }
+    ctx.peer(user_id)?;
+    let title = ctx.titles.lock().unwrap().get(&user_id).cloned().unwrap_or_default();
+    let meta = ctx.meta.lock().unwrap().get(&user_id).copied();
+    let has_photo = ctx.photos.lock().unwrap().contains_key(&user_id);
+    let kind = meta.map(|m| m.kind).unwrap_or(if title == "Saved Messages" { ChatKind::Saved } else { ChatKind::User });
+    Ok(ChatSummary {
+        id: user_id,
+        title: if title.is_empty() { "Chat".to_string() } else { title },
+        kind,
+        has_photo,
+        ..ChatSummary::default()
+    })
+}
+
+async fn create_group(client: &Client, ctx: &Arc<Ctx>, title: &str, user_ids: &[i64]) -> Result<ChatSummary, TgError> {
+    if title.is_empty() {
+        return Err("the group needs a title".into());
+    }
+    if user_ids.is_empty() {
+        return Err("pick at least one member".into());
+    }
+    let mut users = Vec::new();
+    for id in user_ids {
+        users.push(tl::enums::InputUser::from(ctx.peer(*id)?));
+    }
+    let r = client
+        .invoke(&tl::functions::messages::CreateChat { users, title: title.to_string(), ttl_period: None })
+        .await
+        .map_err(|e| format!("could not create the group: {e}"))?;
+    let tl::enums::messages::InvitedUsers::Users(iu) = r;
+    let chats = match iu.updates {
+        tl::enums::Updates::Updates(u) => u.chats,
+        tl::enums::Updates::Combined(u) => u.chats,
+        _ => vec![],
+    };
+    for chat in chats {
+        if let tl::enums::Chat::Chat(c) = &chat {
+            let chat_id = -c.id;
+            let group = grammers_client::peer::Group::from_raw(client, chat.clone());
+            if let Ok(Some(r)) = group.to_ref().await {
+                ctx.remember(chat_id, r, Some(title));
+                ctx.meta.lock().unwrap().insert(
+                    chat_id,
+                    DialogMeta { kind: ChatKind::Group, contact: false, muted: false, unread: false, archived: false },
+                );
+                return Ok(ChatSummary { id: chat_id, title: title.to_string(), kind: ChatKind::Group, ..ChatSummary::default() });
+            }
+        }
+    }
+    Err("the group was created but could not be opened — reload the chat list".into())
+}
+
+async fn get_folders(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<Folder>, TgError> {
+    let r = client
+        .invoke(&tl::functions::messages::GetDialogFilters {})
+        .await
+        .map_err(|e| e.to_string())?;
+    let tl::enums::messages::DialogFilters::Filters(f) = r;
+    let meta = ctx.meta.lock().unwrap().clone();
+    let mut out = Vec::new();
+    for filter in f.filters {
+        let (id, title, pinned, include, exclude, flags) = match filter {
+            tl::enums::DialogFilter::Filter(d) => {
+                let flags = Some((d.contacts, d.non_contacts, d.groups, d.broadcasts, d.bots, d.exclude_muted, d.exclude_read, d.exclude_archived));
+                (d.id, text_of(&d.title), d.pinned_peers, d.include_peers, d.exclude_peers, flags)
+            }
+            tl::enums::DialogFilter::Chatlist(d) => (d.id, text_of(&d.title), d.pinned_peers, d.include_peers, vec![], None),
+            tl::enums::DialogFilter::Default => continue,
+        };
+        let mut chats: Vec<i64> = pinned.iter().chain(include.iter()).filter_map(input_peer_chat_id).collect();
+        let excluded: Vec<i64> = exclude.iter().filter_map(input_peer_chat_id).collect();
+        if let Some((contacts, non_contacts, groups, broadcasts, bots, ex_muted, ex_read, ex_archived)) = flags {
+            for (&chat_id, m) in &meta {
+                if chats.contains(&chat_id) || excluded.contains(&chat_id) {
+                    continue;
+                }
+                let by_kind = match m.kind {
+                    ChatKind::User | ChatKind::Saved => (contacts && m.contact) || (non_contacts && !m.contact),
+                    ChatKind::Bot => bots,
+                    ChatKind::Group => groups,
+                    ChatKind::Channel => broadcasts,
+                };
+                if by_kind && !(ex_muted && m.muted) && !(ex_read && !m.unread) && !(ex_archived && m.archived) {
+                    chats.push(chat_id);
+                }
+            }
+        }
+        chats.sort_unstable();
+        chats.dedup();
+        out.push(Folder { id, title, chats });
+    }
+    Ok(out)
+}
+
+fn text_of(t: &tl::enums::TextWithEntities) -> String {
+    let tl::enums::TextWithEntities::Entities(t) = t;
+    t.text.clone()
+}
+
+// ===================== wave 5: stickers & gifs =====================
+
+async fn sticker_packs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<StickerPack>, TgError> {
+    let mut out = Vec::new();
+    if let Ok(tl::enums::messages::RecentStickers::Stickers(r)) = client
+        .invoke(&tl::functions::messages::GetRecentStickers { attached: false, hash: 0 })
+        .await
+    {
+        let docs = remember_documents(ctx, &r.stickers);
+        if !docs.is_empty() {
+            out.push(StickerPack { id: "recent".into(), title: "Recent".into(), count: docs.len() as i32 });
+        }
+    }
+    if let Ok(tl::enums::messages::FavedStickers::Stickers(f)) =
+        client.invoke(&tl::functions::messages::GetFavedStickers { hash: 0 }).await
+    {
+        let docs = remember_documents(ctx, &f.stickers);
+        if !docs.is_empty() {
+            out.push(StickerPack { id: "favorites".into(), title: "Favorites".into(), count: docs.len() as i32 });
+        }
+    }
+    match client.invoke(&tl::functions::messages::GetAllStickers { hash: 0 }).await {
+        Ok(tl::enums::messages::AllStickers::Stickers(s)) => {
+            for set in s.sets {
+                let tl::enums::StickerSet::Set(set) = set;
+                if set.masks || set.emojis {
+                    continue;
+                }
+                ctx.sticker_sets.lock().unwrap().insert(set.id, set.access_hash);
+                out.push(StickerPack { id: set.id.to_string(), title: set.title, count: set.count });
+            }
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("could not load sticker packs: {e}")),
+    }
+    Ok(out)
+}
+
+async fn stickers_of(client: &Client, ctx: &Arc<Ctx>, pack_id: &str) -> Result<Vec<Sticker>, TgError> {
+    let docs = match pack_id {
+        "recent" => match client
+            .invoke(&tl::functions::messages::GetRecentStickers { attached: false, hash: 0 })
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            tl::enums::messages::RecentStickers::Stickers(r) => remember_documents(ctx, &r.stickers),
+            _ => vec![],
+        },
+        "favorites" => match client
+            .invoke(&tl::functions::messages::GetFavedStickers { hash: 0 })
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            tl::enums::messages::FavedStickers::Stickers(f) => remember_documents(ctx, &f.stickers),
+            _ => vec![],
+        },
+        set_id => {
+            let id: i64 = set_id.parse().map_err(|_| format!("unknown sticker pack {set_id}"))?;
+            let access_hash = ctx
+                .sticker_sets
+                .lock()
+                .unwrap()
+                .get(&id)
+                .copied()
+                .ok_or_else(|| "unknown sticker pack — reopen the picker".to_string())?;
+            match client
+                .invoke(&tl::functions::messages::GetStickerSet {
+                    stickerset: tl::enums::InputStickerSet::Id(tl::types::InputStickerSetId { id, access_hash }),
+                    hash: 0,
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                tl::enums::messages::StickerSet::Set(s) => remember_documents(ctx, &s.documents),
+                _ => vec![],
+            }
+        }
+    };
+    Ok(docs.iter().map(sticker_from_doc).collect())
+}
+
+async fn saved_gifs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<Gif>, TgError> {
+    let r = client
+        .invoke(&tl::functions::messages::GetSavedGifs { hash: 0 })
+        .await
+        .map_err(|e| e.to_string())?;
+    let tl::enums::messages::SavedGifs::Gifs(g) = r else {
+        return Ok(vec![]);
+    };
+    let docs = remember_documents(ctx, &g.gifs);
+    Ok(docs
+        .iter()
+        .map(|d| {
+            let (w, h) = d
+                .attributes
+                .iter()
+                .find_map(|a| match a {
+                    tl::enums::DocumentAttribute::Video(v) => Some((v.w, v.h)),
+                    _ => None,
+                })
+                .unwrap_or((0, 0));
+            Gif { id: d.id, width: w, height: h }
+        })
+        .collect())
+}
+
+// ===================== wave 5: raw updates =====================
+
+fn event_from_raw(u: &tl::enums::Update) -> Option<Event> {
+    use tl::enums::Update as U;
+    Some(match u {
+        U::ReadHistoryOutbox(x) => Event::ReadOutbox { chat_id: peer_chat_id(&x.peer), max_id: x.max_id },
+        U::ReadChannelOutbox(x) => Event::ReadOutbox { chat_id: -1_000_000_000_000 - x.channel_id, max_id: x.max_id },
+        U::ReadHistoryInbox(x) => Event::ReadInbox { chat_id: peer_chat_id(&x.peer), max_id: x.max_id },
+        U::ReadChannelInbox(x) => Event::ReadInbox { chat_id: -1_000_000_000_000 - x.channel_id, max_id: x.max_id },
+        U::UserStatus(x) => Event::Presence { user_id: x.user_id, presence: presence_from(&x.status) },
+        U::DialogPinned(_)
+        | U::PinnedDialogs(_)
+        | U::NotifySettings(_)
+        | U::FolderPeers(_)
+        | U::DialogUnreadMark(_)
+        | U::DraftMessage(_)
+        | U::DialogFilters
+        | U::DialogFilter(_) => Event::DialogsChanged,
+        U::PinnedMessages(x) => Event::PinnedChanged { chat_id: peer_chat_id(&x.peer) },
+        _ => return None,
+    })
 }

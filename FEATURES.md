@@ -55,3 +55,7 @@ MERGED. All planned waves are complete.
 - Standalone Motion Lab artifact (54 options across 10 groups) is the design
   sandbox. User reviews there, sends picks, then animations ship as individual
   settings toggles in an in-app Animations menu. Keep ALL as options.
+
+## Wave 5 backend notes (2026-09-02)
+- Archived dialogs are not fetched by the real backend yet: grammers 0.10 `iter_dialogs` has no folder option; needs a raw `messages.getDialogs { folder_id: 1 }` path. The mock serves an archived chat so the UI is ready.
+- Drafts are saved without their reply target (raw `InputReplyTo` shape varies by layer).
