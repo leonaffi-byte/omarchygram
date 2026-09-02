@@ -15,9 +15,17 @@ weston --backend=headless --socket="$sock" --width=1200 --height=800 --idle-time
 wpid=$!
 cleanup() { kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true; rm -f "$log"; }
 trap cleanup EXIT INT TERM
-for _ in $(seq 1 50); do [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$sock" ] && break; sleep 0.1; done
+# Under load weston can take a while to bring the socket up; wait up to 20s,
+# retrying once with a fresh instance.
+wait_sock() { for _ in $(seq 1 200); do [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$sock" ] && return 0; sleep 0.1; done; return 1; }
+if ! wait_sock; then
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  weston --backend=headless --socket="$sock" --width=1200 --height=800 --idle-time=0 >"$log" 2>&1 &
+  wpid=$!
+  wait_sock || true
+fi
 if [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$sock" ]; then
   echo "bin/headless: weston did not create $sock" >&2; cat "$log" >&2; exit 3
 fi
 # Cairo rendering: no GPU surfaces to lose when the private compositor exits.
-WAYLAND_DISPLAY="$sock" GDK_BACKEND=wayland GSK_RENDERER=cairo "$@"
+WAYLAND_DISPLAY="$sock" GDK_BACKEND=wayland GSK_RENDERER="${GSK_RENDERER:-cairo}" "$@"

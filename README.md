@@ -69,6 +69,17 @@ message bar; forward to one or several chats; full-window photo viewer with
 arrow keys and Save/Open; video/GIF/audio cards that download and open in
 your default app.
 
+## More Telegram functions
+
+The **i** button (or `Ctrl+Shift+I`) opens the chat info panel: photo, bio,
+username, phone, notifications switch, members of a group, and the shared
+photos/files/links/voice tabs. The sticker button next to the emoji one opens
+your sticker packs and saved GIFs. The microphone records a voice note
+(needs `ffmpeg`; Esc cancels). ☰ → Contacts opens a chat with a contact;
+☰ → New group creates one. Right-click a message → Select for multi-select
+(forward, delete, copy several at once). Attaching a file asks for a caption.
+Muted chats never raise desktop notifications.
+
 ## Keyboard
 
 | Key           | Action                          |
