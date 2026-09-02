@@ -1,42 +1,28 @@
 #!/usr/bin/env bash
+# Screenshot a smoke-mode screen WITHOUT touching the user's desktop: the app
+# runs under a private headless compositor (bin/headless) and renders its own
+# window offscreen (OMG_SMOKE_SHOT). No synthetic input anywhere.
+#   bin/shot NAME [CHAT_TITLE] [SECONDS]
+#   OMG_SMOKE_SEARCH=green bin/shot search
+#   OMG_SMOKE_MENU=1 bin/shot menu
+# Output: target/shots/NAME.png
 set -euo pipefail
-
 name=${1:?usage: bin/shot NAME [CHAT_TITLE] [SECONDS]}
 chat_title=${2:-}
 wait_seconds=${3:-3}
 app=./target/debug/omarchygram
-output=target/shots/${name}.png
-
+out="$PWD/target/shots/${name}.png"
 if [[ ! -x "$app" ]]; then
   echo "bin/shot: $app is missing; build it first" >&2
   exit 1
 fi
-
 mkdir -p target/shots
-
-if [[ -n "$chat_title" ]]; then
-  OMG_SMOKE_OPEN="$chat_title" "$app" --smoke &
-else
-  "$app" --smoke &
-fi
-app_pid=$!
-
-cleanup() {
-  kill "$app_pid" 2>/dev/null || true
-  wait "$app_pid" 2>/dev/null || true
-}
-trap cleanup EXIT INT TERM
-
-sleep "$wait_seconds"
-if ! clients_json=$(hyprctl clients -j); then
-  echo "bin/shot: could not query Hyprland" >&2
+rm -f "$out"
+env_args=(OMG_SMOKE_SHOT="$out" OMG_SMOKE_SHOT_DELAY_MS="$((wait_seconds * 1000))")
+if [[ -n "$chat_title" ]]; then env_args+=(OMG_SMOKE_OPEN="$chat_title"); fi
+bin/headless env "${env_args[@]}" timeout $((wait_seconds + 20)) "$app" --smoke >/dev/null 2>&1 || true
+if [[ ! -s "$out" ]]; then
+  echo "bin/shot: no screenshot produced at $out" >&2
   exit 1
 fi
-geometry=$(jq -r '.[] | select(.class == "dev.leoom.Omarchygram") | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"' <<<"$clients_json" | head -n 1)
-if [[ -z "$geometry" ]]; then
-  echo "bin/shot: Omarchygram window not found" >&2
-  exit 1
-fi
-
-grim -g "$geometry" "$output"
-echo "$output"
+echo "$out"

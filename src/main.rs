@@ -89,6 +89,24 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
     // Keep the shell alive with the window.
     unsafe { window.set_data("shell", shell) };
 
+    // OMG_SMOKE_SHOT=<file.png>: render the window's content offscreen after
+    // OMG_SMOKE_SHOT_DELAY_MS (default 3000) and quit. Works while the window
+    // sits on another workspace — no compositor screenshot, no synthetic input.
+    if smoke && !probe {
+        if let Some(path) = std::env::var_os("OMG_SMOKE_SHOT") {
+            let delay = std::env::var("OMG_SMOKE_SHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000u64);
+            let window = window.clone();
+            let app = app.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
+                let ok = snapshot_window(&window, std::path::Path::new(&path));
+                if !ok {
+                    eprintln!("omarchygram: OMG_SMOKE_SHOT failed");
+                }
+                app.quit();
+            });
+        }
+    }
+
     if probe_traversal {
         // The traversal grows with every wave (100+ steps, delete/edit demos
         // wait 2.5s each, latency variants add 0.4s per command); 90s is the
@@ -98,4 +116,21 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
         let app = app.clone();
         glib::timeout_add_seconds_local_once(2, move || app.quit());
     }
+}
+
+/// Render the toplevel's child into a PNG through GSK (no screen capture).
+fn snapshot_window(window: &gtk::ApplicationWindow, path: &std::path::Path) -> bool {
+    use gtk::prelude::NativeExt;
+    let Some(child) = window.child() else { return false };
+    let Some(renderer) = window.renderer() else { return false };
+    let paintable = gtk::WidgetPaintable::new(Some(&child));
+    let snapshot = gtk::Snapshot::new();
+    let (w, h) = (child.width() as f64, child.height() as f64);
+    if w < 1.0 || h < 1.0 {
+        return false;
+    }
+    gtk::prelude::PaintableExt::snapshot(&paintable, &snapshot, w, h);
+    let Some(node) = snapshot.to_node() else { return false };
+    let texture = renderer.render_texture(&node, Some(&gtk::graphene::Rect::new(0.0, 0.0, w as f32, h as f32)));
+    texture.save_to_png(path).is_ok()
 }

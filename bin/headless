@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Run a command against a private headless Wayland compositor (weston), so
+# smoke runs, probes and screenshots never appear on the user's desktop.
+#   bin/headless ./target/debug/omarchygram --smoke --probe
+#   bin/headless env OMG_SMOKE_SHOT=$PWD/target/shots/x.png OMG_SMOKE_OPEN=Marta ./target/debug/omarchygram --smoke
+# Requires: sudo pacman -S --needed weston
+set -euo pipefail
+if ! command -v weston >/dev/null; then
+  echo "bin/headless: weston is not installed (sudo pacman -S --needed weston)" >&2
+  exit 2
+fi
+sock="wayland-omg-$$"
+log=$(mktemp -t omg-weston.XXXXXX)
+weston --backend=headless --socket="$sock" --width=1200 --height=800 --idle-time=0 >"$log" 2>&1 &
+wpid=$!
+cleanup() { kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true; rm -f "$log"; }
+trap cleanup EXIT INT TERM
+for _ in $(seq 1 50); do [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$sock" ] && break; sleep 0.1; done
+if [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$sock" ]; then
+  echo "bin/headless: weston did not create $sock" >&2; cat "$log" >&2; exit 3
+fi
+# Cairo rendering: no GPU surfaces to lose when the private compositor exits.
+WAYLAND_DISPLAY="$sock" GDK_BACKEND=wayland GSK_RENDERER=cairo "$@"
