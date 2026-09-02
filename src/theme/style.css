@@ -323,6 +323,17 @@ button.omg-menu-item.omg-danger {
   color: var(--muted);
 }
 
+.omg-auth linkbutton,
+.omg-auth linkbutton label,
+.omg-auth button.link,
+.omg-auth button.link label,
+.omg-auth link,
+.omg-auth link:visited,
+.omg-auth link:hover,
+.omg-auth link:active {
+  color: var(--accent);
+}
+
 .omg-auth entry {
   background-color: var(--bg-dark);
   color: var(--fg);
@@ -334,6 +345,12 @@ button.omg-menu-item.omg-danger {
 
 .omg-auth entry:focus-within {
   border-color: var(--accent);
+}
+
+.omg-auth entry placeholder,
+.omg-dialog entry placeholder {
+  color: var(--muted);
+  opacity: 1;
 }
 
 .omg-error {
@@ -355,6 +372,13 @@ button.omg-primary {
 button.omg-primary:hover {
   background-color: var(--accent);
   opacity: 0.9;
+}
+
+button.omg-primary:disabled {
+  background-image: none;
+  background-color: var(--bg-lighter);
+  color: var(--muted);
+  opacity: 1;
 }
 
 button.omg-primary:focus-visible {
@@ -385,6 +409,53 @@ button.omg-primary:focus-visible {
 
 .omg-settings entry:focus-within {
   border-color: var(--accent);
+}
+
+.omg-settings stacksidebar {
+  min-width: 176px;
+  background-color: var(--bg-dark);
+}
+
+.omg-settings stacksidebar list,
+.omg-settings stacksidebar row {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+}
+
+.omg-settings stacksidebar row {
+  padding: 8px 12px;
+}
+
+.omg-settings stacksidebar row:hover,
+.omg-settings stacksidebar row:selected {
+  background-color: var(--selection);
+}
+
+.omg-settings-separator {
+  background-color: var(--bg-lighter);
+}
+
+.omg-keys-accel {
+  background-color: var(--bg-darker);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 4px 8px;
+}
+
+.omg-keys-note {
+  color: var(--muted);
+  font-size: 9.5pt;
+}
+
+.omg-keys-conflict {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+window.omg-dialog {
+  background-color: var(--bg);
+  color: var(--fg);
 }
 
 /* GTK switches paint an Adwaita-blue background-image when checked; clearing
