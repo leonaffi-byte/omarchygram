@@ -5,7 +5,7 @@ by build wave. Status (2026-09-02): waves 0, 1, 2 and 3 are MERGED (settings, po
 ghost mode, anti-delete, edit history, Assistant/Omarchy virtual chats,
 transcription, AI draft/translate/summarize, ticketed shell gate). Wave 4
 (animations: all 54 Motion Lab effects as toggles + presets + previews) is
-MERGED. All planned waves are complete.
+MERGED. Wave 5 (Telegram parity: layout/chrome, in-app configuration, daily-use and regular-use functions — specs/spec-wave5.md) is IN PROGRESS: backend contract + real implementation merged 2026-09-02; UI packages 5A–5D delegated in order.
 
 ## Design decisions (orchestrator-owned)
 
