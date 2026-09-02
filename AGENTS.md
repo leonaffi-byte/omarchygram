@@ -10,3 +10,7 @@ You are one of several agents working in this repo under an orchestrator. These 
 - Secrets come from the environment only. Never print, log, or hardcode credentials or API keys.
 - UI work: implement the design spec exactly; do not invent design. The written design spec always wins over the defaults that follow. Where the spec is silent: one typeface (two max), one spacing scale, one accent color; no gradients-on-everything, no glassmorphism, no decorative emoji in UI copy, no marketing filler.
 - Finish with a short report: files changed (one line each), acceptance criteria results, anything your task missed.
+
+## GUI runs (binding)
+- NEVER open the app on the user's desktop. Every `./target/debug/omarchygram`, `cargo run`, `--smoke`, `--probe` or screenshot run MUST be wrapped as `bin/headless <command>` (private headless Wayland compositor). If `bin/headless` is unavailable or fails, skip the GUI check and say so in your report — the orchestrator runs the gate. A visible window on the user's screen is a hard rule violation.
+- Never send synthetic keyboard/mouse input to the desktop (no xdotool/wtype/ydotool/wlrctl).
