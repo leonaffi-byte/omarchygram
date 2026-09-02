@@ -753,6 +753,15 @@ impl ChatList {
             .collect()
     }
 
+    pub fn ordered_summaries(&self) -> Vec<ChatSummary> {
+        let summaries = self.summaries.borrow();
+        self.order
+            .borrow()
+            .iter()
+            .filter_map(|id| summaries.get(id).cloned())
+            .collect()
+    }
+
     pub fn visible_titles(&self) -> Vec<String> {
         let rows = self.rows.borrow();
         let summaries = self.summaries.borrow();

@@ -10,11 +10,14 @@ use gtk::glib::subclass::prelude::ObjectSubclassIsExt;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
-use crate::tg::{ChatInfo, ChatKind, ChatSummary, MediaKind, Msg, MsgVersion, Presence, Tg};
+use crate::tg::{
+    ChatInfo, ChatKind, ChatSummary, MediaKind, Msg, MsgVersion, Presence, SpanKind, Tg,
+};
 
 use super::anim::Effects;
 use super::avatar::Avatar;
 use super::icons;
+use super::markup;
 use super::menus::{self, ChatAction, PopoverSlot};
 use super::virtual_chat::is_virtual;
 
@@ -85,7 +88,11 @@ mod bubble_clamp_imp {
             } else {
                 // Height must be measured at the width the child will really
                 // get (the clamped one), or wrapped text is cut off.
-                let width = if for_size > 0 { self.child_width(&child, for_size, target) } else { for_size };
+                let width = if for_size > 0 {
+                    self.child_width(&child, for_size, target)
+                } else {
+                    for_size
+                };
                 child.measure(orientation, width)
             }
         }
@@ -101,7 +108,11 @@ mod bubble_clamp_imp {
                 self.pane_width.borrow().as_ref().map(|width| width.get()),
             );
             let child_width = self.child_width(&child, width, target);
-            let x = if child.halign() == gtk::Align::End { width - child_width } else { 0 };
+            let x = if child.halign() == gtk::Align::End {
+                width - child_width
+            } else {
+                0
+            };
             let transform = (x > 0).then(|| {
                 gtk::gsk::Transform::new().translate(&gtk::graphene::Point::new(x as f32, 0.0))
             });
@@ -231,11 +242,33 @@ pub enum MessageAction {
     Attach,
     DraftChanged,
     DraftRetry,
+    RetryReaction,
+    RetryAvailableReactions,
+    SearchChanged(String),
+    SearchPrevious,
+    SearchNext,
+    SearchOlder,
+    SearchRetry,
+    SearchClose,
     Header(ChatAction),
     DropFile(gtk::gio::File),
     Reply(i32),
     Edit(i32),
     EditHistory(i32),
+    Forward(i32),
+    Reaction {
+        msg_id: i32,
+        emoji: Option<String>,
+    },
+    RevealSpoiler {
+        msg_id: i32,
+        start: usize,
+        end: usize,
+    },
+    OpenLink(String),
+    OpenMention(i64),
+    UnpinMessage(i32),
+    RetryPinned,
     Delete(i32),
     Media(i32),
     Paginate,
@@ -262,16 +295,19 @@ pub enum MediaState {
 #[derive(Clone)]
 struct MessageRow {
     widget: BubbleClamp,
-    content: gtk::Box,
     forwarded: gtk::Label,
     sender: gtk::Label,
     quote: gtk::Label,
+    text_block: gtk::Box,
     text: Rc<RefCell<Option<gtk::Label>>>,
+    revealed_spoilers: Rc<RefCell<HashSet<(usize, usize)>>>,
+    web_preview: gtk::Box,
     time: gtk::Label,
     deleted_tag: gtk::Label,
     receipt: gtk::Label,
     reactions: gtk::Box,
-    reaction_labels: Rc<RefCell<Vec<gtk::Label>>>,
+    reaction_buttons: Rc<RefCell<Vec<gtk::Button>>>,
+    reaction_anchor: gtk::Button,
     media_slot: gtk::Box,
     media_button: Option<gtk::Button>,
     transcribe_button: Option<gtk::Button>,
@@ -318,6 +354,18 @@ struct MessagesInner {
     header_info: gtk::Button,
     header_more: gtk::Button,
     header_actions: gtk::Box,
+    search_bar: gtk::Box,
+    search_entry: gtk::SearchEntry,
+    search_position: gtk::Label,
+    search_previous: gtk::Button,
+    search_next: gtk::Button,
+    search_older: gtk::Button,
+    search_retry: gtk::Button,
+    pinned_bar: gtk::Box,
+    pinned_text: gtk::Label,
+    pinned_message: RefCell<Option<Msg>>,
+    pinned_more: gtk::Button,
+    pinned_retry: gtk::Button,
     bottom_button: gtk::Button,
     bottom_badge: gtk::Label,
     bottom_unread: Cell<u32>,
@@ -331,6 +379,7 @@ struct MessagesInner {
     paging_spinner: gtk::Spinner,
     error: gtk::Label,
     draft_retry: gtk::Button,
+    operation_retry: gtk::Button,
     reply_bar: gtk::Box,
     reply_label: gtk::Label,
     edit_bar: gtk::Box,
@@ -372,7 +421,10 @@ struct MessagesInner {
     upper_tick: RefCell<Option<gtk::TickCallbackId>>,
     context_popover: RefCell<Option<gtk::Popover>>,
     history_popover: RefCell<Option<gtk::Popover>>,
+    reaction_popover: PopoverSlot,
+    probe_reaction_chooser: RefCell<Option<gtk::EmojiChooser>>,
     header_popover: PopoverSlot,
+    pinned_popover: PopoverSlot,
     composer_popover: PopoverSlot,
     initial_render_count: Cell<u64>,
     history_version_count: Cell<usize>,
@@ -381,6 +433,9 @@ struct MessagesInner {
     day_separators: RefCell<HashMap<chrono::NaiveDate, gtk::Label>>,
     quote_cache: RefCell<HashMap<i32, (String, String)>>,
     pending_messages: RefCell<HashSet<i32>>,
+    available_reactions: RefCell<Vec<String>>,
+    available_reactions_loading: Cell<bool>,
+    available_reactions_error: RefCell<Option<String>>,
     effects: Rc<Effects>,
 }
 
@@ -486,6 +541,66 @@ impl MessagesView {
 
         widget.append(&header);
 
+        let search_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        search_bar.add_css_class("omg-in-chat-search");
+        search_bar.set_visible(false);
+        let search_entry = gtk::SearchEntry::new();
+        search_entry.set_placeholder_text(Some("Search in chat"));
+        search_entry.set_hexpand(true);
+        search_bar.append(&search_entry);
+        let search_position = gtk::Label::new(Some("No results"));
+        search_position.add_css_class("omg-small");
+        search_bar.append(&search_position);
+        let search_previous = gtk::Button::with_label(icons::LEFT);
+        search_previous.add_css_class("omg-icon-button");
+        search_previous.set_tooltip_text(Some("Previous result"));
+        search_bar.append(&search_previous);
+        let search_next = gtk::Button::with_label(icons::RIGHT);
+        search_next.add_css_class("omg-icon-button");
+        search_next.set_tooltip_text(Some("Next result"));
+        search_bar.append(&search_next);
+        let search_older = gtk::Button::with_label("Load older");
+        search_older.add_css_class("omg-menu-item");
+        search_older.set_visible(false);
+        search_bar.append(&search_older);
+        let search_retry = gtk::Button::with_label("Retry");
+        search_retry.add_css_class("omg-primary");
+        search_retry.set_visible(false);
+        search_bar.append(&search_retry);
+        let search_close = gtk::Button::with_label(icons::CLOSE);
+        search_close.add_css_class("omg-icon-button");
+        search_close.set_tooltip_text(Some("Close search"));
+        search_bar.append(&search_close);
+        widget.append(&search_bar);
+
+        let pinned_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        pinned_bar.add_css_class("omg-pinned-bar");
+        pinned_bar.set_visible(false);
+        let pinned_icon = gtk::Label::new(Some(icons::PIN));
+        pinned_icon.add_css_class("omg-muted");
+        pinned_bar.append(&pinned_icon);
+        let pinned_copy = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pinned_copy.set_hexpand(true);
+        let pinned_title = gtk::Label::new(Some("Pinned message"));
+        pinned_title.set_halign(gtk::Align::Start);
+        pinned_title.add_css_class("omg-small");
+        pinned_copy.append(&pinned_title);
+        let pinned_text = gtk::Label::new(None);
+        pinned_text.set_halign(gtk::Align::Start);
+        pinned_text.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        pinned_text.add_css_class("omg-muted");
+        pinned_copy.append(&pinned_text);
+        pinned_bar.append(&pinned_copy);
+        let pinned_more = gtk::Button::with_label(icons::MORE);
+        pinned_more.add_css_class("omg-icon-button");
+        pinned_more.set_tooltip_text(Some("Pinned message actions"));
+        pinned_bar.append(&pinned_more);
+        let pinned_retry = gtk::Button::with_label("Retry");
+        pinned_retry.add_css_class("omg-primary");
+        pinned_retry.set_visible(false);
+        pinned_bar.append(&pinned_retry);
+        widget.append(&pinned_bar);
+
         // Spacing comes from the rows themselves (4px same sender / 12px
         // otherwise), so the list adds none.
         let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -547,6 +662,12 @@ impl MessagesView {
         draft_retry.set_margin_start(8);
         draft_retry.set_visible(false);
         widget.append(&draft_retry);
+        let operation_retry = gtk::Button::with_label("Retry");
+        operation_retry.add_css_class("omg-primary");
+        operation_retry.set_halign(gtk::Align::Start);
+        operation_retry.set_margin_start(8);
+        operation_retry.set_visible(false);
+        widget.append(&operation_retry);
 
         let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         reply_bar.add_css_class("omg-reply-bar");
@@ -691,6 +812,18 @@ impl MessagesView {
             header_info,
             header_more,
             header_actions,
+            search_bar,
+            search_entry,
+            search_position,
+            search_previous,
+            search_next,
+            search_older,
+            search_retry,
+            pinned_bar,
+            pinned_text,
+            pinned_message: RefCell::new(None),
+            pinned_more,
+            pinned_retry,
             bottom_button,
             bottom_badge,
             bottom_unread: Cell::new(0),
@@ -704,6 +837,7 @@ impl MessagesView {
             paging_spinner,
             error,
             draft_retry,
+            operation_retry,
             reply_bar,
             reply_label,
             edit_bar,
@@ -745,7 +879,10 @@ impl MessagesView {
             upper_tick: RefCell::new(None),
             context_popover: RefCell::new(None),
             history_popover: RefCell::new(None),
+            reaction_popover: PopoverSlot::default(),
+            probe_reaction_chooser: RefCell::new(None),
             header_popover: PopoverSlot::default(),
+            pinned_popover: PopoverSlot::default(),
             composer_popover: PopoverSlot::default(),
             initial_render_count: Cell::new(0),
             history_version_count: Cell::new(0),
@@ -754,6 +891,9 @@ impl MessagesView {
             day_separators: RefCell::new(HashMap::new()),
             quote_cache: RefCell::new(HashMap::new()),
             pending_messages: RefCell::new(HashSet::new()),
+            available_reactions: RefCell::new(Vec::new()),
+            available_reactions_loading: Cell::new(true),
+            available_reactions_error: RefCell::new(None),
             effects,
         });
         let view = Self { widget, inner };
@@ -768,11 +908,16 @@ impl MessagesView {
                 glib::ControlFlow::Continue
             });
         }
-        view.connect_controls(reply_close, edit_close);
+        view.connect_controls(reply_close, edit_close, search_close);
         view
     }
 
-    fn connect_controls(&self, reply_close: gtk::Button, edit_close: gtk::Button) {
+    fn connect_controls(
+        &self,
+        reply_close: gtk::Button,
+        edit_close: gtk::Button,
+        search_close: gtk::Button,
+    ) {
         {
             let action = self.inner.action.clone();
             self.inner.attach.connect_clicked(move |_| {
@@ -831,6 +976,33 @@ impl MessagesView {
         }
         {
             let action = self.inner.action.clone();
+            self.inner
+                .search_entry
+                .connect_search_changed(move |entry| {
+                    if let Some(callback) = action.borrow().as_ref().cloned() {
+                        callback(MessageAction::SearchChanged(entry.text().to_string()));
+                    }
+                });
+        }
+        for (button, message_action) in [
+            (
+                self.inner.search_previous.clone(),
+                MessageAction::SearchPrevious,
+            ),
+            (self.inner.search_next.clone(), MessageAction::SearchNext),
+            (self.inner.search_older.clone(), MessageAction::SearchOlder),
+            (self.inner.search_retry.clone(), MessageAction::SearchRetry),
+            (search_close, MessageAction::SearchClose),
+        ] {
+            let action = self.inner.action.clone();
+            button.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(message_action.clone());
+                }
+            });
+        }
+        {
+            let action = self.inner.action.clone();
             self.inner.header_info.connect_clicked(move |_| {
                 if let Some(callback) = action.borrow().as_ref().cloned() {
                     callback(MessageAction::Header(ChatAction::Info));
@@ -846,9 +1018,64 @@ impl MessagesView {
             });
         }
         {
+            let action = self.inner.action.clone();
+            self.inner.operation_retry.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::RetryReaction);
+                }
+            });
+        }
+        {
             let inner = self.inner.clone();
             self.inner.header_more.connect_clicked(move |button| {
                 MessagesView::show_header_menu(&inner, button);
+            });
+        }
+        {
+            let inner = self.inner.clone();
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |_, _, _, _| {
+                if let Some(message) = inner.pinned_message.borrow().as_ref() {
+                    if let Some(callback) = inner.action.borrow().as_ref().cloned() {
+                        callback(MessageAction::JumpToMessage(message.id));
+                    }
+                }
+            });
+            self.inner.pinned_bar.add_controller(click);
+        }
+        {
+            let inner = self.inner.clone();
+            self.inner.pinned_more.connect_clicked(move |button| {
+                let Some(msg_id) = inner
+                    .pinned_message
+                    .borrow()
+                    .as_ref()
+                    .map(|message| message.id)
+                else {
+                    return;
+                };
+                let (popover, contents) = menus::popover();
+                let unpin = menus::button("Unpin", false);
+                let action = inner.action.clone();
+                let popover_weak = popover.downgrade();
+                unpin.connect_clicked(move |_| {
+                    if let Some(popover) = popover_weak.upgrade() {
+                        popover.popdown();
+                    }
+                    if let Some(callback) = action.borrow().as_ref().cloned() {
+                        callback(MessageAction::UnpinMessage(msg_id));
+                    }
+                });
+                contents.append(&unpin);
+                inner.pinned_popover.show(button, popover);
+            });
+        }
+        {
+            let action = self.inner.action.clone();
+            self.inner.pinned_retry.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::RetryPinned);
+                }
             });
         }
 
@@ -952,6 +1179,246 @@ impl MessagesView {
 
     pub fn set_action(&self, callback: Rc<dyn Fn(MessageAction)>) {
         *self.inner.action.borrow_mut() = Some(callback);
+    }
+
+    pub fn open_search(&self) {
+        self.inner.search_bar.set_visible(true);
+        self.inner.search_entry.grab_focus();
+    }
+
+    pub fn close_search(&self) {
+        self.move_focus_before_removal(&self.inner.search_bar);
+        self.inner.search_entry.set_text("");
+        self.inner.search_bar.set_visible(false);
+        self.clear_search_highlights();
+        self.inner.search_retry.set_visible(false);
+    }
+
+    pub fn search_is_open(&self) -> bool {
+        self.inner.search_bar.is_visible()
+    }
+
+    pub fn search_text(&self) -> String {
+        self.inner.search_entry.text().to_string()
+    }
+
+    pub fn search_position_text(&self) -> String {
+        self.inner.search_position.label().to_string()
+    }
+
+    pub fn search_retry_visible(&self) -> bool {
+        self.inner.search_retry.is_visible()
+    }
+
+    pub fn trigger_search_retry(&self) {
+        self.inner.search_retry.emit_clicked();
+    }
+
+    pub fn set_search_text(&self, text: &str) {
+        self.inner.search_entry.set_text(text);
+    }
+
+    pub fn set_search_loading(&self, loading: bool) {
+        self.inner.search_position.remove_css_class("omg-error");
+        self.inner.search_position.set_label(if loading {
+            "Searching…"
+        } else {
+            "No results"
+        });
+        self.inner.search_retry.set_visible(false);
+        self.inner.search_older.set_sensitive(!loading);
+    }
+
+    pub fn set_search_results(&self, ids: &[i32], index: Option<usize>, has_older: bool) {
+        self.inner.search_entry.set_sensitive(true);
+        self.inner.search_retry.set_visible(false);
+        self.inner
+            .search_position
+            .set_label(&search_position(index, ids.len()));
+        self.inner
+            .search_previous
+            .set_sensitive(index.is_some_and(|index| index > 0));
+        self.inner
+            .search_next
+            .set_sensitive(index.is_some_and(|index| index + 1 < ids.len()));
+        self.inner.search_older.set_visible(has_older);
+        self.inner.search_older.set_sensitive(true);
+        self.clear_search_highlights();
+        let store = self.inner.store.borrow();
+        for (position, id) in ids.iter().enumerate() {
+            if let Some(entry) = store.entries.get(id) {
+                entry.row.widget.add_css_class("omg-hit");
+                if Some(position) == index {
+                    entry.row.widget.add_css_class("omg-hit-active");
+                }
+            }
+        }
+    }
+
+    pub fn fail_search(&self, message: &str, has_results: bool) {
+        if !has_results {
+            self.clear_search_highlights();
+        }
+        self.inner.search_position.set_label(message);
+        self.inner.search_position.add_css_class("omg-error");
+        self.inner.search_retry.set_visible(true);
+        self.inner.search_older.set_sensitive(false);
+    }
+
+    fn clear_search_highlights(&self) {
+        for entry in self.inner.store.borrow().entries.values() {
+            entry.row.widget.remove_css_class("omg-hit");
+            entry.row.widget.remove_css_class("omg-hit-active");
+        }
+        self.inner.search_position.remove_css_class("omg-error");
+    }
+
+    pub fn set_pinned_message(&self, message: Option<Msg>) {
+        self.move_focus_before_removal(&self.inner.pinned_bar);
+        self.inner.pinned_popover.dismiss();
+        self.inner.pinned_retry.set_visible(false);
+        self.inner.pinned_more.set_visible(message.is_some());
+        self.inner.pinned_text.remove_css_class("omg-error");
+        *self.inner.pinned_message.borrow_mut() = message.clone();
+        if let Some(message) = message {
+            let preview = if message.text.is_empty() {
+                media_title(&message)
+            } else {
+                message.text.clone()
+            };
+            self.inner.pinned_text.set_label(&snippet(&preview, 90));
+            self.inner.pinned_bar.set_visible(true);
+        } else {
+            self.inner.pinned_text.set_label("");
+            self.inner.pinned_bar.set_visible(false);
+        }
+    }
+
+    pub fn begin_pinned(&self) {
+        self.move_focus_before_removal(&self.inner.pinned_bar);
+        self.inner.pinned_popover.dismiss();
+        self.inner.pinned_message.borrow_mut().take();
+        self.inner.pinned_text.remove_css_class("omg-error");
+        self.inner.pinned_text.set_label("Loading…");
+        self.inner.pinned_more.set_visible(false);
+        self.inner.pinned_retry.set_visible(false);
+        self.inner.pinned_bar.set_visible(true);
+    }
+
+    pub fn fail_pinned(&self, error: &str) {
+        self.inner.pinned_message.borrow_mut().take();
+        self.inner.pinned_text.add_css_class("omg-error");
+        self.inner.pinned_text.set_label(error);
+        self.inner.pinned_more.set_visible(false);
+        self.inner.pinned_retry.set_visible(true);
+        self.inner.pinned_bar.set_visible(true);
+    }
+
+    pub fn pinned_id(&self) -> Option<i32> {
+        self.inner
+            .pinned_message
+            .borrow()
+            .as_ref()
+            .map(|message| message.id)
+    }
+
+    pub fn pinned_bar_visible(&self) -> bool {
+        self.inner.pinned_bar.is_visible()
+    }
+
+    pub fn pinned_retry_visible(&self) -> bool {
+        self.inner.pinned_retry.is_visible()
+    }
+
+    pub fn trigger_pinned_retry(&self) {
+        self.inner.pinned_retry.emit_clicked();
+    }
+
+    pub fn trigger_pinned(&self) {
+        if let Some(message) = self.inner.pinned_message.borrow().as_ref() {
+            if let Some(callback) = self.inner.action.borrow().as_ref().cloned() {
+                callback(MessageAction::JumpToMessage(message.id));
+            }
+        }
+    }
+
+    pub fn set_available_reactions(&self, reactions: Vec<String>) {
+        *self.inner.available_reactions.borrow_mut() = reactions;
+        self.inner.available_reactions_loading.set(false);
+        self.inner.available_reactions_error.borrow_mut().take();
+    }
+
+    pub fn begin_available_reactions(&self) {
+        self.inner.available_reactions_loading.set(true);
+        self.inner.available_reactions_error.borrow_mut().take();
+    }
+
+    pub fn fail_available_reactions(&self, error: String) {
+        self.inner.available_reactions_loading.set(false);
+        *self.inner.available_reactions_error.borrow_mut() = Some(error);
+    }
+
+    pub fn optimistic_reaction(&self, msg_id: i32, emoji: &str) -> bool {
+        let message = {
+            let store = self.inner.store.borrow();
+            let Some(entry) = store.entries.get(&msg_id) else {
+                return false;
+            };
+            let mut message = entry.msg.clone();
+            let remove = message
+                .reactions
+                .iter()
+                .any(|reaction| reaction.emoji == emoji && reaction.chosen);
+            for reaction in message
+                .reactions
+                .iter_mut()
+                .filter(|reaction| reaction.chosen)
+            {
+                reaction.chosen = false;
+                reaction.count -= 1;
+            }
+            message.reactions.retain(|reaction| reaction.count > 0);
+            if !remove {
+                match message
+                    .reactions
+                    .iter_mut()
+                    .find(|reaction| reaction.emoji == emoji)
+                {
+                    Some(reaction) => {
+                        reaction.count += 1;
+                        reaction.chosen = true;
+                    }
+                    None => message.reactions.push(crate::tg::Reaction {
+                        emoji: emoji.to_string(),
+                        count: 1,
+                        chosen: true,
+                    }),
+                }
+            }
+            message
+        };
+        self.update_existing(message, true);
+        true
+    }
+
+    pub fn reveal_spoiler(&self, msg_id: i32, start: usize, end: usize) -> bool {
+        let (message, label, revealed) = {
+            let store = self.inner.store.borrow();
+            let Some(entry) = store.entries.get(&msg_id) else {
+                return false;
+            };
+            let Some(label) = entry.row.text.borrow().as_ref().cloned() else {
+                return false;
+            };
+            (
+                entry.msg.clone(),
+                label,
+                entry.row.revealed_spoilers.clone(),
+            )
+        };
+        revealed.borrow_mut().insert((start, end));
+        apply_message_markup(&label, &message, &revealed);
+        true
     }
 
     fn cancel_pending_scroll(&self) {
@@ -1098,6 +1565,7 @@ impl MessagesView {
     }
 
     pub fn reset_chat(&self, chat_id: i64, title: &str, epoch: u64) {
+        self.move_focus_before_removal(&self.widget);
         self.clear_recent_presence();
         self.inner.virtual_mode.set(is_virtual(chat_id));
         let composer_enabled = self.inner.virtual_mode.get() || !self.inner.busy.get();
@@ -1118,6 +1586,8 @@ impl MessagesView {
         self.dismiss_row_popovers();
         self.inner.header_popover.dismiss();
         self.inner.composer_popover.dismiss();
+        self.inner.reaction_popover.dismiss();
+        self.set_pinned_message(None);
         self.inner.media_ready.borrow_mut().clear();
         self.inner.quote_cache.borrow_mut().clear();
         self.inner.pending_messages.borrow_mut().clear();
@@ -1148,6 +1618,7 @@ impl MessagesView {
     }
 
     pub fn clear_selection(&self, epoch: u64) {
+        self.move_focus_before_removal(&self.widget);
         self.clear_recent_presence();
         self.cancel_pending_scroll();
         self.inner.scroll_epoch.set(epoch);
@@ -1162,6 +1633,8 @@ impl MessagesView {
         self.dismiss_row_popovers();
         self.inner.header_popover.dismiss();
         self.inner.composer_popover.dismiss();
+        self.inner.reaction_popover.dismiss();
+        self.set_pinned_message(None);
         self.inner.media_ready.borrow_mut().clear();
         self.inner.quote_cache.borrow_mut().clear();
         self.inner.pending_messages.borrow_mut().clear();
@@ -1195,6 +1668,7 @@ impl MessagesView {
     /// preserves the composer draft, reply/edit mode, and busy sensitivity
     /// (C5/C13). `detached` is left to the caller.
     pub fn reset_history(&self, chat_id: i64, epoch: u64) {
+        self.move_focus_before_removal(&self.widget);
         self.cancel_pending_scroll();
         self.inner.scroll_epoch.set(epoch);
         self.clear_error();
@@ -1392,9 +1866,16 @@ impl MessagesView {
         let row_layout = gtk::Box::new(gtk::Orientation::Vertical, 4);
         // Same alignment as the clamp, so the bubble sits at the end even if
         // a parent ever hands the clamp the full row width.
-        row_layout.set_halign(if message.outgoing { gtk::Align::End } else { gtk::Align::Start });
+        row_layout.set_halign(if message.outgoing {
+            gtk::Align::End
+        } else {
+            gtk::Align::Start
+        });
         let widget = BubbleClamp::new(&row_layout, self.inner.pane_width.clone());
         widget.add_css_class("omg-msg");
+        // The viewer returns keyboard focus to its originating message.  The
+        // bubble wrapper therefore needs to be an explicit focus target.
+        widget.set_focusable(true);
         widget.set_hexpand(false);
         widget.set_halign(if message.outgoing {
             gtk::Align::End
@@ -1437,10 +1918,8 @@ impl MessagesView {
         forwarded.set_visible(message.forwarded_from.is_some());
         content.append(&forwarded);
 
-        let show_sender = matches!(
-            self.inner.chat_kind.get(),
-            ChatKind::Group | ChatKind::Channel
-        ) && !message.outgoing
+        let show_sender = self.inner.chat_kind.get() == ChatKind::Group
+            && !message.outgoing
             && !message.sender.is_empty()
             && message.sender != "You";
         let sender = gtk::Label::new(Some(&message.sender));
@@ -1503,20 +1982,7 @@ impl MessagesView {
                 | MediaKind::VideoNote
                 | MediaKind::Unsupported,
             ) => {
-                let label = match message.media {
-                    Some(MediaKind::Voice) => "voice message".to_string(),
-                    _ => message
-                        .doc_name
-                        .clone()
-                        .unwrap_or_else(|| "document".to_string()),
-                };
-                let button = gtk::Button::with_label(&label);
-                button.add_css_class("omg-doc-pill");
-                // Remote-controlled filename: cap the pill width.
-                if let Some(child) = button.child().and_downcast::<gtk::Label>() {
-                    child.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                    child.set_max_width_chars(36);
-                }
+                let button = media_card(message);
                 let action = self.inner.action.clone();
                 let msg_id = message.id;
                 button.connect_clicked(move |_| {
@@ -1545,13 +2011,23 @@ impl MessagesView {
             None => {}
         }
 
+        let revealed_spoilers = Rc::new(RefCell::new(HashSet::new()));
+        let text_block = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        text_block.set_halign(gtk::Align::Fill);
+        set_text_block_style(&text_block, message);
         let text = if message.text.is_empty() {
             None
         } else {
-            let text = message_label(&message.text);
-            content.append(&text);
+            let text = formatted_message_label(message, &revealed_spoilers, &self.inner.action);
+            text_block.append(&text);
             Some(text)
         };
+        text_block.set_visible(text.is_some());
+        content.append(&text_block);
+
+        let web_preview = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&web_preview);
+        render_web_preview(&web_preview, message, &self.inner.action);
 
         let time = gtk::Label::new(None);
         time.add_css_class("omg-msg-time");
@@ -1586,7 +2062,35 @@ impl MessagesView {
         let reactions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         reactions.set_halign(gtk::Align::Start);
         content.append(&reactions);
-        let reaction_labels = Rc::new(RefCell::new(Vec::new()));
+        let reaction_buttons = Rc::new(RefCell::new(Vec::new()));
+        let reaction_anchor = gtk::Button::with_label(icons::EMOJI);
+        reaction_anchor.add_css_class("omg-reaction-anchor");
+        reaction_anchor.set_tooltip_text(Some("React"));
+        {
+            let inner = Rc::downgrade(&self.inner);
+            let anchor = reaction_anchor.clone();
+            let msg_id = message.id;
+            reaction_anchor.connect_clicked(move |_| {
+                let Some(inner) = inner.upgrade() else { return };
+                // Context-menu "…" activates this stable row-owned button.
+                // Focus it before the old popover is unparented (A26).
+                anchor.grab_focus();
+                MessagesView::dismiss_popover(&inner.context_popover);
+                let chooser = gtk::EmojiChooser::new();
+                let action = inner.action.clone();
+                chooser.connect_emoji_picked(move |_, emoji| {
+                    if let Some(callback) = action.borrow().as_ref().cloned() {
+                        callback(MessageAction::Reaction {
+                            msg_id,
+                            emoji: Some(emoji.to_string()),
+                        });
+                    }
+                });
+                *inner.probe_reaction_chooser.borrow_mut() = Some(chooser.clone());
+                inner.reaction_popover.show(&anchor, chooser.upcast());
+            });
+        }
+        reactions.append(&reaction_anchor);
 
         let aux_slot = gtk::Box::new(gtk::Orientation::Vertical, 4);
         content.append(&aux_slot);
@@ -1606,16 +2110,19 @@ impl MessagesView {
 
         let row = MessageRow {
             widget,
-            content,
             forwarded,
             sender,
             quote,
+            text_block,
             text: Rc::new(RefCell::new(text)),
+            revealed_spoilers,
+            web_preview,
             time,
             deleted_tag,
             receipt,
             reactions,
-            reaction_labels,
+            reaction_buttons,
+            reaction_anchor,
             media_slot,
             media_button,
             transcribe_button,
@@ -1624,7 +2131,13 @@ impl MessagesView {
             media_loading_source,
         };
         set_deleted_rendering(&row, message.deleted);
-        update_reactions(&row, message, &self.inner.effects, is_live);
+        update_reactions(
+            &row,
+            message,
+            &self.inner.effects,
+            &self.inner.action,
+            is_live,
+        );
         self.inner
             .effects
             .message_added(row.widget.upcast_ref(), message, is_live);
@@ -1635,15 +2148,23 @@ impl MessagesView {
     }
 
     fn update_existing(&self, message: Msg, is_live: bool) {
-        let (row, was_edited, old_text) = {
+        let (row, was_edited, old_text, old_spans, old_webpage) = {
             let mut store = self.inner.store.borrow_mut();
             let Some(entry) = store.entries.get_mut(&message.id) else {
                 return;
             };
             let was_edited = entry.msg.edited;
             let old_text = entry.msg.text.clone();
+            let old_spans = entry.msg.spans.clone();
+            let old_webpage = entry.msg.webpage.clone();
             entry.msg = message.clone();
-            (entry.row.clone(), was_edited, old_text)
+            (
+                entry.row.clone(),
+                was_edited,
+                old_text,
+                old_spans,
+                old_webpage,
+            )
         };
         row.forwarded.set_label(
             &message
@@ -1655,10 +2176,8 @@ impl MessagesView {
         row.forwarded.set_visible(message.forwarded_from.is_some());
         row.sender.set_label(&message.sender);
         row.sender.set_visible(
-            matches!(
-                self.inner.chat_kind.get(),
-                ChatKind::Group | ChatKind::Channel
-            ) && !message.outgoing
+            self.inner.chat_kind.get() == ChatKind::Group
+                && !message.outgoing
                 && !message.sender.is_empty()
                 && message.sender != "You",
         );
@@ -1667,25 +2186,36 @@ impl MessagesView {
         }
         row.sender
             .add_css_class(&format!("omg-c{}", sender_color_index(&message)));
+        if old_text != message.text || old_spans != message.spans {
+            row.revealed_spoilers.borrow_mut().clear();
+        }
         let mut text_label = row.text.borrow_mut();
         if let Some(label) = text_label.as_ref() {
             label.remove_css_class("omg-code-animation");
         }
         match (text_label.as_ref(), message.text.is_empty()) {
-            (Some(label), false) => label.set_label(&message.text),
+            (Some(label), false) => apply_message_markup(label, &message, &row.revealed_spoilers),
             (Some(label), true) => {
-                row.content.remove(label);
+                self.move_focus_before_removal(label);
+                row.text_block.remove(label);
+                row.text_block.set_visible(false);
                 *text_label = None;
             }
             (None, false) => {
-                let label = message_label(&message.text);
-                row.content
-                    .insert_child_after(&label, Some(&row.media_slot));
+                let label =
+                    formatted_message_label(&message, &row.revealed_spoilers, &self.inner.action);
+                row.text_block.append(&label);
+                row.text_block.set_visible(true);
                 *text_label = Some(label);
             }
             (None, true) => {}
         }
+        set_text_block_style(&row.text_block, &message);
         drop(text_label);
+        if old_webpage != message.webpage {
+            self.move_focus_before_removal(&row.web_preview);
+        }
+        render_web_preview(&row.web_preview, &message, &self.inner.action);
         set_time_label(&row.time, &message, &self.inner.time_format.borrow());
         row.receipt.set_visible(message.outgoing);
         if message.outgoing {
@@ -1696,7 +2226,13 @@ impl MessagesView {
             ));
         }
         set_deleted_rendering(&row, message.deleted);
-        update_reactions(&row, &message, &self.inner.effects, is_live);
+        update_reactions(
+            &row,
+            &message,
+            &self.inner.effects,
+            &self.inner.action,
+            is_live,
+        );
         if message.edited && (!was_edited || old_text != message.text) {
             self.inner.effects.message_edited(row.widget.upcast_ref());
         }
@@ -1780,10 +2316,8 @@ impl MessagesView {
                         .abs()
                         <= 5
             });
-            let can_show_sender = matches!(
-                self.inner.chat_kind.get(),
-                ChatKind::Group | ChatKind::Channel
-            ) && !message.outgoing
+            let can_show_sender = self.inner.chat_kind.get() == ChatKind::Group
+                && !message.outgoing
                 && message.sender != "You"
                 && !message.sender.is_empty();
             sender.set_visible(can_show_sender && !same_sender);
@@ -1902,6 +2436,7 @@ impl MessagesView {
             .map(|entry| entry.row.widget.clone());
         let Some(row) = row else { return };
 
+        row.grab_focus();
         Self::dismiss_popover(&inner.context_popover);
         let popover = gtk::Popover::new();
         popover.add_css_class("omg-menu");
@@ -1916,6 +2451,75 @@ impl MessagesView {
             }
         });
         *inner.context_popover.borrow_mut() = Some(popover.clone());
+
+        let quick = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        quick.add_css_class("omg-quick-reactions");
+        if inner.available_reactions_loading.get() {
+            let state = gtk::Label::new(Some("Loading reactions…"));
+            state.add_css_class("omg-muted");
+            quick.append(&state);
+        } else if let Some(error) = inner.available_reactions_error.borrow().as_ref() {
+            let state = gtk::Label::new(Some(error));
+            state.add_css_class("omg-error");
+            state.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            state.set_max_width_chars(24);
+            quick.append(&state);
+            let retry = gtk::Button::with_label("Retry");
+            retry.add_css_class("omg-primary");
+            let action = inner.action.clone();
+            let popover_weak = popover.downgrade();
+            retry.connect_clicked(move |_| {
+                if let Some(popover) = popover_weak.upgrade() {
+                    popover.popdown();
+                }
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::RetryAvailableReactions);
+                }
+            });
+            quick.append(&retry);
+        } else {
+            let reactions = inner.available_reactions.borrow();
+            if reactions.is_empty() {
+                let state = gtk::Label::new(Some("No reactions"));
+                state.add_css_class("omg-muted");
+                quick.append(&state);
+            }
+            for emoji in reactions.iter().take(7).cloned() {
+                let button = gtk::Button::with_label(&emoji);
+                button.add_css_class("omg-reaction");
+                let action = inner.action.clone();
+                let popover_weak = popover.downgrade();
+                button.connect_clicked(move |_| {
+                    if let Some(popover) = popover_weak.upgrade() {
+                        popover.popdown();
+                    }
+                    if let Some(callback) = action.borrow().as_ref().cloned() {
+                        callback(MessageAction::Reaction {
+                            msg_id,
+                            emoji: Some(emoji.clone()),
+                        });
+                    }
+                });
+                quick.append(&button);
+            }
+        }
+        let more_reactions = gtk::Button::with_label("…");
+        more_reactions.add_css_class("omg-reaction");
+        {
+            let anchor = inner
+                .store
+                .borrow()
+                .entries
+                .get(&msg_id)
+                .map(|entry| entry.row.reaction_anchor.clone());
+            more_reactions.connect_clicked(move |_| {
+                if let Some(anchor) = anchor.as_ref() {
+                    anchor.emit_clicked();
+                }
+            });
+        }
+        quick.append(&more_reactions);
+        menu.append(&quick);
 
         let copy = menu_button("Copy", false);
         {
@@ -1932,12 +2536,14 @@ impl MessagesView {
         menu.append(&copy);
 
         if is_virtual(message.chat_id) {
+            menu.remove(&quick);
             popover.popup();
             return;
         }
 
         // Deleted rows are archive evidence, not actionable Telegram rows.
         if message.deleted {
+            menu.remove(&quick);
             popover.popup();
             return;
         }
@@ -2003,6 +2609,10 @@ impl MessagesView {
         Self::connect_menu_action(inner, &reply, &popover, MessageAction::Reply(msg_id));
         menu.append(&reply);
 
+        let forward = menu_button("Forward", false);
+        Self::connect_menu_action(inner, &forward, &popover, MessageAction::Forward(msg_id));
+        menu.append(&forward);
+
         if message.outgoing && message.media.is_none() && !message.text.is_empty() {
             let edit = menu_button("Edit", false);
             Self::connect_menu_action(inner, &edit, &popover, MessageAction::Edit(msg_id));
@@ -2055,26 +2665,8 @@ impl MessagesView {
                     return;
                 };
                 if matches!(action, ChatAction::JumpToDate) {
-                    let calendar_popover = gtk::Popover::new();
-                    calendar_popover.add_css_class("omg-menu");
-                    calendar_popover.set_has_arrow(false);
-                    let calendar = gtk::Calendar::new();
-                    let action_callback = inner.action.clone();
-                    let popover_for_day = calendar_popover.downgrade();
-                    calendar.connect_day_selected(move |calendar| {
-                        if let Some(popover) = popover_for_day.upgrade() {
-                            popover.popdown();
-                        }
-                        if let Some(date) = calendar_day_end(calendar) {
-                            if let Some(callback) = action_callback.borrow().as_ref().cloned() {
-                                callback(MessageAction::JumpToDate(date));
-                            }
-                        }
-                    });
-                    calendar_popover.set_child(Some(&calendar));
-                    inner
-                        .header_popover
-                        .show(&inner.header_more, calendar_popover);
+                    inner.header_more.grab_focus();
+                    Self::show_jump_calendar(&inner);
                 } else if let Some(callback) = inner.action.borrow().as_ref().cloned() {
                     callback(MessageAction::Header(action));
                 }
@@ -2082,6 +2674,29 @@ impl MessagesView {
             contents.append(&menu_button);
         }
         inner.header_popover.show(button, popover);
+    }
+
+    fn show_jump_calendar(inner: &Rc<MessagesInner>) {
+        let calendar_popover = gtk::Popover::new();
+        calendar_popover.add_css_class("omg-menu");
+        calendar_popover.set_has_arrow(false);
+        let calendar = gtk::Calendar::new();
+        let action_callback = inner.action.clone();
+        let popover_for_day = calendar_popover.downgrade();
+        calendar.connect_day_selected(move |calendar| {
+            if let Some(popover) = popover_for_day.upgrade() {
+                popover.popdown();
+            }
+            if let Some(date) = calendar_day_end(calendar) {
+                if let Some(callback) = action_callback.borrow().as_ref().cloned() {
+                    callback(MessageAction::JumpToDate(date));
+                }
+            }
+        });
+        calendar_popover.set_child(Some(&calendar));
+        inner
+            .header_popover
+            .show(&inner.header_more, calendar_popover);
     }
 
     fn connect_menu_action(
@@ -2339,10 +2954,25 @@ impl MessagesView {
         self.inner.error.set_visible(true);
     }
 
+    pub fn show_reaction_error(&self, message: &str) {
+        self.show_error(message);
+        self.inner.operation_retry.set_visible(true);
+    }
+
+    pub fn clear_reaction_error(&self) {
+        self.inner.operation_retry.set_visible(false);
+        if self.inner.error.label().contains("reaction")
+            || self.inner.error.label().contains("transient failure")
+        {
+            self.clear_error();
+        }
+    }
+
     pub fn clear_error(&self) {
         self.inner.error.set_visible(false);
         self.inner.error.set_label("");
         self.inner.draft_retry.set_visible(false);
+        self.inner.operation_retry.set_visible(false);
     }
 
     pub fn message(&self, msg_id: i32) -> Option<Msg> {
@@ -2597,8 +3227,269 @@ impl MessagesView {
             .map(|entry| entry.media_state.clone())
     }
 
+    pub fn media_retryable(&self, msg_id: i32) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| entry.media_retryable)
+    }
+
     pub fn media_kind(&self, msg_id: i32) -> Option<MediaKind> {
         self.message(msg_id).and_then(|message| message.media)
+    }
+
+    pub fn media_path(&self, msg_id: i32) -> Option<PathBuf> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .and_then(|entry| match &entry.media_state {
+                MediaState::Done(path) => Some(path.clone()),
+                _ => None,
+            })
+    }
+
+    pub fn photo_messages(&self) -> Vec<Msg> {
+        self.messages()
+            .into_iter()
+            .filter(|message| message.media == Some(MediaKind::Photo) && !message.deleted)
+            .collect()
+    }
+
+    pub fn focus_message_or_composer(&self, msg_id: i32) {
+        let row = self
+            .inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .map(|entry| entry.row.widget.clone());
+        if !row.is_some_and(|row| row.grab_focus()) {
+            self.focus_composer();
+        }
+    }
+
+    pub fn rendered_markup(&self, msg_id: i32) -> Option<String> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .and_then(|entry| {
+                entry
+                    .row
+                    .text
+                    .borrow()
+                    .as_ref()
+                    .map(|label| label.label().to_string())
+            })
+    }
+
+    pub fn probe_click_spoiler(&self, msg_id: i32) -> bool {
+        let label = self
+            .inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .and_then(|entry| entry.row.text.borrow().as_ref().cloned());
+        let Some(label) = label else { return false };
+        let controllers = label.observe_controllers();
+        for index in 0..controllers.n_items() {
+            let Some(controller) = controllers.item(index) else {
+                continue;
+            };
+            if let Ok(gesture) = controller.downcast::<gtk::GestureClick>() {
+                if gesture.name().as_deref() != Some("omg-spoiler-gesture") {
+                    continue;
+                }
+                gesture.emit_by_name::<()>("pressed", &[&1_i32, &0_f64, &0_f64]);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn message_has_pre_block(&self, msg_id: i32) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| entry.row.text_block.has_css_class("omg-pre-block"))
+    }
+
+    pub fn message_has_css_class(&self, msg_id: i32, class: &str) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| {
+                entry
+                    .row
+                    .text
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|label| label.has_css_class(class))
+            })
+    }
+
+    pub fn row_has_css_class(&self, msg_id: i32, class: &str) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| entry.row.widget.has_css_class(class))
+    }
+
+    pub fn error_text(&self) -> String {
+        self.inner.error.label().to_string()
+    }
+
+    pub fn message_has_focus(&self, msg_id: i32) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            // is_focus() = the focus widget of the toplevel; has_focus() also
+            // needs the toplevel to be active, which a tiling compositor
+            // never grants the smoke window.
+            .is_some_and(|entry| {
+                entry.row.widget.is_focus() || entry.row.widget.focus_child().is_some()
+            })
+    }
+
+    pub fn reaction(&self, msg_id: i32, emoji: &str) -> Option<crate::tg::Reaction> {
+        self.message(msg_id).and_then(|message| {
+            message
+                .reactions
+                .into_iter()
+                .find(|reaction| reaction.emoji == emoji)
+        })
+    }
+
+    pub fn trigger_reaction_retry(&self) {
+        self.inner.operation_retry.emit_clicked();
+    }
+
+    pub fn available_reactions_settled(&self) -> bool {
+        !self.inner.available_reactions_loading.get()
+    }
+
+    pub fn probe_choose_quick_reaction(&self, msg_id: i32, emoji: &str) -> bool {
+        Self::show_context_menu(&self.inner, msg_id, 0.0, 0.0);
+        let Some(button) = self.context_reaction_button(emoji) else {
+            return false;
+        };
+        button.emit_clicked();
+        true
+    }
+
+    pub fn probe_retry_available_reactions(&self, msg_id: i32) -> bool {
+        Self::show_context_menu(&self.inner, msg_id, 0.0, 0.0);
+        let Some(button) = self.context_reaction_button("Retry") else {
+            return false;
+        };
+        button.emit_clicked();
+        true
+    }
+
+    pub fn probe_open_reaction_chooser(&self, msg_id: i32) -> bool {
+        Self::show_context_menu(&self.inner, msg_id, 0.0, 0.0);
+        let Some(button) = self.context_reaction_button("…") else {
+            return false;
+        };
+        button.emit_clicked();
+        self.inner.context_popover.borrow().is_none() && self.inner.reaction_popover.is_open()
+    }
+
+    pub fn probe_pick_reaction_emoji(&self, emoji: &str) -> bool {
+        let chooser = self.inner.probe_reaction_chooser.borrow().as_ref().cloned();
+        let Some(chooser) = chooser else { return false };
+        chooser.emit_by_name::<()>("emoji-picked", &[&emoji]);
+        self.inner.reaction_popover.dismiss();
+        self.inner.probe_reaction_chooser.borrow_mut().take();
+        true
+    }
+
+    fn context_reaction_button(&self, label: &str) -> Option<gtk::Button> {
+        let popover = self.inner.context_popover.borrow().as_ref().cloned()?;
+        let contents = popover.child()?.downcast::<gtk::Box>().ok()?;
+        let quick = contents.first_child()?.downcast::<gtk::Box>().ok()?;
+        let mut child = quick.first_child();
+        while let Some(widget) = child {
+            if let Ok(button) = widget.clone().downcast::<gtk::Button>() {
+                if button.label().as_deref() == Some(label) {
+                    return Some(button);
+                }
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    pub fn reaction_retry_visible(&self) -> bool {
+        self.inner.operation_retry.is_visible()
+    }
+
+    pub fn receipt_text(&self, msg_id: i32) -> Option<String> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .map(|entry| entry.row.receipt.label().to_string())
+    }
+
+    pub fn has_media_card(&self, kind: MediaKind) -> bool {
+        self.inner.store.borrow().entries.values().any(|entry| {
+            entry.msg.media == Some(kind)
+                && entry
+                    .row
+                    .media_button
+                    .as_ref()
+                    .is_some_and(gtk::prelude::WidgetExt::is_visible)
+        })
+    }
+
+    pub fn trigger_media(&self, msg_id: i32) -> bool {
+        let button = self
+            .inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .and_then(|entry| entry.row.media_button.clone());
+        let Some(button) = button else { return false };
+        button.emit_clicked();
+        true
+    }
+
+    pub fn web_preview_visible(&self, msg_id: i32) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| {
+                entry.row.web_preview.is_visible() && entry.row.web_preview.first_child().is_some()
+            })
+    }
+
+    pub fn forwarded_header_text(&self, msg_id: i32) -> Option<String> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .filter(|entry| entry.row.forwarded.is_visible())
+            .map(|entry| entry.row.forwarded.label().to_string())
     }
 
     pub fn finish_image(&self, msg_id: i32, path: PathBuf, texture: &gdk::Texture) -> bool {
@@ -2650,6 +3541,7 @@ impl MessagesView {
         });
         let action = self.inner.action.clone();
         let gesture = gtk::GestureClick::new();
+        gesture.set_name(Some("omg-photo-gesture"));
         gesture.connect_released(move |_, _, _, _| {
             if let Some(callback) = action.borrow().as_ref().cloned() {
                 callback(MessageAction::Media(msg_id));
@@ -2732,17 +3624,7 @@ impl MessagesView {
             entry.media_state = MediaState::Failed;
             entry.media_retryable = retryable;
             let kind = entry.msg.media;
-            let base = match kind {
-                Some(MediaKind::Voice) => Some("voice message".to_string()),
-                Some(MediaKind::Document) => Some(
-                    entry
-                        .msg
-                        .doc_name
-                        .clone()
-                        .unwrap_or_else(|| "document".to_string()),
-                ),
-                _ => None,
-            };
+            let base = kind.map(|_| media_title(&entry.msg));
             (
                 kind,
                 entry.row.media_slot.clone(),
@@ -2760,9 +3642,21 @@ impl MessagesView {
                 while let Some(child) = media_slot.first_child() {
                     media_slot.remove(&child);
                 }
-                let label = gtk::Label::new(Some("image unavailable"));
-                label.add_css_class("omg-media-placeholder");
-                media_slot.append(&label);
+                if retryable {
+                    let retry = gtk::Button::with_label("Image unavailable — Retry");
+                    retry.add_css_class("omg-doc-pill");
+                    let action = self.inner.action.clone();
+                    retry.connect_clicked(move |_| {
+                        if let Some(callback) = action.borrow().as_ref().cloned() {
+                            callback(MessageAction::Media(msg_id));
+                        }
+                    });
+                    media_slot.append(&retry);
+                } else {
+                    let label = gtk::Label::new(Some("image unavailable"));
+                    label.add_css_class("omg-media-placeholder");
+                    media_slot.append(&label);
+                }
             }
             Some(
                 MediaKind::Document
@@ -2774,7 +3668,13 @@ impl MessagesView {
                 | MediaKind::Unsupported,
             ) => {
                 if let (Some(button), Some(base)) = (button, base) {
-                    button.set_label(&format!("{base} (unavailable)"));
+                    button.set_child(None::<&gtk::Widget>);
+                    let label = if retryable {
+                        format!("{base} — Retry")
+                    } else {
+                        format!("{base} (unavailable)")
+                    };
+                    button.set_label(&label);
                     button.set_sensitive(retryable);
                 }
             }
@@ -3020,13 +3920,22 @@ impl MessagesView {
         Self::show_header_menu(&self.inner, &self.inner.header_more);
     }
 
+    pub fn open_jump_calendar(&self) {
+        if self.inner.header_summary.borrow().is_some() {
+            Self::show_jump_calendar(&self.inner);
+        }
+    }
+
     pub fn dismiss_header_menu(&self) {
         self.inner.header_popover.dismiss();
     }
 
     pub fn dismiss_owned_popovers(&self) {
+        self.move_focus_before_removal(&self.widget);
         self.dismiss_row_popovers();
+        self.inner.reaction_popover.dismiss();
         self.inner.header_popover.dismiss();
+        self.inner.pinned_popover.dismiss();
         self.inner.composer_popover.dismiss();
     }
 
@@ -3055,7 +3964,14 @@ impl MessagesView {
             .entries
             .values()
             // The clamp fills the row; its child is the visible bubble.
-            .map(|entry| entry.row.widget.first_child().map(|c| c.width()).unwrap_or(0))
+            .map(|entry| {
+                entry
+                    .row
+                    .widget
+                    .first_child()
+                    .map(|c| c.width())
+                    .unwrap_or(0)
+            })
             .max()
             .unwrap_or(0);
         (max_bubble, self.inner.scroll.width())
@@ -3264,6 +4180,7 @@ impl MessagesView {
         };
 
         let version_count = versions.len();
+        row.grab_focus();
         Self::dismiss_popover(&self.inner.history_popover);
         let popover = gtk::Popover::new();
         popover.add_css_class("omg-history");
@@ -3317,6 +4234,8 @@ impl MessagesView {
         self.move_focus_before_removal(&self.inner.list);
         Self::dismiss_popover(&self.inner.context_popover);
         Self::dismiss_popover(&self.inner.history_popover);
+        self.inner.reaction_popover.dismiss();
+        self.inner.probe_reaction_chooser.borrow_mut().take();
     }
 
     fn move_focus_before_removal(&self, subtree: &impl IsA<gtk::Widget>) {
@@ -3384,6 +4303,14 @@ impl MessagesView {
     }
 
     pub fn scroll_to_message(&self, msg_id: i32) -> bool {
+        self.scroll_to_message_impl(msg_id, true)
+    }
+
+    pub fn scroll_to_search_result(&self, msg_id: i32) -> bool {
+        self.scroll_to_message_impl(msg_id, false)
+    }
+
+    fn scroll_to_message_impl(&self, msg_id: i32, focus: bool) -> bool {
         let row = self
             .inner
             .store
@@ -3400,7 +4327,9 @@ impl MessagesView {
             (f64::from(bounds.y()) - adjustment.page_size() / 3.0)
                 .clamp(0.0, (adjustment.upper() - adjustment.page_size()).max(0.0)),
         );
-        row.grab_focus();
+        if focus {
+            row.grab_focus();
+        }
         true
     }
 
@@ -3561,23 +4490,258 @@ fn message_label(text: &str) -> gtk::Label {
     label
 }
 
+fn formatted_message_label(
+    message: &Msg,
+    revealed: &Rc<RefCell<HashSet<(usize, usize)>>>,
+    action: &Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+) -> gtk::Label {
+    let label = message_label(&message.text);
+    apply_message_markup(&label, message, revealed);
+    let link_action = action.clone();
+    let msg_id = message.id;
+    label.connect_activate_link(move |_, target| {
+        let message_action = if let Some(target) = target.strip_prefix("omg-user:") {
+            target.parse::<i64>().ok().map(MessageAction::OpenMention)
+        } else if markup::is_allowed_link(target) {
+            Some(MessageAction::OpenLink(target.to_string()))
+        } else {
+            None
+        };
+        if let (Some(callback), Some(message_action)) =
+            (link_action.borrow().as_ref().cloned(), message_action)
+        {
+            callback(message_action);
+        }
+        glib::Propagation::Stop
+    });
+    let spoiler_ranges = message
+        .spans
+        .iter()
+        .filter_map(|span| matches!(span.kind, SpanKind::Spoiler).then_some((span.start, span.end)))
+        .collect::<Vec<_>>();
+    if !spoiler_ranges.is_empty() {
+        let gesture = gtk::GestureClick::new();
+        gesture.set_name(Some("omg-spoiler-gesture"));
+        gesture.set_button(1);
+        gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let action = action.clone();
+        let revealed = revealed.clone();
+        gesture.connect_pressed(move |gesture, _, _, _| {
+            let hidden = spoiler_ranges
+                .iter()
+                .copied()
+                .filter(|range| !revealed.borrow().contains(range))
+                .collect::<Vec<_>>();
+            if hidden.is_empty() {
+                return;
+            }
+            // The first click reveals the concealed text and must not also
+            // activate a link that overlaps it.
+            if gesture.current_sequence().is_some() {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+            }
+            if let Some(callback) = action.borrow().as_ref().cloned() {
+                for (start, end) in hidden {
+                    callback(MessageAction::RevealSpoiler { msg_id, start, end });
+                }
+            }
+        });
+        label.add_controller(gesture);
+    }
+    label
+}
+
+fn apply_message_markup(
+    label: &gtk::Label,
+    message: &Msg,
+    revealed: &Rc<RefCell<HashSet<(usize, usize)>>>,
+) {
+    let rendered = markup::render_with_revealed(&message.text, &message.spans, &revealed.borrow());
+    label.set_markup(&rendered.markup);
+    if rendered.has_spoiler {
+        label.add_css_class("omg-spoiler");
+        label.set_cursor_from_name(Some("pointer"));
+    } else {
+        label.remove_css_class("omg-spoiler");
+        label.set_cursor_from_name(None);
+    }
+}
+
+fn set_text_block_style(block: &gtk::Box, message: &Msg) {
+    let text_len = message.text.chars().count();
+    let full_pre = message.spans.iter().any(|span| {
+        matches!(span.kind, SpanKind::Pre(_)) && span.start == 0 && span.end == text_len
+    });
+    let full_quote = message.spans.iter().any(|span| {
+        matches!(span.kind, SpanKind::Blockquote) && span.start == 0 && span.end == text_len
+    });
+    if full_pre {
+        block.add_css_class("omg-pre-block");
+    } else {
+        block.remove_css_class("omg-pre-block");
+    }
+    if full_quote {
+        block.add_css_class("omg-blockquote");
+    } else {
+        block.remove_css_class("omg-blockquote");
+    }
+}
+
+fn render_web_preview(
+    slot: &gtk::Box,
+    message: &Msg,
+    action: &Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+) {
+    while let Some(child) = slot.first_child() {
+        slot.remove(&child);
+    }
+    let Some(preview) = message.webpage.as_ref() else {
+        slot.set_visible(false);
+        return;
+    };
+    let button = gtk::Button::new();
+    button.add_css_class("omg-web-preview");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let site = gtk::Label::new(Some(&preview.site_name));
+    site.add_css_class("omg-small");
+    site.set_halign(gtk::Align::Start);
+    content.append(&site);
+    let title = gtk::Label::new(Some(&preview.title));
+    title.add_css_class("omg-web-title");
+    title.set_halign(gtk::Align::Start);
+    title.set_wrap(true);
+    content.append(&title);
+    let description = gtk::Label::new(Some(&preview.description));
+    description.add_css_class("omg-muted");
+    description.set_halign(gtk::Align::Start);
+    description.set_wrap(true);
+    description.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    description.set_lines(3);
+    content.append(&description);
+    button.set_child(Some(&content));
+    let url = preview.url.clone();
+    let action = action.clone();
+    button.connect_clicked(move |_| {
+        if let Some(callback) = action.borrow().as_ref().cloned() {
+            callback(MessageAction::OpenLink(url.clone()));
+        }
+    });
+    slot.append(&button);
+    slot.set_visible(true);
+}
+
+fn media_title(message: &Msg) -> String {
+    match message.media {
+        Some(MediaKind::Photo) => "Photo".to_string(),
+        Some(MediaKind::Sticker) => "Sticker".to_string(),
+        Some(MediaKind::Voice) => "Voice message".to_string(),
+        Some(MediaKind::Document) => message
+            .doc_name
+            .clone()
+            .unwrap_or_else(|| "Document".into()),
+        Some(MediaKind::Video) => message.doc_name.clone().unwrap_or_else(|| "Video".into()),
+        Some(MediaKind::Gif) => message.doc_name.clone().unwrap_or_else(|| "GIF".into()),
+        Some(MediaKind::Audio) => message.doc_name.clone().unwrap_or_else(|| "Audio".into()),
+        Some(MediaKind::VideoNote) => "Video message".to_string(),
+        Some(MediaKind::Unsupported) => "Unsupported message".to_string(),
+        None => "Message".to_string(),
+    }
+}
+
+fn media_card(message: &Msg) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.add_css_class("omg-doc-pill");
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let glyph = match message.media {
+        Some(MediaKind::Gif) => icons::GIF,
+        Some(MediaKind::Voice | MediaKind::Audio) => icons::MIC,
+        Some(MediaKind::Video | MediaKind::VideoNote) => icons::IMAGE,
+        _ => icons::FILE,
+    };
+    let icon = gtk::Label::new(Some(glyph));
+    icon.add_css_class("omg-muted");
+    content.append(&icon);
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    copy.set_hexpand(true);
+    let title = gtk::Label::new(Some(&media_title(message)));
+    title.set_halign(gtk::Align::Start);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.set_max_width_chars(36);
+    copy.append(&title);
+    let details = media_details(message);
+    if !details.is_empty() {
+        let details = gtk::Label::new(Some(&details));
+        details.add_css_class("omg-small");
+        details.set_halign(gtk::Align::Start);
+        copy.append(&details);
+    }
+    content.append(&copy);
+    let download = gtk::Label::new(Some("Download"));
+    download.add_css_class("omg-small");
+    content.append(&download);
+    button.set_child(Some(&content));
+    button
+}
+
+fn media_details(message: &Msg) -> String {
+    let mut details = Vec::new();
+    if let Some(duration) = message.duration {
+        details.push(format!("{}:{:02}", duration / 60, duration % 60));
+    }
+    if let Some(size) = message.doc_size {
+        details.push(if size >= 1_000_000 {
+            format!("{:.1} MB", size as f64 / 1_000_000.0)
+        } else if size >= 1_000 {
+            format!("{:.1} KB", size as f64 / 1_000.0)
+        } else {
+            format!("{size} B")
+        });
+    }
+    details.join(" · ")
+}
+
+pub fn search_position(index: Option<usize>, total: usize) -> String {
+    match (index, total) {
+        (Some(index), total) if index < total => format!("{} of {total}", index + 1),
+        _ => "No results".to_string(),
+    }
+}
+
 fn aux_label(text: &str, error: bool) -> gtk::Label {
     let label = message_label(text);
     label.add_css_class(if error { "omg-error" } else { "omg-msg-quote" });
     label
 }
 
-fn update_reactions(row: &MessageRow, message: &Msg, effects: &Effects, animate: bool) {
-    let mut labels = row.reaction_labels.borrow_mut();
-    while labels.len() < message.reactions.len() {
-        let label = gtk::Label::new(None);
-        label.add_css_class("omg-reaction");
-        row.reactions.append(&label);
-        labels.push(label);
+fn update_reactions(
+    row: &MessageRow,
+    message: &Msg,
+    effects: &Effects,
+    action: &Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    animate: bool,
+) {
+    let mut buttons = row.reaction_buttons.borrow_mut();
+    while buttons.len() < message.reactions.len() {
+        let button = gtk::Button::new();
+        button.add_css_class("omg-reaction");
+        let action = action.clone();
+        let msg_id = message.id;
+        button.connect_clicked(move |button| {
+            let emoji = button.tooltip_text().map(|text| text.to_string());
+            if let (Some(callback), Some(emoji)) = (action.borrow().as_ref().cloned(), emoji) {
+                callback(MessageAction::Reaction {
+                    msg_id,
+                    emoji: Some(emoji),
+                });
+            }
+        });
+        let previous = buttons.last().cloned();
+        row.reactions.insert_child_after(&button, previous.as_ref());
+        buttons.push(button);
     }
-    for (index, label) in labels.iter().enumerate() {
+    for (index, button) in buttons.iter().enumerate() {
         let Some(reaction) = message.reactions.get(index) else {
-            label.set_visible(false);
+            button.set_visible(false);
             continue;
         };
         let text = if reaction.count == 1 {
@@ -3585,19 +4749,34 @@ fn update_reactions(row: &MessageRow, message: &Msg, effects: &Effects, animate:
         } else {
             format!("{} {}", reaction.emoji, reaction.count)
         };
+        let label = button
+            .child()
+            .and_downcast::<gtk::Label>()
+            .unwrap_or_else(|| {
+                let label = gtk::Label::new(None);
+                button.set_child(Some(&label));
+                label
+            });
         let changed = label.label().as_str() != text;
-        let rolling = animate && changed && effects.reaction_changed(label, &text);
+        let rolling = animate && changed && effects.reaction_changed(&label, &text);
         if !rolling {
             label.set_label(&text);
         }
-        label.set_visible(true);
+        button.set_tooltip_text(Some(&reaction.emoji));
+        button.set_visible(true);
+        if reaction.chosen {
+            button.add_css_class("omg-reaction-chosen");
+        } else {
+            button.remove_css_class("omg-reaction-chosen");
+        }
         if animate && changed {
             row.animation_sources
                 .borrow_mut()
-                .extend(effects.reaction_added(label.upcast_ref()));
+                .extend(effects.reaction_added(button.upcast_ref()));
         }
     }
-    row.reactions.set_visible(!message.reactions.is_empty());
+    row.reaction_anchor.set_visible(true);
+    row.reactions.set_visible(true);
 }
 
 fn set_deleted_rendering(row: &MessageRow, deleted: bool) {
@@ -3653,7 +4832,7 @@ fn snippet(text: &str, max_chars: usize) -> String {
 mod wave5_tests {
     use chrono::NaiveDate;
 
-    use super::{bubble_width_limit, day_separator_label_at};
+    use super::{bubble_width_limit, day_separator_label_at, search_position};
 
     #[test]
     fn day_separator_labels_cover_relative_and_absolute_dates() {
@@ -3678,5 +4857,13 @@ mod wave5_tests {
         assert_eq!(bubble_width_limit(Some(600)), 396);
         assert_eq!(bubble_width_limit(Some(1200)), 520);
         assert_eq!(bubble_width_limit(None), 520);
+    }
+
+    #[test]
+    fn in_chat_search_position_is_one_based_and_handles_empty_results() {
+        assert_eq!(search_position(None, 0), "No results");
+        assert_eq!(search_position(Some(0), 3), "1 of 3");
+        assert_eq!(search_position(Some(2), 3), "3 of 3");
+        assert_eq!(search_position(Some(3), 3), "No results");
     }
 }

@@ -1118,3 +1118,149 @@ button.omg-primary,
   color: var(--muted);
   padding: 8px 12px;
 }
+
+/* ---- wave 5C: daily-use surfaces ---- */
+
+.omg-in-chat-search {
+  min-height: 40px;
+  padding: 4px 8px;
+  background-color: var(--bg-dark);
+  border-bottom: 1px solid var(--bg-lighter);
+}
+
+.omg-in-chat-search entry,
+.omg-forward-dialog entry {
+  background-color: var(--bg-darker);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 6px 10px;
+  caret-color: var(--accent);
+}
+
+.omg-hit {
+  border-color: var(--accent);
+}
+
+.omg-hit-active {
+  background-color: var(--selection);
+}
+
+.omg-pinned-bar {
+  min-height: 40px;
+  padding: 4px 12px;
+  background-color: var(--bg-dark);
+  border-left: 2px solid var(--accent);
+  border-bottom: 1px solid var(--bg-lighter);
+}
+
+.omg-pre-block {
+  background-color: var(--bg-darker);
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.omg-msg label link {
+  color: var(--accent);
+  text-decoration-line: underline;
+}
+
+.omg-blockquote {
+  border-left: 2px solid var(--accent);
+  padding-left: 8px;
+}
+
+button.omg-web-preview {
+  background-image: none;
+  background-color: transparent;
+  color: var(--fg);
+  border: none;
+  border-left: 2px solid var(--accent);
+  border-radius: 0;
+  padding: 4px 8px;
+}
+
+button.omg-web-preview:hover {
+  background-color: var(--bg-darker);
+}
+
+.omg-web-title {
+  font-weight: bold;
+}
+
+button.omg-reaction {
+  background-image: none;
+  background-color: var(--bg-lighter);
+  color: var(--fg);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 9pt;
+}
+
+button.omg-reaction-chosen {
+  border-color: var(--accent);
+}
+
+button.omg-reaction-anchor {
+  background-image: none;
+  background-color: transparent;
+  color: var(--muted);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 1px 6px;
+  opacity: 0;
+  transition: opacity 120ms ease-in-out;
+}
+
+.omg-msg:hover button.omg-reaction-anchor,
+.omg-msg:focus-within button.omg-reaction-anchor {
+  opacity: 1;
+}
+
+.omg-quick-reactions {
+  padding: 4px;
+}
+
+.omg-overlay-backdrop {
+  background-color: var(--bg);
+}
+
+.omg-forward-dialog {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 0;
+  padding: 16px;
+}
+
+checkbutton.omg-forward-row {
+  padding: 8px;
+  color: var(--fg);
+}
+
+.omg-viewer {
+  background-color: alpha(var(--bg-darker), 0.96);
+  color: var(--fg);
+  padding: 8px;
+}
+
+.omg-viewer-toolbar {
+  padding: 4px 8px;
+}
+
+button.omg-viewer-nav {
+  background-image: none;
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 6px;
+  padding: 12px;
+  margin: 16px;
+}
+
+.omg-viewer-caption {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  padding: 8px 16px;
+}

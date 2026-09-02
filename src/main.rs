@@ -27,7 +27,11 @@ fn main() -> glib::ExitCode {
     }
     config::enforce_permissions();
 
-    let app = gtk::Application::builder().application_id(APP_ID).build();
+    // Smoke/probe runs must never collapse into an already-running instance
+    // (GTK would forward "activate" over D-Bus and exit 0 without running
+    // anything), so they register as non-unique.
+    let flags = if smoke { gtk::gio::ApplicationFlags::NON_UNIQUE } else { gtk::gio::ApplicationFlags::default() };
+    let app = gtk::Application::builder().application_id(APP_ID).flags(flags).build();
     app.connect_activate(move |app| build(app, smoke, probe));
     // GTK must not see our flags.
     app.run_with_args::<&str>(&[])
@@ -86,9 +90,10 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
     unsafe { window.set_data("shell", shell) };
 
     if probe_traversal {
-        // The traversal grows with every wave (delete/edit demos wait 2.5s
-        // each); 45s is the hard ceiling before a run counts as hung.
-        glib::timeout_add_seconds_local_once(45, || std::process::exit(1));
+        // The traversal grows with every wave (100+ steps, delete/edit demos
+        // wait 2.5s each, latency variants add 0.4s per command); 90s is the
+        // hard ceiling before a run counts as hung.
+        glib::timeout_add_seconds_local_once(90, || std::process::exit(1));
     } else if probe {
         let app = app.clone();
         glib::timeout_add_seconds_local_once(2, move || app.quit());
