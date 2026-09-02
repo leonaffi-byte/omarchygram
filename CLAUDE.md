@@ -8,6 +8,8 @@
 - Test: `cargo test`
 - Smoke check: `cargo run -- --smoke --probe` (scripted traversal of every feature on mock data — auth, chats, media, settings, anti-delete, virtual chats, animations — quits on success; exit 0 = pass, 45s failsafe)
 - `OMG_MOCK_AUTH=1 cargo run -- --smoke` walks the login screens offline (code `2fa` routes via the password screen)
+- Mock test hooks (wave 5): `OMG_MOCK_NEED_CREDS=1` starts at the credentials form; `OMG_MOCK_SLOW=GetDialogs,SearchGlobal` delays those backend commands 1.5s; `OMG_MOCK_FAIL_ONCE=SaveDraft,ForwardMessages` fails the first call of each (names = `Command` variants in `src/tg/mod.rs`); `OMG_UISTATE_PATH` points window/pane state at a throwaway file (smoke sets it automatically).
+- Worker launches: ALWAYS `systemd-run --user --scope --quiet --collect -p TasksMax=infinity -- <codex|kimi …>` plus `setsid nohup … &` and a marker file (see global CLAUDE.md; unwrapped parallel builds killed the orchestrator session twice on 2026-09-02).
 - HARD acceptance gate for any UI change (learned the hard way, 2026-09-02): `G_DEBUG=fatal-criticals ./target/debug/omarchygram --smoke --probe` ×6 + the `OMG_MOCK_AUTH=1` variant ×3 + `OMG_MOCK_LATENCY_MS=400` ×1 must all exit 0. A plain probe exits 0 even when GTK prints CRITICALs. `OMG_PROBE_TRACE=1` prints each traversal step (bisects crashes that have no Rust frame); `coredumpctl -1 debug` gives the backtrace.
 
 # Architecture (decided 2026-09-01, orchestrator; Rust rewrite same day at user's request — Python v2 lives in git history)
