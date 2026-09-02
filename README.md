@@ -28,7 +28,8 @@ commit them.
 
 1. Log in at <https://my.telegram.org/apps> with your Telegram account.
 2. Create an application (any name, platform "Desktop").
-3. Save the credentials it gives you:
+3. Start Omarchygram and enter the API ID and API hash in the form it shows
+   (they are saved to a private file). Or write the file yourself:
 
    ```
    mkdir -p ~/.config/omarchygram
@@ -46,6 +47,18 @@ Telegram sends you (and your password if you use two-step verification). The
 session is stored at `~/.local/share/omarchygram/omarchygram.session`, so this
 happens only once.
 
+## Layout
+
+Telegram Desktop's layout on the Omarchy skin: a resizable chat list (drag
+the divider; `Ctrl+Shift+B` collapses it to an avatar strip; it collapses by
+itself under 640px), a search box (chats, then messages) and the ☰ main menu
+above it, folder tabs when your account has folders, an "Archived chats" row,
+avatars (profile photos or initials in theme colors), a chat header with the
+contact's status and a ⋮ menu (mute, pin, mark unread, jump to date, clear
+history, delete chat), day separators, sender names in groups, inline
+timestamps with ✓/✓✓ read ticks, and per-chat drafts that follow you between
+chats and devices. Right-click a chat for the same actions.
+
 ## Keyboard
 
 | Key           | Action                          |
@@ -57,12 +70,25 @@ happens only once.
 | `Shift+Enter` | New line in the message         |
 | `Esc`         | Cancel, or focus the composer   |
 | `Ctrl+,`      | Open settings                   |
+| `Ctrl+F`      | Search chats and messages       |
+| `Ctrl+Shift+B`| Collapse the chat list          |
+| `Ctrl+B/I/U`  | Bold / italic / underline       |
+| `Ctrl+Shift+X/M/K/P` | Strike / monospace / link / spoiler |
+
+Every shortcut can be changed in Settings → Keyboard.
 
 ## Settings
 
-`Ctrl+,` opens the settings panel. Every option writes straight to
-`~/.config/omarchygram/settings.toml` (also hot-reloaded if you edit the file
-by hand). Everything below is off until you turn it on.
+`Ctrl+,` (or ☰ → Settings) opens the settings pages: Account, Appearance,
+Timestamps, Privacy, AI, Omarchy, Keyboard, Animations. Every option writes
+straight to `~/.config/omarchygram/settings.toml` (also hot-reloaded if you
+edit the file by hand). Everything below is off until you turn it on.
+
+- **Account** — who you are, "Change…" for the Telegram API credentials
+  (takes effect after a restart), Log out.
+- **Appearance** — avatars, compact chat list, send on Enter, markdown
+  formatting on send.
+- **Keyboard** — every shortcut, rebindable; conflicts are flagged.
 
 - **Timestamps** — seconds in message times, a live clock in the chat header,
   a custom time format.
@@ -108,8 +134,10 @@ one in settings.
 - **Local:** `ollama` (if it is running on `127.0.0.1:11434`) for chat;
   `whisper.cpp` (`whisper-cli` on PATH + a `ggml-*.bin` model in
   `~/.local/share/whisper.cpp/`, plus `ffmpeg`) for transcription.
-- **API keys:** add a table to `~/.config/omarchygram/config.toml`
-  (already private) — any of these:
+- **API keys:** Settings → AI has one masked field per provider (Anthropic,
+  OpenAI, Groq, Gemini) plus the whisper model path; keys are stored in
+  `~/.config/omarchygram/config.toml` (private). Editing that file directly
+  also works:
 
   ```
   [ai]
