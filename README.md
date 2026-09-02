@@ -59,6 +59,16 @@ history, delete chat), day separators, sender names in groups, inline
 timestamps with ✓/✓✓ read ticks, and per-chat drafts that follow you between
 chats and devices. Right-click a chat for the same actions.
 
+## Messages
+
+Search inside a chat (the magnifier in the header, `Ctrl+Shift+F`) with
+"N of M" navigation; bold/italic/strike/code/links/spoilers render and can be
+typed with the usual shortcuts or `**markers**`; link previews; reactions
+(right-click a message for the quick row, click a pill to toggle); pinned
+message bar; forward to one or several chats; full-window photo viewer with
+arrow keys and Save/Open; video/GIF/audio cards that download and open in
+your default app.
+
 ## Keyboard
 
 | Key           | Action                          |
