@@ -39,6 +39,12 @@ const TOKENS: &[(&str, &str)] = &[
     ("accent", "--accent"),
     ("selection", "--selection"),
     ("red", "--red"),
+    ("green", "--green"),
+    ("cyan", "--cyan"),
+    ("blue", "--blue"),
+    ("magenta", "--magenta"),
+    ("yellow", "--yellow"),
+    ("orange", "--orange"),
 ];
 
 #[test]
