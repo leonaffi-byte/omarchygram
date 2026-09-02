@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -17,7 +18,7 @@ use crate::local::Local as LocalServices;
 use crate::os::{self, OsPolicy, Parsed};
 use crate::settings::{Settings, SettingsStore};
 use crate::tg::{
-    AuthState, BackendFlags, ChatInfo, ChatKind, Event, Me, MediaKind, Msg, SETUP_HELP, Tg,
+    AuthState, BackendFlags, ChatInfo, ChatKind, Event, Me, MediaKind, Msg, Tg,
 };
 use crate::uistate::UiState;
 
@@ -25,6 +26,7 @@ use super::anim::{Effects, RadioGroup, apply_full_phosphor, group_ids, select_ra
 use super::auth::{AuthAction, AuthView};
 use super::avatar::Avatar;
 use super::chatlist::{ChatList, SearchRetry, SidebarMode, UnreadUpdate};
+use super::keys;
 use super::menus::{self, ChatAction, MainMenuAction, PopoverSlot};
 use super::messages::{MediaState, MessageAction, MessagesView};
 use super::settings_view::SettingsView;
@@ -32,6 +34,35 @@ use super::switcher::Switcher;
 use super::virtual_chat::{
     ASSISTANT_CHAT, AuxState, OMARCHY_CHAT, ReqState, VirtualStore, is_virtual, virtual_title,
 };
+
+const LOG_RING_CAPACITY: usize = 128;
+const PROBE_API_HASH: &str = "0123456789abcdef0123456789abcdef";
+
+thread_local! {
+    static LOG_RING: RefCell<VecDeque<String>> = RefCell::new(VecDeque::new());
+}
+
+fn shell_log(args: fmt::Arguments<'_>) {
+    let line = args.to_string();
+    LOG_RING.with(|ring| {
+        let mut ring = ring.borrow_mut();
+        if ring.len() == LOG_RING_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(line.clone());
+    });
+    eprintln!("{line}");
+}
+
+fn log_ring_contains(needle: &str) -> bool {
+    LOG_RING.with(|ring| ring.borrow().iter().any(|line| line.contains(needle)))
+}
+
+macro_rules! shell_log {
+    ($($arg:tt)*) => {
+        shell_log(format_args!($($arg)*))
+    };
+}
 
 pub struct Shell {
     pub widget: gtk::Box,
@@ -50,6 +81,7 @@ struct ReadState {
 struct FlagsRequest {
     flags: BackendFlags,
     generation: u64,
+    session_epoch: u64,
 }
 
 #[derive(Clone, Default)]
@@ -122,12 +154,10 @@ struct ShellInner {
     dialogs_retry: gtk::Button,
     epoch: Cell<u64>,
     open_chat: Cell<Option<i64>>,
-    started: Cell<bool>,
-    event_loop_started: Cell<bool>,
     session_ready: Cell<bool>,
     session_epoch: Cell<u64>,
-    logging_out: Cell<bool>,
-    chat_mutations: Cell<u32>,
+    event_loop_started: Cell<bool>,
+    started: Cell<bool>,
     dialogs_loaded: Cell<bool>,
     dialogs_in_flight: Cell<bool>,
     dialogs_refresh_again: Cell<bool>,
@@ -135,6 +165,7 @@ struct ShellInner {
     dialogs_reload_timeout: RefCell<Option<glib::SourceId>>,
     window_hooked: Cell<bool>,
     composer_operation: Cell<bool>,
+    mutations_in_flight: Cell<u32>,
     pending_message_id: Cell<i32>,
     mark_reads: RefCell<HashMap<i64, ReadState>>,
     last_by_chat: RefCell<HashMap<i64, Msg>>,
@@ -272,12 +303,10 @@ impl Shell {
             dialogs_retry: dialogs_retry.clone(),
             epoch: Cell::new(0),
             open_chat: Cell::new(None),
-            started: Cell::new(false),
-            event_loop_started: Cell::new(false),
             session_ready: Cell::new(false),
             session_epoch: Cell::new(0),
-            logging_out: Cell::new(false),
-            chat_mutations: Cell::new(0),
+            event_loop_started: Cell::new(false),
+            started: Cell::new(false),
             dialogs_loaded: Cell::new(false),
             dialogs_in_flight: Cell::new(false),
             dialogs_refresh_again: Cell::new(false),
@@ -285,6 +314,7 @@ impl Shell {
             dialogs_reload_timeout: RefCell::new(None),
             window_hooked: Cell::new(false),
             composer_operation: Cell::new(false),
+            mutations_in_flight: Cell::new(0),
             pending_message_id: Cell::new(i32::MAX),
             mark_reads: RefCell::new(HashMap::new()),
             last_by_chat: RefCell::new(HashMap::new()),
@@ -357,6 +387,13 @@ impl ShellInner {
             this.auth.set_action(Rc::new(move |action| {
                 if let Some(this) = weak.upgrade() {
                     this.handle_auth_action(action);
+                }
+            }));
+            this.settings_view.set_tg(this.tg.clone());
+            let weak = Rc::downgrade(this);
+            this.settings_view.set_on_logout(Rc::new(move || {
+                if let Some(this) = weak.upgrade() {
+                    this.log_out();
                 }
             }));
         }
@@ -486,38 +523,49 @@ impl ShellInner {
             });
         }
 
-        let keys = gtk::EventControllerKey::new();
+        let global_action: Rc<dyn Fn(&str)> = {
+            let weak = Rc::downgrade(this);
+            Rc::new(move |action| {
+                let Some(this) = weak.upgrade() else { return };
+                if !this.session_ready.get() {
+                    return;
+                }
+                match action {
+                    "switcher" => this.switcher.open(this.chatlist.ordered()),
+                    "settings" => this.toggle_settings(),
+                    "next_chat" => this.chatlist.select_next(),
+                    "prev_chat" => this.chatlist.select_prev(),
+                    // TODO(5A/5C/5D): swap these no-op targets for the shell
+                    // methods introduced by the later layout/function packages.
+                    "search" | "search_in_chat" | "chat_info" | "toggle_sidebar"
+                    | "jump_to_date" | "reply_last" | "saved" | "contacts" => {}
+                    _ => {}
+                }
+            })
+        };
+        let submit: Rc<dyn Fn()> = {
+            let weak = Rc::downgrade(this);
+            Rc::new(move || {
+                if let Some(this) = weak.upgrade().filter(|this| this.session_ready.get()) {
+                    this.submit_composer();
+                }
+            })
+        };
+        keys::install(
+            this.widget.upcast_ref(),
+            &this.messages.composer(),
+            &this.settings,
+            global_action,
+            submit,
+        );
+
+        let fixed_keys = gtk::EventControllerKey::new();
         {
             let weak = Rc::downgrade(this);
-            keys.connect_key_pressed(move |_, key, _, modifiers| {
+            fixed_keys.connect_key_pressed(move |_, key, _, _| {
                 let Some(this) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                if modifiers.contains(gdk::ModifierType::CONTROL_MASK) && key == gdk::Key::k {
-                    if this.started.get() {
-                        this.switcher.open(this.chatlist.ordered());
-                    }
-                    return glib::Propagation::Stop;
-                }
-                if modifiers.contains(gdk::ModifierType::CONTROL_MASK) && key == gdk::Key::comma {
-                    if this.started.get() {
-                        this.toggle_settings();
-                    }
-                    return glib::Propagation::Stop;
-                }
-                if modifiers.contains(gdk::ModifierType::ALT_MASK) {
-                    match key {
-                        gdk::Key::Down => {
-                            this.chatlist.select_next();
-                            return glib::Propagation::Stop;
-                        }
-                        gdk::Key::Up => {
-                            this.chatlist.select_prev();
-                            return glib::Propagation::Stop;
-                        }
-                        _ => {}
-                    }
-                }
                 if key == gdk::Key::Escape {
                     if this.switcher.is_open() {
                         this.switcher.close();
@@ -531,14 +579,13 @@ impl ShellInner {
                 glib::Propagation::Proceed
             });
         }
-        this.widget.add_controller(keys);
+        this.widget.add_controller(fixed_keys);
     }
 
     async fn start_backend(self: Rc<Self>) {
         match self.tg.start().await {
             Ok(state) => self.handle_auth_state(state),
             Err(error) => {
-                eprintln!("start: {error}");
                 self.stack.set_visible_child_name("auth");
                 self.auth.show_start_error(&error);
             }
@@ -557,12 +604,14 @@ impl ShellInner {
                 AuthAction::SubmitPhone(value) => self.tg.submit_phone(&value).await,
                 AuthAction::SubmitCode(value) => self.tg.submit_code(&value).await,
                 AuthAction::SubmitPassword(value) => self.tg.submit_password(&value).await,
+                AuthAction::SubmitCredentials { api_id, api_hash } => {
+                    self.tg.submit_credentials(api_id, &api_hash).await
+                }
                 AuthAction::RetryStart => return,
             };
             match result {
                 Ok(state) => self.handle_auth_state(state),
                 Err(error) => {
-                    eprintln!("authentication: {error}");
                     self.auth.finish_error(&error);
                 }
             }
@@ -573,7 +622,10 @@ impl ShellInner {
         match state {
             AuthState::NeedCredentials => {
                 self.stack.set_visible_child_name("auth");
-                self.auth.show_setup(SETUP_HELP);
+                self.auth.show_credentials();
+                if self.probe {
+                    self.start_auth_probe();
+                }
             }
             AuthState::NeedPhone | AuthState::NeedCode | AuthState::NeedPassword => {
                 self.stack.set_visible_child_name("auth");
@@ -611,6 +663,65 @@ impl ShellInner {
         if first_ready {
             self.start_probe();
         }
+    }
+
+    fn log_out(self: Rc<Self>) {
+        // This synchronous transition is the mutation barrier: no callback
+        // can start another send/attach/delete before the wait loop begins.
+        if !self.session_ready.replace(false) {
+            return;
+        }
+        self.settings_view.begin_logout();
+        self.switcher.close();
+        self.main_menu.dismiss();
+        self.messages.set_busy(true);
+        self.widget.set_sensitive(false);
+        for (_, source) in self.draft_timeouts.borrow_mut().drain() {
+            source.remove();
+        }
+        glib::MainContext::default().spawn_local(async move {
+            self.local.record_cancel().await;
+            while self.mutations_in_flight.get() != 0
+                || self.flags_in_flight.get()
+                || self.drafts.borrow().values().any(|state| state.in_flight)
+                || self
+                    .mark_reads
+                    .borrow()
+                    .values()
+                    .any(|state| state.in_flight)
+            {
+                glib::timeout_future(Duration::from_millis(25)).await;
+            }
+            self.composer_operation.set(false);
+            self.messages.stop_send_feedback();
+            let next_session = self.session_epoch.get().wrapping_add(1);
+            self.session_epoch.set(next_session);
+            let epoch = self.bump_epoch();
+            let result = self.tg.log_out().await;
+            self.messages.set_busy(false);
+            self.widget.set_sensitive(true);
+            if result.is_ok() {
+                self.me.borrow_mut().take();
+                self.chat_info.borrow_mut().clear();
+                self.drafts.borrow_mut().clear();
+            }
+            match result {
+                Ok(AuthState::NeedPhone) => {
+                    self.open_chat.set(None);
+                    self.dialogs_loaded.set(false);
+                    self.messages.clear_selection(epoch);
+                    self.stack.set_visible_child_name("auth");
+                    self.auth.show_step(AuthState::NeedPhone);
+                }
+                Ok(state) => self.handle_auth_state(state),
+                Err(error) => {
+                    self.session_ready.set(true);
+                    self.apply_settings(&self.settings.get());
+                    self.settings_view.account_error(&error);
+                    self.messages.show_error(&error);
+                }
+            }
+        });
     }
 
     /// Push settings into the UI and the backend (clock, ghost pill, message
@@ -662,7 +773,13 @@ impl ShellInner {
         // Forward on every store change. Besides keeping the backend snapshot
         // explicit, this guarantees a current-generation completion exists if
         // an unrelated setting changes while an anti-delete flip is in flight.
-        self.push_flags(FlagsRequest { flags, generation });
+        if self.session_ready.get() {
+            self.push_flags(FlagsRequest {
+                flags,
+                generation,
+                session_epoch: self.session_epoch.get(),
+            });
+        }
     }
 
     fn refresh_virtual_rows(&self, settings: &Settings) {
@@ -710,7 +827,10 @@ impl ShellInner {
             let Some(this) = weak.upgrade() else { return };
             this.flags_in_flight.set(false);
             match result {
-                Ok(()) if request.generation == this.settings_gen.get() => {
+                Ok(())
+                    if this.is_session_current(request.session_epoch)
+                        && request.generation == this.settings_gen.get() =>
+                {
                     if this.anti_reload_pending.replace(false) {
                         if let Some(chat_id) = this.open_chat.get() {
                             this.clone().force_reload(chat_id);
@@ -721,12 +841,15 @@ impl ShellInner {
                     // A newer settings snapshot is queued (or already sent),
                     // so this completion must not reload data.
                 }
-                Err(error) => {
-                    eprintln!("set_flags: {error}");
+                Err(error) if this.is_session_current(request.session_epoch) => {
+                    shell_log!("set_flags: {error}");
                 }
+                Err(_) => {}
             }
             let pending = this.flags_pending.borrow_mut().take();
-            if let Some(request) = pending {
+            if let Some(request) =
+                pending.filter(|request| this.is_session_current(request.session_epoch))
+            {
                 this.push_flags(request);
             }
         });
@@ -765,6 +888,7 @@ impl ShellInner {
     }
 
     fn close_settings(&self) {
+        self.settings_view.dismiss_transients();
         if self.settings_open() {
             self.stack.set_visible_child_name("main");
             self.messages.focus_composer();
@@ -1125,50 +1249,12 @@ impl ShellInner {
             if answer != Some(1) {
                 return;
             }
-            if self.logging_out.replace(true) {
-                return;
-            }
-            self.widget.set_sensitive(false);
-            for (_, source) in self.draft_timeouts.borrow_mut().drain() {
-                source.remove();
-            }
-            while self.composer_operation.get()
-                || self.chat_mutations.get() > 0
-                || self.drafts.borrow().values().any(|state| state.in_flight)
-                || self
-                    .mark_reads
-                    .borrow()
-                    .values()
-                    .any(|state| state.in_flight)
-                || self.flags_in_flight.get()
-            {
-                glib::timeout_future(Duration::from_millis(20)).await;
-            }
-            self.session_ready.set(false);
-            self.session_epoch
-                .set(self.session_epoch.get().wrapping_add(1));
-            self.bump_epoch();
-            match self.tg.log_out().await {
-                Ok(state) => {
-                    self.me.borrow_mut().take();
-                    self.chat_info.borrow_mut().clear();
-                    self.drafts.borrow_mut().clear();
-                    self.logging_out.set(false);
-                    self.widget.set_sensitive(true);
-                    self.handle_auth_state(state);
-                }
-                Err(error) => {
-                    self.session_ready.set(true);
-                    self.logging_out.set(false);
-                    self.widget.set_sensitive(true);
-                    self.messages.show_error(&error);
-                }
-            }
+            self.log_out();
         });
     }
 
     fn handle_chat_action(self: Rc<Self>, chat_id: i64, action: ChatAction) {
-        if self.logging_out.get() {
+        if !self.session_ready.get() {
             return;
         }
         if matches!(action, ChatAction::Open) {
@@ -1245,7 +1331,7 @@ impl ShellInner {
     }
 
     fn confirm_destructive_chat_action(self: Rc<Self>, chat_id: i64, action: ChatAction) {
-        if self.logging_out.get() {
+        if !self.session_ready.get() {
             return;
         }
         let Some(window) = self.window() else { return };
@@ -1266,7 +1352,7 @@ impl ShellInner {
             if dialog.choose_future(Some(&window)).await.ok() != Some(1) {
                 return;
             }
-            if self.logging_out.get() {
+            if !self.session_ready.get() {
                 return;
             }
             self.begin_chat_mutation();
@@ -1351,7 +1437,7 @@ impl ShellInner {
     }
 
     fn composer_draft_changed(self: &Rc<Self>) {
-        if self.logging_out.get() {
+        if !self.session_ready.get() {
             return;
         }
         let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
@@ -1408,7 +1494,7 @@ impl ShellInner {
     }
 
     fn send_draft_snapshot(self: &Rc<Self>, chat_id: i64, snapshot: DraftSnapshot) {
-        if self.logging_out.get() {
+        if !self.session_ready.get() {
             return;
         }
         {
@@ -1480,13 +1566,18 @@ impl ShellInner {
         let events = self.tg.events.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = events.recv().await {
-                this.handle_event(event);
+                if this.session_ready.get() {
+                    this.handle_event(event);
+                }
             }
-            eprintln!("event loop: backend event stream closed");
+            shell_log!("event loop: backend event stream closed");
         });
     }
 
     fn load_dialogs(self: &Rc<Self>) {
+        if !self.session_ready.get() {
+            return;
+        }
         if self.dialogs_in_flight.replace(true) {
             self.dialogs_refresh_again.set(true);
             return;
@@ -1611,7 +1702,7 @@ impl ShellInner {
                     this.run_smoke_hooks();
                 }
                 Err(error) => {
-                    eprintln!("get_dialogs: {error}");
+                    shell_log!("get_dialogs: {error}");
                     this.dialogs_error.set_label(&error);
                     this.dialogs_error_box.set_visible(true);
                 }
@@ -1619,7 +1710,7 @@ impl ShellInner {
             if requested_revision != this.dialogs_revision.get() {
                 this.dialogs_refresh_again.set(true);
             }
-            if this.dialogs_refresh_again.replace(false) {
+            if this.dialogs_refresh_again.replace(false) && this.session_ready.get() {
                 this.load_dialogs();
             }
         });
@@ -1644,13 +1735,13 @@ impl ShellInner {
     }
 
     fn begin_chat_mutation(&self) {
-        self.chat_mutations
-            .set(self.chat_mutations.get().saturating_add(1));
+        self.mutations_in_flight
+            .set(self.mutations_in_flight.get().saturating_add(1));
     }
 
     fn finish_chat_mutation(&self) {
-        self.chat_mutations
-            .set(self.chat_mutations.get().saturating_sub(1));
+        self.mutations_in_flight
+            .set(self.mutations_in_flight.get().saturating_sub(1));
     }
 
     fn dialog_upsert(
@@ -2011,9 +2102,12 @@ impl ShellInner {
     }
 
     fn open_chat(self: Rc<Self>, chat_id: i64) {
-        if self.logging_out.get() {
+        if !self.session_ready.get() {
             return;
         }
+        // A chat activation owns the main view even when it re-opens the
+        // already-selected chat; dismiss settings capture and modal windows.
+        self.close_settings();
         if self.open_chat.get() == Some(chat_id) {
             return;
         }
@@ -2029,9 +2123,6 @@ impl ShellInner {
             self.open_virtual_chat(chat_id);
             return;
         }
-        // Opening a chat while the settings page is up swaps back to the main
-        // view so the opened chat is actually visible.
-        self.close_settings();
         let epoch = self.bump_epoch();
         self.open_chat.set(Some(chat_id));
         self.chatlist.select_chat(chat_id);
@@ -2066,13 +2157,15 @@ impl ShellInner {
     }
 
     fn open_virtual_chat(self: Rc<Self>, chat_id: i64) {
+        if !self.session_ready.get() {
+            return;
+        }
         let settings = self.settings.get();
         if (chat_id == ASSISTANT_CHAT && !settings.ai.enabled)
             || (chat_id == OMARCHY_CHAT && !settings.os.enabled)
         {
             return;
         }
-        self.close_settings();
         if chat_id == OMARCHY_CHAT {
             let should_seed = self
                 .virtual_stores
@@ -2166,7 +2259,7 @@ impl ShellInner {
                     }
                 }
                 Err(error) => {
-                    eprintln!("get_history({chat_id}): {error}");
+                    shell_log!("get_history({chat_id}): {error}");
                     if self.is_current(chat_id, epoch) {
                         self.messages.fail_initial(&error);
                     }
@@ -2197,7 +2290,7 @@ impl ShellInner {
                     self.post_render(inserted);
                 }
                 Err(error) => {
-                    eprintln!("get_history page ({chat_id}): {error}");
+                    shell_log!("get_history page ({chat_id}): {error}");
                     if self.is_current(chat_id, epoch) {
                         self.messages.fail_page(&error);
                     }
@@ -2207,7 +2300,7 @@ impl ShellInner {
     }
 
     fn handle_message_action(self: Rc<Self>, action: MessageAction) {
-        if self.logging_out.get() {
+        if !self.session_ready.get() {
             return;
         }
         if self.open_chat.get().is_some_and(is_virtual)
@@ -2343,7 +2436,7 @@ impl ShellInner {
                     self.messages.show_edit_history(msg_id, versions);
                 }
                 Err(error) => {
-                    eprintln!("get_edit_history({chat_id}, {msg_id}): {error}");
+                    shell_log!("get_edit_history({chat_id}, {msg_id}): {error}");
                     self.messages.show_error(&error);
                 }
             }
@@ -2386,7 +2479,7 @@ impl ShellInner {
                     this.messages.set_detached(true);
                 }
                 Err(error) => {
-                    eprintln!("get_history_at_date({chat_id}): {error}");
+                    shell_log!("get_history_at_date({chat_id}): {error}");
                     if this.is_current(chat_id, epoch) {
                         this.messages.fail_initial(&error);
                         // The store was reset for the jump: keep the view
@@ -2437,7 +2530,7 @@ impl ShellInner {
                     }
                 }
                 Err(error) => {
-                    eprintln!("get_history({chat_id}): {error}");
+                    shell_log!("get_history({chat_id}): {error}");
                     if this.is_current(chat_id, epoch) {
                         this.messages.fail_initial(&error);
                         this.messages.set_detached(true);
@@ -2478,6 +2571,11 @@ impl ShellInner {
 
     fn finish_virtual(&self, chat_id: i64, result: Result<String, String>, monospace: bool) {
         self.end_virtual_request(chat_id);
+        // A local reply that lands while logging out must not touch the
+        // (soon to be cleared) message view.
+        if !self.session_ready.get() {
+            return;
+        }
         let text = match result {
             Ok(text) => text,
             Err(error) if chat_id == ASSISTANT_CHAT && error.contains("no chat provider") => {
@@ -2511,6 +2609,9 @@ impl ShellInner {
     }
 
     fn submit_virtual(self: Rc<Self>, chat_id: i64) {
+        if !self.session_ready.get() {
+            return;
+        }
         let settings = self.settings.get();
         if (chat_id == ASSISTANT_CHAT && !settings.ai.enabled)
             || (chat_id == OMARCHY_CHAT && !settings.os.enabled)
@@ -2869,6 +2970,9 @@ impl ShellInner {
     }
 
     fn submit_composer(self: Rc<Self>) {
+        if !self.session_ready.get() {
+            return;
+        }
         let kind = self.open_chat.get();
         if let Some(chat_id) = kind.filter(|chat_id| is_virtual(*chat_id)) {
             self.submit_virtual(chat_id);
@@ -2888,6 +2992,9 @@ impl ShellInner {
         let title = self.title_for(chat_id);
         let edit_id = self.messages.edit_id();
         let reply_to = self.messages.reply_to();
+        let Some(session_epoch) = self.begin_mutation() else {
+            return;
+        };
         self.composer_operation.set(true);
         self.messages.clear_error();
         self.messages.set_busy(true);
@@ -2899,6 +3006,10 @@ impl ShellInner {
             glib::MainContext::default().spawn_local(async move {
                 charge.await;
                 let result = self.tg.edit_text(chat_id, msg_id, &text).await;
+                self.finish_mutation();
+                if !self.is_session_current(session_epoch) {
+                    return;
+                }
                 self.composer_operation.set(false);
                 match result {
                     Ok(message) => {
@@ -2923,7 +3034,7 @@ impl ShellInner {
                             .complete_text_operation(&text, epoch_is_current);
                     }
                     Err(error) => {
-                        eprintln!("edit_text({chat_id}, {msg_id}): {error}");
+                        shell_log!("edit_text({chat_id}, {msg_id}): {error}");
                         if self.is_current(chat_id, epoch) {
                             self.messages.show_error(&error);
                             self.effects.error_flash(&self.overlay);
@@ -2955,6 +3066,10 @@ impl ShellInner {
         glib::MainContext::default().spawn_local(async move {
             charge.await;
             let result = self.tg.send_text(chat_id, &text, reply_to).await;
+            self.finish_mutation();
+            if !self.is_session_current(session_epoch) {
+                return;
+            }
             self.composer_operation.set(false);
             match result {
                 Ok(message) => {
@@ -2980,7 +3095,7 @@ impl ShellInner {
                     self.clear_sent_draft(chat_id);
                 }
                 Err(error) => {
-                    eprintln!("send_text({chat_id}): {error}");
+                    shell_log!("send_text({chat_id}): {error}");
                     if self.is_current(chat_id, epoch) {
                         self.messages.remove(pending_id);
                         self.messages.show_error(&error);
@@ -2994,6 +3109,9 @@ impl ShellInner {
     }
 
     fn open_file_dialog(self: Rc<Self>) {
+        if !self.session_ready.get() {
+            return;
+        }
         if self.composer_operation.get() || self.messages.is_busy() {
             return;
         }
@@ -3004,6 +3122,7 @@ impl ShellInner {
             return;
         };
         let epoch = self.epoch.get();
+        let session_epoch = self.session_epoch.get();
         let caption = self.messages.composer_text();
         let title = self.title_for(chat_id);
         self.composer_operation.set(true);
@@ -3013,26 +3132,33 @@ impl ShellInner {
         glib::MainContext::default().spawn_local(async move {
             match dialog.open_future(Some(&window)).await {
                 Ok(file) => {
-                    self.send_file_snapshot(file, chat_id, epoch, caption, title)
+                    self.send_file_snapshot(file, chat_id, epoch, session_epoch, caption, title)
                         .await;
                 }
                 Err(error) if error.matches(gio::IOErrorEnum::Cancelled) => {
-                    self.composer_operation.set(false);
-                    self.messages.set_busy(false);
+                    if self.is_session_current(session_epoch) {
+                        self.composer_operation.set(false);
+                        self.messages.set_busy(false);
+                    }
                 }
                 Err(error) => {
-                    eprintln!("file dialog: {error}");
-                    if self.is_current(chat_id, epoch) {
+                    shell_log!("file dialog: {error}");
+                    if self.is_session_current(session_epoch) && self.is_current(chat_id, epoch) {
                         self.messages.show_error(error.message());
                     }
-                    self.composer_operation.set(false);
-                    self.messages.set_busy(false);
+                    if self.is_session_current(session_epoch) {
+                        self.composer_operation.set(false);
+                        self.messages.set_busy(false);
+                    }
                 }
             }
         });
     }
 
     fn send_file(self: Rc<Self>, file: gio::File) {
+        if !self.session_ready.get() {
+            return;
+        }
         if self.composer_operation.get() || self.messages.is_busy() {
             return;
         }
@@ -3040,13 +3166,14 @@ impl ShellInner {
             return;
         };
         let epoch = self.epoch.get();
+        let session_epoch = self.session_epoch.get();
         let caption = self.messages.composer_text();
         let title = self.title_for(chat_id);
         self.composer_operation.set(true);
         self.messages.clear_error();
         self.messages.set_busy(true);
         glib::MainContext::default().spawn_local(async move {
-            self.send_file_snapshot(file, chat_id, epoch, caption, title)
+            self.send_file_snapshot(file, chat_id, epoch, session_epoch, caption, title)
                 .await;
         });
     }
@@ -3056,18 +3183,29 @@ impl ShellInner {
         file: gio::File,
         chat_id: i64,
         epoch: u64,
+        session_epoch: u64,
         caption: String,
         title: String,
     ) {
+        if !self.is_session_current(session_epoch) || self.begin_mutation().is_none() {
+            return;
+        }
         let Some(path) = file.path() else {
             if self.is_current(chat_id, epoch) {
                 self.messages.show_error("only local files can be sent");
             }
+            self.finish_mutation();
             self.composer_operation.set(false);
-            self.messages.set_busy(false);
+            if self.is_session_current(session_epoch) {
+                self.messages.set_busy(false);
+            }
             return;
         };
         let result = self.tg.send_file(chat_id, path, &caption).await;
+        self.finish_mutation();
+        if !self.is_session_current(session_epoch) {
+            return;
+        }
         self.composer_operation.set(false);
         match result {
             Ok(message) => {
@@ -3091,7 +3229,7 @@ impl ShellInner {
                     .complete_text_operation(&caption, epoch_is_current);
             }
             Err(error) => {
-                eprintln!("send_file({chat_id}): {error}");
+                shell_log!("send_file({chat_id}): {error}");
                 if self.is_current(chat_id, epoch) {
                     self.messages.show_error(&error);
                     self.effects.error_flash(&self.overlay);
@@ -3102,7 +3240,7 @@ impl ShellInner {
     }
 
     fn delete_message(self: Rc<Self>, msg_id: i32) {
-        if self.logging_out.get() {
+        if !self.session_ready.get() {
             return;
         }
         let Some(chat_id) = self.open_chat.get() else {
@@ -3120,9 +3258,16 @@ impl ShellInner {
             .then(|| self.messages.last_before(msg_id))
             .flatten();
         let title = self.title_for(chat_id);
-        self.begin_chat_mutation();
+        let Some(session_epoch) = self.begin_mutation() else {
+            return;
+        };
         glib::MainContext::default().spawn_local(async move {
-            match self.tg.delete_message(chat_id, msg_id).await {
+            let result = self.tg.delete_message(chat_id, msg_id).await;
+            self.finish_mutation();
+            if !self.is_session_current(session_epoch) {
+                return;
+            }
+            match result {
                 Ok(()) => {
                     if was_last {
                         let reconciled =
@@ -3143,7 +3288,7 @@ impl ShellInner {
                     }
                 }
                 Err(error) => {
-                    eprintln!("delete_message({chat_id}, {msg_id}): {error}");
+                    shell_log!("delete_message({chat_id}, {msg_id}): {error}");
                     if self.is_current(chat_id, epoch) {
                         self.messages.show_error(&error);
                     }
@@ -3200,7 +3345,7 @@ impl ShellInner {
             match result {
                 Ok(reply) => self.messages.show_ai_draft(&reply.text),
                 Err(error) => {
-                    eprintln!("AI draft ({chat_id}, {msg_id}): {error}");
+                    shell_log!("AI draft ({chat_id}, {msg_id}): {error}");
                     self.messages.show_error(&error);
                 }
             }
@@ -3605,12 +3750,12 @@ impl ShellInner {
                             self.messages.finish_image(msg_id, path, &texture);
                         }
                         Ok(Err(error)) => {
-                            eprintln!("decode media ({chat_id}, {msg_id}): {error}");
+                            shell_log!("decode media ({chat_id}, {msg_id}): {error}");
                             self.messages.fail_media(msg_id, false);
                             self.messages.show_error(error.message());
                         }
                         Err(_) => {
-                            eprintln!("decode media ({chat_id}, {msg_id}): decoder failed");
+                            shell_log!("decode media ({chat_id}, {msg_id}): decoder failed");
                             self.messages.fail_media(msg_id, false);
                             self.messages.show_error("image unavailable");
                         }
@@ -3649,7 +3794,7 @@ impl ShellInner {
                     }
                 }
                 Err(error) => {
-                    eprintln!("download_media({chat_id}, {msg_id}): {error}");
+                    shell_log!("download_media({chat_id}, {msg_id}): {error}");
                     if self.is_current(chat_id, epoch) && self.messages.contains(msg_id) {
                         self.messages.fail_media(msg_id, true);
                         self.messages.show_error(&error);
@@ -3667,19 +3812,16 @@ impl ShellInner {
         if let Err(error) =
             gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>)
         {
-            eprintln!("launch media: {error}");
+            shell_log!("launch media: {error}");
             self.messages.show_error(error.message());
         }
     }
 
     fn queue_mark_read(self: &Rc<Self>, chat_id: i64, latest: i32, epoch: u64) {
-        if self.logging_out.get() {
+        if !self.session_ready.get() || is_virtual(chat_id) {
             return;
         }
         if self.manual_unread_hold.borrow().contains(&chat_id) {
-            return;
-        }
-        if is_virtual(chat_id) {
             return;
         }
         // Ghost mode suppresses read receipts; check the CURRENT snapshot so
@@ -3732,7 +3874,7 @@ impl ShellInner {
                     }
                 }
                 Err(error) => {
-                    eprintln!("mark_read({chat_id}): {error}");
+                    shell_log!("mark_read({chat_id}): {error}");
                     if this.is_current(chat_id, epoch) {
                         this.messages.show_error(&error);
                     }
@@ -3752,6 +3894,25 @@ impl ShellInner {
         let next = self.epoch.get().wrapping_add(1);
         self.epoch.set(next);
         next
+    }
+
+    fn begin_mutation(&self) -> Option<u64> {
+        if !self.session_ready.get() {
+            return None;
+        }
+        let session_epoch = self.session_epoch.get();
+        self.mutations_in_flight
+            .set(self.mutations_in_flight.get().saturating_add(1));
+        Some(session_epoch)
+    }
+
+    fn finish_mutation(&self) {
+        self.mutations_in_flight
+            .set(self.mutations_in_flight.get().saturating_sub(1));
+    }
+
+    fn is_session_current(&self, session_epoch: u64) -> bool {
+        self.session_ready.get() && self.session_epoch.get() == session_epoch
     }
 
     fn apply_tombstone(&self, mut message: Msg) -> Msg {
@@ -3808,7 +3969,9 @@ impl ShellInner {
     }
 
     fn is_current(&self, chat_id: i64, epoch: u64) -> bool {
-        self.open_chat.get() == Some(chat_id) && self.epoch.get() == epoch
+        self.session_ready.get()
+            && self.open_chat.get() == Some(chat_id)
+            && self.epoch.get() == epoch
     }
 
     fn title_for(&self, chat_id: i64) -> String {
@@ -3873,18 +4036,76 @@ impl ShellInner {
         }
         let this = self.clone();
         glib::MainContext::default().spawn_local(async move {
+            if this.auth.state() == AuthState::NeedCredentials {
+                probe_step("credentials invalid disabled");
+                this.auth.probe_fill_credentials("0", "not-a-hash");
+                if this.auth.probe_continue_sensitive() {
+                    probe_fail("credentials invalid enabled");
+                    return;
+                }
+
+                probe_step("credentials valid enabled");
+                this.auth.probe_fill_credentials("12345", PROBE_API_HASH);
+                if !this.auth.probe_continue_sensitive() {
+                    probe_fail("credentials valid disabled");
+                    return;
+                }
+                this.auth.probe_submit_credentials();
+
+                let fail_once = std::env::var("OMG_MOCK_FAIL_ONCE").is_ok_and(|value| {
+                    value
+                        .split(',')
+                        .any(|name| name.trim() == "SubmitCredentials")
+                });
+                if fail_once {
+                    probe_step("credentials inline retry");
+                    if !poll_until(3000, || {
+                        this.auth
+                            .probe_credentials_error()
+                            .is_some_and(|error| error.contains("mock: transient failure"))
+                    })
+                    .await
+                    {
+                        probe_fail("credentials inline error");
+                        return;
+                    }
+                    let (api_id, api_hash) = this.auth.probe_credential_values();
+                    if api_id != "12345"
+                        || api_hash != PROBE_API_HASH
+                        || !this.auth.probe_continue_sensitive()
+                    {
+                        probe_fail("credentials retry state");
+                        return;
+                    }
+                    this.auth.probe_submit_credentials();
+                }
+                probe_step("credentials submit");
+                if !poll_until(3000, || this.auth.state() == AuthState::NeedPhone).await {
+                    probe_fail("credentials submit");
+                    return;
+                }
+                probe_step("credentials secret absent from log");
+                if log_ring_contains(PROBE_API_HASH) {
+                    probe_fail("credentials secret reached log");
+                    return;
+                }
+            }
+
+            probe_step("auth phone");
             this.auth.probe_submit("123");
             if !poll_until(3000, || this.auth.state() == AuthState::NeedCode).await {
                 probe_fail("auth phone");
                 return;
             }
+            probe_step("auth code");
             this.auth.probe_submit("2fa");
             if !poll_until(3000, || this.auth.state() == AuthState::NeedPassword).await {
                 probe_fail("auth code");
                 return;
             }
+            probe_step("auth password");
             this.auth.probe_submit("x");
-            if !poll_until(3000, || this.started.get()).await {
+            if !poll_until(3000, || this.session_ready.get()).await {
                 probe_fail("auth password");
             }
         });
@@ -4415,6 +4636,152 @@ impl ShellInner {
             probe_fail("open settings");
             return;
         }
+
+        for page in super::settings_view::PAGE_NAMES {
+            probe_step(&format!("settings page {page}"));
+            self.settings_view.probe_show_page(page);
+            if self.settings_view.visible_page().as_deref() != Some(*page) {
+                probe_fail("settings page order");
+                return;
+            }
+        }
+        self.settings_view.probe_show_page("account");
+        probe_step("account get me");
+        if !poll_until(3000, || {
+            self.settings_view.probe_account_name() == "Leo Test"
+        })
+        .await
+        {
+            probe_fail("account get me");
+            return;
+        }
+
+        self.settings_view.probe_show_page("keyboard");
+        probe_step("keyboard Primary canonicalizes to Control");
+        let control_f = keys::canonical("<Control>f");
+        if control_f.is_none() || control_f != keys::canonical("<Primary>f") {
+            probe_fail("keyboard Primary canonicalization");
+            return;
+        }
+        probe_step("keyboard capture");
+        if !self.settings_view.keys().probe_capture(
+            "switcher",
+            gdk::Key::z,
+            gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK,
+        ) || keys::canonical(&self.settings_view.keys().probe_accel("switcher"))
+            != keys::canonical("<Control><Shift>z")
+            || !self.settings_view.keys().probe_save()
+        {
+            probe_fail("keyboard capture");
+            return;
+        }
+        probe_step("keyboard capture rejects modifier-only and invalid");
+        if !self.settings_view.keys().probe_rejected_capture(
+            "switcher",
+            gdk::Key::Shift_L,
+            gdk::ModifierType::SHIFT_MASK,
+        ) || !self.settings_view.keys().probe_rejected_capture(
+            "switcher",
+            gdk::Key::VoidSymbol,
+            gdk::ModifierType::empty(),
+        ) {
+            probe_fail("keyboard invalid capture rejection");
+            return;
+        }
+
+        self.messages.set_composer_text("aéz");
+        self.messages.probe_select_composer(1, 2);
+        keys::wrap_buffer_selection(&self.messages.composer().buffer(), "**", "**");
+        probe_step("keyboard live marker wrap");
+        if self.messages.composer_text() != "a**é**z" || self.messages.probe_composer_cursor() != 6
+        {
+            probe_fail("keyboard live marker wrap");
+            return;
+        }
+        self.messages.set_composer_text("");
+        self.settings_view
+            .keys()
+            .probe_stage("switcher", "<Primary>f");
+        probe_step("keyboard same-group conflict");
+        if self
+            .settings_view
+            .keys()
+            .probe_conflict_note("switcher")
+            .is_none_or(|note| !note.contains("Search chats and messages"))
+            || self.settings_view.keys().probe_save_sensitive()
+            || self.settings_view.keys().probe_save()
+        {
+            probe_fail("keyboard conflict rejection");
+            return;
+        }
+        self.settings_view.keys().probe_reset_all();
+        probe_step("keyboard reset all");
+        if self.settings_view.keys().probe_accel("switcher") != "<Control>k" {
+            probe_fail("keyboard reset all");
+            return;
+        }
+
+        self.settings_view.probe_show_page("ai");
+        probe_step("AI key save and never prefill");
+        self.settings_view
+            .probe_ai_key_save("openai", "probe-openai-key");
+        if !self.settings_view.probe_ai_key_is_set("openai")
+            || self.settings_view.probe_ai_key_status("openai").as_deref() != Some("set")
+            || !self.settings_view.probe_ai_key_entry_empty("openai")
+        {
+            probe_fail("AI key save");
+            return;
+        }
+        self.settings_view.probe_show_page("appearance");
+        self.settings_view.probe_show_page("ai");
+        if !self.settings_view.probe_ai_key_entry_empty("openai") {
+            probe_fail("AI key was prefilled");
+            return;
+        }
+        probe_step("AI empty save preserves stored key");
+        self.settings_view.probe_ai_key_save("openai", "");
+        if !self.settings_view.probe_ai_key_is_set("openai")
+            || !self.settings_view.probe_ai_key_entry_empty("openai")
+        {
+            probe_fail("AI empty save changed key");
+            return;
+        }
+        probe_step("AI key clear");
+        self.settings_view.probe_ai_key_clear("openai");
+        if self.settings_view.probe_ai_key_is_set("openai")
+            || self.settings_view.probe_ai_key_status("openai").as_deref() != Some("not set")
+        {
+            probe_fail("AI key clear");
+            return;
+        }
+
+        self.settings_view.probe_show_page("account");
+        probe_step("change credentials dialog save");
+        if !self.settings_view.probe_open_change_credentials()
+            || !self.settings_view.probe_open_change_credentials()
+            || !self
+                .settings_view
+                .probe_submit_change_credentials("54321", PROBE_API_HASH)
+            || !self.session_ready.get()
+        {
+            probe_fail("change credentials dialog save");
+            return;
+        }
+        self.settings_view.dismiss_transients();
+
+        self.settings
+            .update(|settings| settings.ui.markdown_send = false);
+        probe_step("markdown send flag off");
+        if !poll_until(1000, || {
+            self.flags_settled() && !self.desired_flags.get().markdown_send
+        })
+        .await
+        {
+            probe_fail("markdown send flag off");
+            return;
+        }
+        self.settings
+            .update(|settings| settings.ui.markdown_send = true);
         self.settings
             .update(|settings| settings.show_seconds = true);
         probe_step("show seconds");
@@ -4938,6 +5305,52 @@ impl ShellInner {
             return;
         }
 
+        if !self.settings_open() {
+            self.toggle_settings();
+        }
+        self.settings_view.probe_show_page("account");
+        probe_step("log out");
+        if !self.settings_view.probe_open_logout_dialog()
+            || !self.settings_view.probe_confirm_logout()
+        {
+            probe_fail("log out confirm dialog");
+            return;
+        }
+        let fail_once = std::env::var("OMG_MOCK_FAIL_ONCE")
+            .is_ok_and(|value| value.split(',').any(|name| name.trim() == "LogOut"));
+        if fail_once {
+            probe_step("log out inline retry");
+            if !poll_until(3000, || {
+                self.session_ready.get()
+                    && self
+                        .settings_view
+                        .probe_logout_error()
+                        .is_some_and(|error| error.contains("mock: transient failure"))
+            })
+            .await
+            {
+                probe_fail("log out failure state");
+                return;
+            }
+            if !self.settings_view.probe_open_logout_dialog()
+                || !self.settings_view.probe_confirm_logout()
+            {
+                probe_fail("log out retry confirm dialog");
+                return;
+            }
+        }
+        if !poll_until(3000, || {
+            !self.session_ready.get()
+                && self.stack.visible_child_name().as_deref() == Some("auth")
+                && self.auth.state() == AuthState::NeedPhone
+                && !self.settings_view.probe_logout_dialog_open()
+        })
+        .await
+        {
+            probe_fail("log out phone step");
+            return;
+        }
+
         let Some(window) = self.window() else {
             probe_fail("find application window");
             return;
@@ -5208,11 +5621,11 @@ where
 /// crashes that abort the process without a Rust frame.
 fn probe_step(step: &str) {
     if std::env::var_os("OMG_PROBE_TRACE").is_some() {
-        eprintln!("[probe] {step}");
+        shell_log!("[probe] {step}");
     }
 }
 
 fn probe_fail(step: &str) {
-    eprintln!("probe failed: {step}");
+    shell_log!("probe failed: {step}");
     std::process::exit(1);
 }

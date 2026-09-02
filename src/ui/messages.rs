@@ -885,26 +885,6 @@ impl MessagesView {
             });
         }
 
-        let key_controller = gtk::EventControllerKey::new();
-        {
-            let inner = self.inner.clone();
-            key_controller.connect_key_pressed(move |_, key, _, modifiers| {
-                if !matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
-                    return glib::Propagation::Proceed;
-                }
-                if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
-                    return glib::Propagation::Proceed;
-                }
-                if inner.virtual_mode.get() || !inner.busy.get() {
-                    if let Some(callback) = inner.action.borrow().as_ref().cloned() {
-                        callback(MessageAction::Submit);
-                    }
-                }
-                glib::Propagation::Stop
-            });
-        }
-        self.inner.composer.add_controller(key_controller);
-
         {
             let inner = self.inner.clone();
             self.inner.drop_target.connect_drop(move |_, value, _, _| {
@@ -2246,6 +2226,11 @@ impl MessagesView {
             .to_string()
     }
 
+    /// The text view that owns composer-scoped shortcut controllers (A28).
+    pub fn composer(&self) -> gtk::TextView {
+        self.inner.composer.clone()
+    }
+
     pub fn set_composer_text(&self, text: &str) {
         self.inner.composer_signal_blocked.set(true);
         self.inner.composer.buffer().set_text(text);
@@ -2300,6 +2285,21 @@ impl MessagesView {
             self.clear_error();
         }
         self.inner.draft_retry.set_visible(false);
+    }
+
+    /// Probe support for the live GTK wrapping path: select character offsets
+    /// exactly as a user selection in the composer would.
+    pub fn probe_select_composer(&self, start: i32, end: i32) {
+        let buffer = self.inner.composer.buffer();
+        let chars = buffer.char_count();
+        let start = buffer.iter_at_offset(start.clamp(0, chars));
+        let end = buffer.iter_at_offset(end.clamp(0, chars));
+        buffer.select_range(&start, &end);
+    }
+
+    pub fn probe_composer_cursor(&self) -> i32 {
+        let buffer = self.inner.composer.buffer();
+        buffer.iter_at_mark(&buffer.get_insert()).offset()
     }
 
     pub fn reply_to(&self) -> Option<i32> {
