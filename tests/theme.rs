@@ -23,6 +23,12 @@ const KEYS: &[&str] = &[
     "accent",
     "selection",
     "red",
+    "green",
+    "cyan",
+    "blue",
+    "magenta",
+    "yellow",
+    "orange",
 ];
 
 /// Color key -> the CSS custom property its placeholder fills, per the `:root`
