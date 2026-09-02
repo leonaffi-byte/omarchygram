@@ -17,20 +17,21 @@ use crate::ai::{ChatMessage, Prefs, Role};
 use crate::local::Local as LocalServices;
 use crate::os::{self, OsPolicy, Parsed};
 use crate::settings::{Settings, SettingsStore};
-use crate::tg::{
-    AuthState, BackendFlags, ChatInfo, ChatKind, Event, Me, MediaKind, Msg, Tg,
-};
+use crate::tg::{AuthState, BackendFlags, ChatInfo, ChatKind, Event, Me, MediaKind, Msg, Tg};
 use crate::uistate::UiState;
 
 use super::anim::{Effects, RadioGroup, apply_full_phosphor, group_ids, select_radio};
 use super::auth::{AuthAction, AuthView};
 use super::avatar::Avatar;
 use super::chatlist::{ChatList, SearchRetry, SidebarMode, UnreadUpdate};
+use super::forward::{ForwardAction, ForwardDialog, ForwardRequest};
+use super::icons;
 use super::keys;
 use super::menus::{self, ChatAction, MainMenuAction, PopoverSlot};
 use super::messages::{MediaState, MessageAction, MessagesView};
 use super::settings_view::SettingsView;
 use super::switcher::Switcher;
+use super::viewer::{Viewer, ViewerAction};
 use super::virtual_chat::{
     ASSISTANT_CHAT, AuxState, OMARCHY_CHAT, ReqState, VirtualStore, is_virtual, virtual_title,
 };
@@ -100,6 +101,17 @@ struct DraftState {
     dirty: bool,
 }
 
+#[derive(Default)]
+struct InChatSearchState {
+    generation: u64,
+    query: String,
+    hits: Vec<Msg>,
+    index: Option<usize>,
+    exhausted: bool,
+    in_flight: bool,
+    retry_before: Option<i32>,
+}
+
 struct PendingShellTicket {
     ticket: Option<os::ShellTicket>,
 }
@@ -140,6 +152,8 @@ struct ShellInner {
     auth: AuthView,
     chatlist: ChatList,
     messages: MessagesView,
+    forward: ForwardDialog,
+    viewer: Viewer,
     paned: gtk::Paned,
     effects: Rc<Effects>,
     overlay: gtk::Overlay,
@@ -200,11 +214,20 @@ struct ShellInner {
     manual_unread_hold: RefCell<HashSet<i64>>,
     read_outbox: RefCell<HashMap<i64, i32>>,
     quote_requests: RefCell<HashSet<(i64, u64, i32)>>,
+    in_chat_search: RefCell<InChatSearchState>,
+    pinned_generation: Cell<u64>,
+    available_reactions_generation: Cell<u64>,
+    forward_generation: Cell<u64>,
+    viewer_generation: Cell<u64>,
+    reaction_generations: RefCell<HashMap<(i64, i32), u64>>,
+    message_change_generations: RefCell<HashMap<(i64, i32), u64>>,
+    reaction_retry: RefCell<Option<(i64, i32, String)>>,
     probe_restored_ui_state: Option<(i32, bool, i32)>,
     smoke_hook_done: Cell<bool>,
     probe_started: Cell<bool>,
     auth_probe_started: Cell<bool>,
     probe_answer: Cell<Option<usize>>,
+    probe_media_launches: Cell<u64>,
 }
 
 impl Shell {
@@ -214,6 +237,8 @@ impl Shell {
         let effects = Effects::new(settings.clone());
         let chatlist = ChatList::new(effects.clone(), tg.clone());
         let messages = MessagesView::new(effects.clone());
+        let forward = ForwardDialog::new();
+        let viewer = Viewer::new();
         let switcher = Switcher::new();
         let last_applied_settings = settings.get();
         let settings_view = SettingsView::new(settings.clone(), effects.clone());
@@ -264,6 +289,8 @@ impl Shell {
         // overlay, so atmosphere/launch layers can never paint over Ctrl+K.
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&stack));
+        overlay.add_overlay(&viewer.widget);
+        overlay.add_overlay(&forward.widget);
         overlay.set_hexpand(true);
         overlay.set_vexpand(true);
         let shell_overlay = gtk::Overlay::new();
@@ -289,6 +316,8 @@ impl Shell {
             auth,
             chatlist,
             messages,
+            forward,
+            viewer,
             paned,
             effects,
             overlay,
@@ -349,11 +378,20 @@ impl Shell {
             manual_unread_hold: RefCell::new(HashSet::new()),
             read_outbox: RefCell::new(HashMap::new()),
             quote_requests: RefCell::new(HashSet::new()),
+            in_chat_search: RefCell::new(InChatSearchState::default()),
+            pinned_generation: Cell::new(0),
+            available_reactions_generation: Cell::new(0),
+            forward_generation: Cell::new(0),
+            viewer_generation: Cell::new(0),
+            reaction_generations: RefCell::new(HashMap::new()),
+            message_change_generations: RefCell::new(HashMap::new()),
+            reaction_retry: RefCell::new(None),
             probe_restored_ui_state,
             smoke_hook_done: Cell::new(false),
             probe_started: Cell::new(false),
             auth_probe_started: Cell::new(false),
             probe_answer: Cell::new(None),
+            probe_media_launches: Cell::new(0),
         });
         ShellInner::wire(&inner, dialogs_retry);
         Shell { widget, inner }
@@ -476,6 +514,22 @@ impl ShellInner {
         }
         {
             let weak = Rc::downgrade(this);
+            this.forward.set_action(Rc::new(move |action| {
+                if let Some(this) = weak.upgrade() {
+                    this.handle_forward_action(action);
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.viewer.set_action(Rc::new(move |action| {
+                if let Some(this) = weak.upgrade() {
+                    this.handle_viewer_action(action);
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
             dialogs_retry.connect_clicked(move |_| {
                 if let Some(this) = weak.upgrade() {
                     this.load_dialogs();
@@ -531,14 +585,18 @@ impl ShellInner {
                     return;
                 }
                 match action {
-                    "switcher" => this.switcher.open(this.chatlist.ordered()),
+                    "switcher" => this.open_switcher(),
                     "settings" => this.toggle_settings(),
                     "next_chat" => this.chatlist.select_next(),
                     "prev_chat" => this.chatlist.select_prev(),
-                    // TODO(5A/5C/5D): swap these no-op targets for the shell
-                    // methods introduced by the later layout/function packages.
-                    "search" | "search_in_chat" | "chat_info" | "toggle_sidebar"
-                    | "jump_to_date" | "reply_last" | "saved" | "contacts" => {}
+                    "search" => this.focus_search(),
+                    "search_in_chat" => this.open_in_chat_search(),
+                    "toggle_sidebar" => this.toggle_sidebar(),
+                    "reply_last" => this.reply_last(),
+                    "saved" => this.clone().open_saved_messages(),
+                    // Package 5D fills these two surfaces.
+                    "chat_info" | "contacts" => {}
+                    "jump_to_date" => this.messages.open_jump_calendar(),
                     _ => {}
                 }
             })
@@ -567,8 +625,16 @@ impl ShellInner {
                     return glib::Propagation::Proceed;
                 };
                 if key == gdk::Key::Escape {
-                    if this.switcher.is_open() {
+                    if this.viewer.is_open() {
+                        this.close_viewer();
+                    } else if this.forward.is_open() {
+                        this.close_forward();
+                    } else if this.messages.search_is_open() {
+                        this.close_in_chat_search();
+                    } else if this.switcher.is_open() {
+                        this.clear_window_focus();
                         this.switcher.close();
+                        this.messages.focus_composer();
                     } else if this.settings_open() {
                         this.close_settings();
                     } else if !this.messages.cancel_mode() {
@@ -621,6 +687,7 @@ impl ShellInner {
     fn handle_auth_state(self: &Rc<Self>, state: AuthState) {
         match state {
             AuthState::NeedCredentials => {
+                self.clear_window_focus();
                 self.stack.set_visible_child_name("auth");
                 self.auth.show_credentials();
                 if self.probe {
@@ -628,6 +695,7 @@ impl ShellInner {
                 }
             }
             AuthState::NeedPhone | AuthState::NeedCode | AuthState::NeedPassword => {
+                self.clear_window_focus();
                 self.stack.set_visible_child_name("auth");
                 self.auth.show_step(state);
                 if self.probe && state == AuthState::NeedPhone {
@@ -643,6 +711,7 @@ impl ShellInner {
             return;
         }
         let first_ready = !self.started.replace(true);
+        self.clear_window_focus();
         self.stack.set_visible_child_name("main");
         self.install_window_hook();
         self.install_sidebar_layout();
@@ -660,6 +729,7 @@ impl ShellInner {
         self.load_dialogs();
         self.load_folders();
         self.load_me();
+        self.load_available_reactions();
         if first_ready {
             self.start_probe();
         }
@@ -671,9 +741,20 @@ impl ShellInner {
         if !self.session_ready.replace(false) {
             return;
         }
+        self.close_forward();
+        self.close_viewer();
+        if self.messages.search_is_open() {
+            self.close_in_chat_search();
+        }
         self.settings_view.begin_logout();
         self.switcher.close();
         self.main_menu.dismiss();
+        // Whatever entry holds keyboard focus (search bars, composer) is
+        // about to be unmapped with the main view; drop focus first so GTK
+        // delivers its focus-out instead of warning at teardown.
+        if let Some(window) = self.window() {
+            gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+        }
         self.messages.set_busy(true);
         self.widget.set_sensitive(false);
         for (_, source) in self.draft_timeouts.borrow_mut().drain() {
@@ -710,6 +791,7 @@ impl ShellInner {
                     self.open_chat.set(None);
                     self.dialogs_loaded.set(false);
                     self.messages.clear_selection(epoch);
+                    self.clear_window_focus();
                     self.stack.set_visible_child_name("auth");
                     self.auth.show_step(AuthState::NeedPhone);
                 }
@@ -751,6 +833,11 @@ impl ShellInner {
             _ => false,
         };
         if disabled_open {
+            self.close_forward();
+            self.close_viewer();
+            if self.messages.search_is_open() {
+                self.close_in_chat_search();
+            }
             let epoch = self.bump_epoch();
             self.open_chat.set(None);
             self.messages.clear_selection(epoch);
@@ -883,15 +970,31 @@ impl ShellInner {
         if self.settings_open() {
             self.close_settings();
         } else {
+            self.close_forward();
+            self.close_viewer();
+            self.close_in_chat_search();
+            self.clear_window_focus();
+            self.switcher.close();
             self.stack.set_visible_child_name("settings");
         }
     }
 
+    fn open_switcher(&self) {
+        self.close_forward();
+        self.close_viewer();
+        self.close_in_chat_search();
+        self.close_settings();
+        self.switcher.open(self.chatlist.ordered());
+    }
+
     fn close_settings(&self) {
-        self.settings_view.dismiss_transients();
         if self.settings_open() {
+            self.clear_window_focus();
+            self.settings_view.dismiss_transients();
             self.stack.set_visible_child_name("main");
             self.messages.focus_composer();
+        } else {
+            self.settings_view.dismiss_transients();
         }
     }
 
@@ -1051,6 +1154,31 @@ impl ShellInner {
             match result {
                 Ok(me) => *this.me.borrow_mut() = Some(me),
                 Err(error) => eprintln!("get_me: {error}"),
+            }
+        });
+    }
+
+    fn load_available_reactions(self: &Rc<Self>) {
+        let generation = self.available_reactions_generation.get().wrapping_add(1);
+        self.available_reactions_generation.set(generation);
+        self.messages.begin_available_reactions();
+        let session_epoch = self.session_epoch.get();
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_available_reactions().await;
+            let Some(this) = weak.upgrade().filter(|this| {
+                this.is_session_current(session_epoch)
+                    && this.available_reactions_generation.get() == generation
+            }) else {
+                return;
+            };
+            match result {
+                Ok(reactions) => this.messages.set_available_reactions(reactions),
+                Err(error) => {
+                    shell_log!("get_available_reactions: {error}");
+                    this.messages.fail_available_reactions(error);
+                }
             }
         });
     }
@@ -1261,10 +1389,13 @@ impl ShellInner {
             self.open_chat(chat_id);
             return;
         }
-        if matches!(
-            action,
-            ChatAction::Search | ChatAction::Info | ChatAction::JumpToDate
-        ) {
+        if matches!(action, ChatAction::Search) {
+            if self.open_chat.get() == Some(chat_id) {
+                self.open_in_chat_search();
+            }
+            return;
+        }
+        if matches!(action, ChatAction::Info | ChatAction::JumpToDate) {
             return;
         }
         if matches!(action, ChatAction::ClearHistory | ChatAction::Delete) {
@@ -1376,6 +1507,9 @@ impl ShellInner {
                     self.bump_dialogs_revision();
                     self.chatlist.remove_chat(chat_id);
                     if self.is_current(chat_id, view_epoch) {
+                        self.close_forward();
+                        self.close_viewer();
+                        self.close_in_chat_search();
                         self.open_chat.set(None);
                         let epoch = self.bump_epoch();
                         self.messages.clear_selection(epoch);
@@ -1786,6 +1920,43 @@ impl ShellInner {
                 glib::ControlFlow::Break
             });
         }
+        if let Some(msg_id) = std::env::var("OMG_SMOKE_FORWARD")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+        {
+            let weak = Rc::downgrade(self);
+            glib::MainContext::default().spawn_local(async move {
+                let ready = poll_until(8_000, || {
+                    weak.upgrade()
+                        .is_some_and(|this| this.messages.contains(msg_id))
+                })
+                .await;
+                if ready {
+                    if let Some(this) = weak.upgrade() {
+                        this.open_forward(vec![msg_id]);
+                    }
+                }
+            });
+        }
+        if let Some(msg_id) = std::env::var("OMG_SMOKE_VIEWER")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+        {
+            let weak = Rc::downgrade(self);
+            glib::MainContext::default().spawn_local(async move {
+                let ready = poll_until(8_000, || {
+                    weak.upgrade().is_some_and(|this| {
+                        matches!(this.messages.media_state(msg_id), Some(MediaState::Done(_)))
+                    })
+                })
+                .await;
+                if ready {
+                    if let Some(this) = weak.upgrade() {
+                        this.open_viewer(msg_id);
+                    }
+                }
+            });
+        }
     }
 
     fn install_window_hook(self: &Rc<Self>) {
@@ -1893,11 +2064,24 @@ impl ShellInner {
                 self.bump_dialogs_revision();
                 self.schedule_dialogs_reload();
             }
-            // Package 5C owns the pinned-message bar. Consuming the event here
-            // keeps the event match exhaustive without starting that fill.
-            Event::PinnedChanged { .. } => {}
+            Event::PinnedChanged { chat_id } => {
+                if self.open_chat.get() == Some(chat_id) {
+                    self.load_pinned(chat_id);
+                }
+            }
             Event::NewMessage(message) => self.handle_new_message(message),
             Event::MessageChanged(message) => {
+                let message_key = (message.chat_id, message.id);
+                let change = self
+                    .message_change_generations
+                    .borrow()
+                    .get(&message_key)
+                    .copied()
+                    .unwrap_or(0)
+                    .wrapping_add(1);
+                self.message_change_generations
+                    .borrow_mut()
+                    .insert(message_key, change);
                 let message = self.apply_tombstone(message);
                 if self.open_chat.get() == Some(message.chat_id) {
                     let was_last = self.messages.is_last(message.id);
@@ -1916,6 +2100,10 @@ impl ShellInner {
                 }
             }
             Event::MessageDeleted { chat_id, msg_ids } => {
+                let viewer_closed = self.viewer.remove_deleted(chat_id, &msg_ids);
+                if viewer_closed {
+                    self.close_viewer();
+                }
                 let is_open = self.open_chat.get() == Some(chat_id);
                 let anti_delete = self.settings.get().anti_delete;
                 let tracked_last = self
@@ -2108,6 +2296,11 @@ impl ShellInner {
         // A chat activation owns the main view even when it re-opens the
         // already-selected chat; dismiss settings capture and modal windows.
         self.close_settings();
+        self.switcher.close();
+        self.close_forward();
+        self.close_viewer();
+        self.close_in_chat_search();
+        self.reaction_retry.borrow_mut().take();
         if self.open_chat.get() == Some(chat_id) {
             return;
         }
@@ -2145,6 +2338,7 @@ impl ShellInner {
         }
         self.restore_draft(chat_id);
         self.load_chat_info(chat_id, epoch);
+        self.load_pinned(chat_id);
         let recent = self
             .recent_incoming
             .borrow()
@@ -2186,6 +2380,7 @@ impl ShellInner {
         self.messages
             .reset_chat(chat_id, virtual_title(chat_id), epoch);
         self.messages.set_virtual_header(chat_id, &self.tg);
+        self.messages.set_pinned_message(None);
         let (messages, mono_ids) = {
             let stores = self.virtual_stores.borrow();
             let Some(store) = stores.get(&chat_id) else {
@@ -2209,6 +2404,11 @@ impl ShellInner {
         if self.open_chat.get() != Some(chat_id) {
             return;
         }
+        self.close_forward();
+        self.close_viewer();
+        if self.messages.search_is_open() {
+            self.close_in_chat_search();
+        }
         if is_virtual(chat_id) {
             self.open_chat.set(None);
             self.open_virtual_chat(chat_id);
@@ -2228,6 +2428,7 @@ impl ShellInner {
             self.messages.set_read_outbox(known);
         }
         self.restore_draft(chat_id);
+        self.load_pinned(chat_id);
         self.start_initial_load(chat_id, epoch);
     }
 
@@ -2322,6 +2523,21 @@ impl ShellInner {
                     self.flush_draft(chat_id);
                 }
             }
+            MessageAction::RetryReaction => {
+                let retry = self.reaction_retry.borrow_mut().take();
+                if let Some((chat_id, msg_id, emoji)) = retry {
+                    if self.open_chat.get() == Some(chat_id) {
+                        self.send_reaction(msg_id, emoji);
+                    }
+                }
+            }
+            MessageAction::RetryAvailableReactions => self.load_available_reactions(),
+            MessageAction::SearchChanged(query) => self.search_in_chat(query, None),
+            MessageAction::SearchPrevious => self.move_search_result(-1),
+            MessageAction::SearchNext => self.move_search_result(1),
+            MessageAction::SearchOlder => self.load_older_search_results(),
+            MessageAction::SearchRetry => self.retry_in_chat_search(),
+            MessageAction::SearchClose => self.close_in_chat_search(),
             MessageAction::Header(action) => {
                 if let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
                     self.handle_chat_action(chat_id, action);
@@ -2347,6 +2563,23 @@ impl ShellInner {
             }
             MessageAction::Edit(msg_id) => self.messages.begin_edit(msg_id),
             MessageAction::EditHistory(msg_id) => self.open_edit_history(msg_id),
+            MessageAction::Forward(msg_id) => self.open_forward(vec![msg_id]),
+            MessageAction::Reaction { msg_id, emoji } => {
+                if let Some(emoji) = emoji {
+                    self.send_reaction(msg_id, emoji);
+                }
+            }
+            MessageAction::RevealSpoiler { msg_id, start, end } => {
+                self.messages.reveal_spoiler(msg_id, start, end);
+            }
+            MessageAction::OpenLink(url) => self.open_link(&url),
+            MessageAction::OpenMention(user_id) => self.open_mention(user_id),
+            MessageAction::UnpinMessage(msg_id) => self.unpin_message(msg_id),
+            MessageAction::RetryPinned => {
+                if let Some(chat_id) = self.open_chat.get() {
+                    self.load_pinned(chat_id);
+                }
+            }
             MessageAction::Delete(msg_id) => self.delete_message(msg_id),
             MessageAction::Media(msg_id) => self.media_action(msg_id),
             MessageAction::Paginate => self.paginate(),
@@ -2378,6 +2611,640 @@ impl ShellInner {
             MessageAction::Summarize(msg_id) => self.summarize_message(msg_id),
             MessageAction::Transcribe(msg_id) => self.request_transcription(msg_id),
         }
+    }
+
+    fn open_in_chat_search(self: &Rc<Self>) {
+        if self.open_chat.get().is_none_or(is_virtual) {
+            return;
+        }
+        self.close_forward();
+        self.close_viewer();
+        self.switcher.close();
+        self.close_settings();
+        self.messages.open_search();
+    }
+
+    fn close_in_chat_search(&self) {
+        let generation = self.in_chat_search.borrow().generation.wrapping_add(1);
+        *self.in_chat_search.borrow_mut() = InChatSearchState {
+            generation,
+            ..InChatSearchState::default()
+        };
+        self.messages.close_search();
+    }
+
+    fn search_in_chat(self: Rc<Self>, query: String, before_id: Option<i32>) {
+        let Some(chat_id) = self.open_chat.get().filter(|chat_id| !is_virtual(*chat_id)) else {
+            return;
+        };
+        let query = query.trim().to_string();
+        let (generation, prior_hits) = {
+            let mut state = self.in_chat_search.borrow_mut();
+            state.generation = state.generation.wrapping_add(1);
+            state.query = query.clone();
+            state.in_flight = query.chars().count() >= 3;
+            state.retry_before = before_id;
+            if before_id.is_none() {
+                if query.chars().count() < 3 {
+                    state.hits.clear();
+                }
+                state.index = None;
+                state.exhausted = false;
+            }
+            (state.generation, state.hits.clone())
+        };
+        if query.chars().count() < 3 {
+            self.messages.set_search_results(&[], None, false);
+            return;
+        }
+        self.messages.set_search_loading(true);
+        let session_epoch = self.session_epoch.get();
+        glib::MainContext::default().spawn_local(async move {
+            let result = self.tg.search_messages(chat_id, &query, before_id).await;
+            if !self.is_session_current(session_epoch)
+                || self.open_chat.get() != Some(chat_id)
+                || !self.messages.search_is_open()
+                || self.in_chat_search.borrow().generation != generation
+            {
+                return;
+            }
+            match result {
+                Ok(page) => {
+                    let mut state = self.in_chat_search.borrow_mut();
+                    state.in_flight = false;
+                    state.exhausted = page.len() < 50;
+                    if before_id.is_none() {
+                        state.hits = page;
+                    } else {
+                        let mut known = state
+                            .hits
+                            .iter()
+                            .map(|message| message.id)
+                            .collect::<HashSet<_>>();
+                        state
+                            .hits
+                            .extend(page.into_iter().filter(|message| known.insert(message.id)));
+                    }
+                    if state.index.is_none() && !state.hits.is_empty() {
+                        state.index = Some(0);
+                    }
+                    state.retry_before = None;
+                    drop(state);
+                    self.refresh_in_chat_search();
+                    self.jump_to_active_search_result();
+                }
+                Err(error) => {
+                    self.in_chat_search.borrow_mut().in_flight = false;
+                    shell_log!("search_messages({chat_id}): {error}");
+                    self.messages.fail_search(&error, !prior_hits.is_empty());
+                }
+            }
+        });
+    }
+
+    fn refresh_in_chat_search(&self) {
+        let state = self.in_chat_search.borrow();
+        let ids = state
+            .hits
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        self.messages
+            .set_search_results(&ids, state.index, !state.exhausted && !state.in_flight);
+    }
+
+    fn move_search_result(self: Rc<Self>, delta: isize) {
+        {
+            let mut state = self.in_chat_search.borrow_mut();
+            let Some(index) = state.index else { return };
+            let next = index as isize + delta;
+            if next < 0 || next >= state.hits.len() as isize {
+                return;
+            }
+            state.index = Some(next as usize);
+        }
+        self.refresh_in_chat_search();
+        self.jump_to_active_search_result();
+    }
+
+    fn load_older_search_results(self: Rc<Self>) {
+        let (query, before) = {
+            let state = self.in_chat_search.borrow();
+            if state.in_flight || state.exhausted {
+                return;
+            }
+            (
+                state.query.clone(),
+                state.hits.iter().map(|message| message.id).min(),
+            )
+        };
+        if let Some(before) = before {
+            self.search_in_chat(query, Some(before));
+        }
+    }
+
+    fn retry_in_chat_search(self: Rc<Self>) {
+        let (query, before) = {
+            let state = self.in_chat_search.borrow();
+            (state.query.clone(), state.retry_before)
+        };
+        self.search_in_chat(query, before);
+    }
+
+    fn jump_to_active_search_result(self: &Rc<Self>) {
+        let (hit, generation) = {
+            let state = self.in_chat_search.borrow();
+            (
+                state.index.and_then(|index| state.hits.get(index)).cloned(),
+                state.generation,
+            )
+        };
+        let Some(hit) = hit else { return };
+        if self.messages.scroll_to_search_result(hit.id) {
+            return;
+        }
+        if self.messages.contains(hit.id) {
+            self.scroll_search_result_next_tick(hit.id, generation);
+            return;
+        }
+        let chat_id = hit.chat_id;
+        let session_epoch = self.session_epoch.get();
+        self.close_forward();
+        self.close_viewer();
+        let this = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            // A17 order matters: anchor around the search hit's timestamp
+            // first, then fetch the exact id so a sparse date page cannot omit
+            // the active result.
+            let surrounding = this.tg.get_history_at_date(chat_id, hit.ts).await;
+            if !this.is_session_current(session_epoch)
+                || this.open_chat.get() != Some(chat_id)
+                || this.in_chat_search.borrow().generation != generation
+                || !this.messages.search_is_open()
+            {
+                return;
+            }
+            let mut messages = match surrounding {
+                Ok(messages) => messages,
+                Err(error) => {
+                    this.messages.fail_search(&error, true);
+                    return;
+                }
+            };
+            let ensured = this.tg.get_messages(chat_id, vec![hit.id]).await;
+            if !this.is_session_current(session_epoch)
+                || this.open_chat.get() != Some(chat_id)
+                || this.in_chat_search.borrow().generation != generation
+                || !this.messages.search_is_open()
+            {
+                return;
+            }
+            let ensure = match ensured {
+                Ok(messages) => messages.into_iter().find(|message| message.id == hit.id),
+                Err(error) => {
+                    this.messages.fail_search(&error, true);
+                    return;
+                }
+            };
+            let Some(ensure) = ensure else {
+                this.messages
+                    .fail_search("Message is no longer available", true);
+                return;
+            };
+            if !messages.iter().any(|message| message.id == ensure.id) {
+                messages.push(ensure);
+            }
+            this.apply_tombstones(chat_id, &mut messages);
+            let epoch = this.bump_epoch();
+            this.messages.reset_history(chat_id, epoch);
+            let inserted = this.messages.finish_initial(messages);
+            this.post_render(inserted);
+            this.messages.set_detached(true);
+            this.refresh_in_chat_search();
+            if !this.messages.scroll_to_search_result(hit.id) {
+                this.scroll_search_result_next_tick(hit.id, generation);
+            }
+        });
+    }
+
+    fn scroll_search_result_next_tick(self: &Rc<Self>, msg_id: i32, generation: u64) {
+        let weak = Rc::downgrade(self);
+        self.messages.widget.add_tick_callback(move |_, _| {
+            if let Some(this) = weak.upgrade().filter(|this| {
+                this.messages.search_is_open()
+                    && this.in_chat_search.borrow().generation == generation
+            }) {
+                this.messages.scroll_to_search_result(msg_id);
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn load_pinned(self: &Rc<Self>, chat_id: i64) {
+        let generation = self.pinned_generation.get().wrapping_add(1);
+        self.pinned_generation.set(generation);
+        self.messages.begin_pinned();
+        let session_epoch = self.session_epoch.get();
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_pinned_message(chat_id).await;
+            let Some(this) = weak.upgrade().filter(|this| {
+                this.is_session_current(session_epoch)
+                    && this.open_chat.get() == Some(chat_id)
+                    && this.pinned_generation.get() == generation
+            }) else {
+                return;
+            };
+            match result {
+                Ok(message) => this.messages.set_pinned_message(message),
+                Err(error) => this.messages.fail_pinned(&error),
+            }
+        });
+    }
+
+    fn unpin_message(self: Rc<Self>, msg_id: i32) {
+        let Some(chat_id) = self.open_chat.get() else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        let Some(session_epoch) = self.begin_mutation() else {
+            return;
+        };
+        glib::MainContext::default().spawn_local(async move {
+            let result = self.tg.pin_message(chat_id, msg_id, false).await;
+            self.finish_mutation();
+            if !self.is_session_current(session_epoch) || !self.is_current(chat_id, epoch) {
+                return;
+            }
+            match result {
+                Ok(()) => self.messages.set_pinned_message(None),
+                Err(error) => self.messages.show_error(&error),
+            }
+        });
+    }
+
+    fn send_reaction(self: Rc<Self>, msg_id: i32, emoji: String) {
+        let Some(chat_id) = self.open_chat.get() else {
+            return;
+        };
+        let Some(before) = self.messages.message(msg_id) else {
+            return;
+        };
+        if before.deleted {
+            return;
+        }
+        let target = if before
+            .reactions
+            .iter()
+            .any(|reaction| reaction.chosen && reaction.emoji == emoji)
+        {
+            None
+        } else {
+            Some(emoji.clone())
+        };
+        let message_key = (chat_id, msg_id);
+        let generation = self
+            .reaction_generations
+            .borrow()
+            .get(&message_key)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        self.reaction_generations
+            .borrow_mut()
+            .insert(message_key, generation);
+        let change_generation = self
+            .message_change_generations
+            .borrow()
+            .get(&message_key)
+            .copied()
+            .unwrap_or(0);
+        let Some(session_epoch) = self.begin_mutation() else {
+            return;
+        };
+        if !self.messages.optimistic_reaction(msg_id, &emoji) {
+            self.finish_mutation();
+            return;
+        }
+        let epoch = self.epoch.get();
+        glib::MainContext::default().spawn_local(async move {
+            let result = self.tg.send_reaction(chat_id, msg_id, target).await;
+            self.finish_mutation();
+            if !self.is_session_current(session_epoch) {
+                return;
+            }
+            match result {
+                Ok(()) => {
+                    let latest_mutation = self
+                        .reaction_generations
+                        .borrow()
+                        .get(&message_key)
+                        .copied()
+                        == Some(generation);
+                    if latest_mutation {
+                        self.reaction_retry.borrow_mut().take();
+                        self.messages.clear_reaction_error();
+                    }
+                }
+                Err(error) => {
+                    let latest_mutation = self
+                        .reaction_generations
+                        .borrow()
+                        .get(&message_key)
+                        .copied()
+                        == Some(generation);
+                    let unchanged = self
+                        .message_change_generations
+                        .borrow()
+                        .get(&message_key)
+                        .copied()
+                        .unwrap_or(0)
+                        == change_generation;
+                    if latest_mutation && unchanged && self.is_current(chat_id, epoch) {
+                        self.messages.merge_event(before);
+                    }
+                    if latest_mutation && self.is_current(chat_id, epoch) {
+                        *self.reaction_retry.borrow_mut() = Some((chat_id, msg_id, emoji));
+                        self.messages.show_reaction_error(&error);
+                    }
+                }
+            }
+        });
+    }
+
+    fn open_link(&self, url: &str) {
+        if !super::markup::is_allowed_link(url) {
+            self.messages.show_error("Blocked unsafe link");
+            return;
+        }
+        if let Some(window) = self.window() {
+            let launcher = gtk::UriLauncher::new(url);
+            let messages = self.messages.clone();
+            glib::MainContext::default().spawn_local(async move {
+                if let Err(error) = launcher.launch_future(Some(&window)).await {
+                    messages.show_error(error.message());
+                }
+            });
+        }
+    }
+
+    fn open_mention(self: Rc<Self>, user_id: i64) {
+        let session_epoch = self.session_epoch.get();
+        glib::MainContext::default().spawn_local(async move {
+            match self.tg.open_user(user_id).await {
+                Ok(summary) if self.is_session_current(session_epoch) => {
+                    let chat_id = summary.id;
+                    self.chatlist.set_summary(summary);
+                    self.open_chat(chat_id);
+                }
+                Err(error) if self.is_session_current(session_epoch) => {
+                    self.messages.show_error(&error)
+                }
+                _ => {}
+            }
+        });
+    }
+
+    fn reply_last(&self) {
+        if let Some(message) = self
+            .messages
+            .messages()
+            .into_iter()
+            .rev()
+            .find(|message| !message.deleted)
+        {
+            self.messages.begin_reply(message.id);
+        }
+    }
+
+    fn open_forward(self: &Rc<Self>, ids: Vec<i32>) {
+        let Some(source_chat) = self.open_chat.get().filter(|chat_id| !is_virtual(*chat_id)) else {
+            return;
+        };
+        let ids = self
+            .messages
+            .messages()
+            .into_iter()
+            .filter(|message| ids.contains(&message.id) && !message.deleted)
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        self.close_viewer();
+        self.switcher.close();
+        self.close_settings();
+        self.close_forward();
+        let generation = self.forward_generation.get().wrapping_add(1);
+        self.forward_generation.set(generation);
+        self.forward.present(
+            source_chat,
+            ids,
+            self.chatlist.ordered_summaries(),
+            generation,
+        );
+    }
+
+    fn close_forward(&self) {
+        if !self.forward.is_open() {
+            return;
+        }
+        let source = self.forward.source_ids().first().copied();
+        self.forward_generation
+            .set(self.forward_generation.get().wrapping_add(1));
+        if let Some(source) = source {
+            self.messages.focus_message_or_composer(source);
+        } else {
+            self.messages.focus_composer();
+        }
+        self.forward.close();
+    }
+
+    fn handle_forward_action(self: Rc<Self>, action: ForwardAction) {
+        match action {
+            ForwardAction::Close => self.close_forward(),
+            ForwardAction::Submit(request) => self.forward_messages(request),
+        }
+    }
+
+    fn forward_messages(self: Rc<Self>, request: ForwardRequest) {
+        if request.generation != self.forward_generation.get() || !self.forward.is_open() {
+            return;
+        }
+        let Some(session_epoch) = self.begin_mutation() else {
+            return;
+        };
+        self.forward.set_busy(request.generation, true);
+        glib::MainContext::default().spawn_local(async move {
+            let total = request.targets.len();
+            let mut successes = Vec::new();
+            let mut failures = Vec::new();
+            let mut last_error = None;
+            for target in &request.targets {
+                match self
+                    .tg
+                    .forward_messages(request.source_chat, request.ids.clone(), *target)
+                    .await
+                {
+                    Ok(messages) => successes.push((*target, messages)),
+                    Err(error) => {
+                        failures.push(*target);
+                        last_error = Some(error);
+                    }
+                }
+            }
+            self.finish_mutation();
+            if !self.is_session_current(session_epoch)
+                || request.generation != self.forward_generation.get()
+                || !self.forward.is_open()
+            {
+                return;
+            }
+            let succeeded = successes.len();
+            if successes.is_empty() {
+                self.forward.show_result(
+                    request.generation,
+                    0,
+                    total,
+                    &failures,
+                    last_error.as_deref(),
+                );
+                return;
+            }
+            let last_target = successes.last().map(|(target, _)| *target);
+            if !failures.is_empty() {
+                self.forward.show_result(
+                    request.generation,
+                    succeeded,
+                    total,
+                    &failures,
+                    last_error.as_deref(),
+                );
+                // Keep the dialog-owned partial result visible before moving
+                // to the last successful destination.
+                glib::timeout_future(Duration::from_millis(900)).await;
+                if request.generation != self.forward_generation.get() || !self.forward.is_open() {
+                    return;
+                }
+            }
+            self.close_forward();
+            if let Some(last_target) = last_target {
+                self.clone().open_chat(last_target);
+            }
+        });
+    }
+
+    fn open_viewer(self: &Rc<Self>, msg_id: i32) {
+        let Some(chat_id) = self.open_chat.get() else {
+            return;
+        };
+        let photos = self.messages.photo_messages();
+        let path = self.messages.media_path(msg_id);
+        if self.messages.search_is_open() {
+            self.close_in_chat_search();
+        }
+        self.close_forward();
+        self.switcher.close();
+        self.close_settings();
+        self.close_viewer();
+        let generation = self.viewer_generation.get().wrapping_add(1);
+        self.viewer_generation.set(generation);
+        if self
+            .viewer
+            .present(chat_id, photos, msg_id, path, generation)
+        {
+            self.clone().load_viewer_media(msg_id, generation);
+        }
+    }
+
+    fn close_viewer(&self) {
+        if !self.viewer.is_open() {
+            return;
+        }
+        let source = self.viewer.source_id();
+        self.viewer_generation
+            .set(self.viewer_generation.get().wrapping_add(1));
+        if let Some(source) = source {
+            self.messages.focus_message_or_composer(source);
+        } else {
+            self.messages.focus_composer();
+        }
+        self.viewer.close();
+    }
+
+    fn handle_viewer_action(self: Rc<Self>, action: ViewerAction) {
+        match action {
+            ViewerAction::Load { msg_id, generation } => self.load_viewer_media(msg_id, generation),
+            ViewerAction::Open { msg_id, generation } => {
+                if self.viewer_generation.get() == generation {
+                    if let Some(path) = self.messages.media_path(msg_id) {
+                        self.launch_media(&path);
+                    }
+                }
+            }
+            ViewerAction::Save { msg_id, generation } => self.save_viewer_media(msg_id, generation),
+            ViewerAction::Close { source_id: _ } => self.close_viewer(),
+        }
+    }
+
+    fn load_viewer_media(self: Rc<Self>, msg_id: i32, generation: u64) {
+        if self.viewer_generation.get() != generation || !self.viewer.is_open() {
+            return;
+        }
+        if let Some(path) = self.messages.media_path(msg_id) {
+            self.viewer.set_path(msg_id, generation, path);
+            return;
+        }
+        let weak = Rc::downgrade(&self);
+        self.messages.on_media_ready(msg_id, move |path| {
+            if let Some(this) = weak
+                .upgrade()
+                .filter(|this| this.viewer_generation.get() == generation && this.viewer.is_open())
+            {
+                this.viewer.set_path(msg_id, generation, path);
+            }
+        });
+        if matches!(
+            self.messages.media_state(msg_id),
+            Some(MediaState::NotStarted | MediaState::Failed)
+        ) {
+            self.start_media_download(msg_id, false);
+        }
+    }
+
+    fn save_viewer_media(self: Rc<Self>, msg_id: i32, generation: u64) {
+        if self.viewer_generation.get() != generation {
+            return;
+        }
+        let Some(source_path) = self.messages.media_path(msg_id) else {
+            return;
+        };
+        let Some(window) = self.window() else { return };
+        let dialog = gtk::FileDialog::new();
+        if let Some(name) = source_path.file_name().and_then(|name| name.to_str()) {
+            dialog.set_initial_name(Some(name));
+        }
+        if let Some(pictures) = dirs::picture_dir() {
+            dialog.set_initial_folder(Some(&gio::File::for_path(pictures)));
+        }
+        glib::MainContext::default().spawn_local(async move {
+            let Ok(destination) = dialog.save_future(Some(&window)).await else {
+                return;
+            };
+            if self.viewer_generation.get() != generation || !self.viewer.is_open() {
+                return;
+            }
+            let source = gio::File::for_path(source_path);
+            let (copy, _progress) = source.copy_future(
+                &destination,
+                gio::FileCopyFlags::OVERWRITE,
+                glib::Priority::DEFAULT,
+            );
+            if let Err(error) = copy.await {
+                self.viewer.show_error(msg_id, generation, error.message());
+            }
+        });
     }
 
     fn jump_to_message(self: Rc<Self>, msg_id: i32) {
@@ -2457,6 +3324,8 @@ impl ShellInner {
         if is_virtual(chat_id) {
             return;
         }
+        self.close_forward();
+        self.close_viewer();
         let epoch = self.bump_epoch();
         // History-only reset: same chat, so the composer draft, reply/edit
         // mode, and busy sensitivity are preserved (C5/C13).
@@ -2502,6 +3371,8 @@ impl ShellInner {
         if is_virtual(chat_id) {
             return;
         }
+        self.close_forward();
+        self.close_viewer();
         let epoch = self.bump_epoch();
         // History-only reset: same chat, so the composer draft, reply/edit
         // mode, and busy sensitivity are preserved (C5/C13).
@@ -3506,6 +4377,9 @@ impl ShellInner {
                 _ => {}
             }
         }
+        if self.messages.search_is_open() {
+            self.refresh_in_chat_search();
+        }
     }
 
     fn resolve_missing_quotes(self: &Rc<Self>) {
@@ -3718,6 +4592,34 @@ impl ShellInner {
     }
 
     fn media_action(self: Rc<Self>, msg_id: i32) {
+        if self.messages.media_kind(msg_id) == Some(MediaKind::Photo) {
+            match self.messages.media_state(msg_id) {
+                Some(MediaState::Done(_)) => self.open_viewer(msg_id),
+                Some(MediaState::NotStarted | MediaState::Failed) => {
+                    let epoch = self.epoch.get();
+                    let weak = Rc::downgrade(&self);
+                    self.messages.on_media_ready(msg_id, move |_| {
+                        if let Some(this) = weak.upgrade().filter(|this| this.epoch.get() == epoch)
+                        {
+                            this.open_viewer(msg_id);
+                        }
+                    });
+                    self.start_media_download(msg_id, false);
+                }
+                Some(MediaState::InFlight) => {
+                    let epoch = self.epoch.get();
+                    let weak = Rc::downgrade(&self);
+                    self.messages.on_media_ready(msg_id, move |_| {
+                        if let Some(this) = weak.upgrade().filter(|this| this.epoch.get() == epoch)
+                        {
+                            this.open_viewer(msg_id);
+                        }
+                    });
+                }
+                None => {}
+            }
+            return;
+        }
         match self.messages.media_state(msg_id) {
             Some(MediaState::Done(path)) => self.launch_media(&path),
             Some(MediaState::NotStarted | MediaState::Failed) => {
@@ -3808,6 +4710,11 @@ impl ShellInner {
     }
 
     fn launch_media(&self, path: &PathBuf) {
+        if self.probe {
+            self.probe_media_launches
+                .set(self.probe_media_launches.get().wrapping_add(1));
+            return;
+        }
         let uri = gio::File::for_path(path).uri();
         if let Err(error) =
             gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>)
@@ -4024,6 +4931,12 @@ impl ShellInner {
             .root()?
             .downcast::<gtk::ApplicationWindow>()
             .ok()
+    }
+
+    fn clear_window_focus(&self) {
+        if let Some(root) = self.widget.root() {
+            root.set_focus(None::<&gtk::Widget>);
+        }
     }
 
     fn window_is_active(&self) -> bool {
@@ -4384,6 +5297,47 @@ impl ShellInner {
             probe_fail("open Marta");
             return;
         }
+        if environment_listed("OMG_MOCK_FAIL_ONCE", "DownloadMedia") {
+            probe_step("media download error retry");
+            if !poll_until(3500, || {
+                matches!(self.messages.media_state(100), Some(MediaState::Failed))
+                    || matches!(self.messages.media_state(103), Some(MediaState::Failed))
+            })
+            .await
+            {
+                probe_fail("media download transient error");
+                return;
+            }
+            let failed_id = if matches!(self.messages.media_state(100), Some(MediaState::Failed)) {
+                100
+            } else {
+                103
+            };
+            if !self
+                .messages
+                .error_text()
+                .contains("mock: transient failure")
+                || !self.messages.media_retryable(failed_id)
+            {
+                probe_fail("media download error shown");
+                return;
+            }
+            self.clone().media_action(failed_id);
+            if !poll_until(3500, || {
+                matches!(
+                    self.messages.media_state(failed_id),
+                    Some(MediaState::Done(_))
+                )
+            })
+            .await
+            {
+                probe_fail("media download retry");
+                return;
+            }
+            if self.viewer.is_open() {
+                self.close_viewer();
+            }
+        }
         if self.messages.has_sender_name() {
             probe_fail("1:1 sender names");
             return;
@@ -4436,6 +5390,532 @@ impl ShellInner {
         }
         self.messages.set_composer_text("");
         self.composer_draft_changed();
+
+        // Package 5C: in-chat search owns a generation independent of the
+        // global sidebar search.  Exercise an abandoned slow request before
+        // the ordinary hit/miss path.
+        self.clone().open_chat(deni_for_draft);
+        if !poll_until(3500, || {
+            self.open_chat.get() == Some(deni_for_draft)
+                && !self.messages.is_loading()
+                && self.messages.contains(203)
+        })
+        .await
+        {
+            probe_fail("open Deni for in-chat search");
+            return;
+        }
+        if environment_listed("OMG_MOCK_SLOW", "SearchMessages") {
+            probe_step("in-chat search stale chat switch");
+            self.open_in_chat_search();
+            self.messages.set_search_text("lockfile");
+            self.clone().open_chat(marta);
+            glib::timeout_future(Duration::from_millis(1800)).await;
+            if self.open_chat.get() != Some(marta)
+                || self.messages.search_is_open()
+                || self.messages.header_title() != "Marta"
+            {
+                probe_fail("in-chat search stale result");
+                return;
+            }
+            self.clone().open_chat(deni_for_draft);
+            if !poll_until(3500, || {
+                self.open_chat.get() == Some(deni_for_draft)
+                    && !self.messages.is_loading()
+                    && self.messages.contains(203)
+            })
+            .await
+            {
+                probe_fail("restore Deni after slow search");
+                return;
+            }
+        }
+
+        self.clone().open_chat(marta);
+        if !poll_until(3500, || {
+            self.open_chat.get() == Some(marta)
+                && !self.messages.is_loading()
+                && self.messages.contains(100)
+                && !self.messages.contains(91)
+        })
+        .await
+        {
+            probe_fail("open Marta for detached search");
+            return;
+        }
+        probe_step("in-chat search detached hit");
+        self.open_in_chat_search();
+        self.messages.set_search_text("scroll-back");
+        if !poll_until(3800, || {
+            (self.messages.search_position_text() == "1 of 1" && self.messages.is_detached())
+                || self.messages.search_retry_visible()
+        })
+        .await
+        {
+            probe_fail("in-chat search detached response");
+            return;
+        }
+        if self.messages.search_retry_visible() {
+            probe_step("in-chat search error retry");
+            if self.messages.search_text() != "scroll-back"
+                || !self
+                    .messages
+                    .search_position_text()
+                    .contains("mock: transient failure")
+            {
+                probe_fail("in-chat search retained input and error");
+                return;
+            }
+            self.messages.trigger_search_retry();
+            if !poll_until(3800, || {
+                self.messages.search_position_text() == "1 of 1" && self.messages.is_detached()
+            })
+            .await
+            {
+                probe_fail("in-chat search retry success");
+                return;
+            }
+        }
+        if !self.messages.contains(91)
+            || !self.messages.row_has_css_class(91, "omg-hit")
+            || !self.messages.row_has_css_class(91, "omg-hit-active")
+        {
+            probe_fail("in-chat search detached highlight");
+            return;
+        }
+        self.messages.trigger_jump_to_latest();
+        probe_step("in-chat search jump to latest");
+        if !poll_until(3800, || {
+            !self.messages.is_detached()
+                && !self.messages.is_loading()
+                && self.messages.contains(100)
+                && !self.messages.contains(91)
+        })
+        .await
+        {
+            probe_fail("in-chat search jump to latest");
+            return;
+        }
+        probe_step("in-chat search no results");
+        self.messages.set_search_text("zzzz");
+        if !poll_until(3800, || {
+            self.messages.search_position_text() == "No results"
+        })
+        .await
+        {
+            probe_fail("in-chat search no results");
+            return;
+        }
+        self.close_in_chat_search();
+        if self.messages.search_is_open() {
+            probe_fail("in-chat search close");
+            return;
+        }
+
+        self.clone().open_chat(deni_for_draft);
+        if !poll_until(3500, || {
+            self.open_chat.get() == Some(deni_for_draft)
+                && !self.messages.is_loading()
+                && self.messages.contains(208)
+        })
+        .await
+        {
+            probe_fail("restore Deni for formatting");
+            return;
+        }
+
+        probe_step("formatting markup");
+        let formatted = self.messages.rendered_markup(206).unwrap_or_default();
+        let preformatted = self.messages.rendered_markup(207).unwrap_or_default();
+        let spoiler = self.messages.rendered_markup(208).unwrap_or_default();
+        if !formatted.contains("<b>")
+            || !formatted.contains("<tt>")
+            || !formatted.contains("<a href=")
+            || !preformatted.contains("<tt>")
+            || !self.messages.message_has_pre_block(207)
+            || !spoiler.contains("alpha=\"1%\"")
+            || spoiler.contains("omg-spoiler:")
+            || !self.messages.message_has_css_class(208, "omg-spoiler")
+        {
+            probe_fail("formatting markup fixtures");
+            return;
+        }
+        probe_step("spoiler click reveal");
+        if !self.messages.probe_click_spoiler(208)
+            || !poll_until(1000, || {
+                self.messages
+                    .rendered_markup(208)
+                    .is_some_and(|markup| !markup.contains("alpha=\"1%\""))
+                    && !self.messages.message_has_css_class(208, "omg-spoiler")
+            })
+            .await
+        {
+            probe_fail("spoiler click reveal");
+            return;
+        }
+
+        self.clone().open_chat(marta);
+        if !poll_until(3500, || {
+            self.open_chat.get() == Some(marta)
+                && !self.messages.is_loading()
+                && self.messages.contains(104)
+        })
+        .await
+        {
+            probe_fail("open Marta for reactions");
+            return;
+        }
+        probe_step("reaction context quick row");
+        if !poll_until(3500, || self.messages.available_reactions_settled()).await {
+            probe_fail("available reactions settled");
+            return;
+        }
+        if !self.messages.probe_choose_quick_reaction(104, "👍") {
+            if !self.messages.probe_retry_available_reactions(104)
+                || !poll_until(3500, || self.messages.available_reactions_settled()).await
+                || !self.messages.probe_choose_quick_reaction(104, "👍")
+            {
+                probe_fail("reaction quick row");
+                return;
+            }
+        }
+        if environment_listed("OMG_MOCK_FAIL_ONCE", "SendReaction") {
+            if !poll_until(3500, || self.messages.reaction_retry_visible()).await {
+                probe_fail("reaction transient error retry");
+                return;
+            }
+            let reverted = self.messages.reaction(104, "👍");
+            if !self
+                .messages
+                .error_text()
+                .contains("mock: transient failure")
+                || !reverted.is_some_and(|reaction| !reaction.chosen && reaction.count == 1)
+            {
+                probe_fail("reaction rollback scope");
+                return;
+            }
+            probe_step("reaction retry");
+            self.messages.trigger_reaction_retry();
+        }
+        if !poll_until(3500, || {
+            self.messages
+                .reaction(104, "👍")
+                .is_some_and(|reaction| reaction.chosen && reaction.count == 2)
+                && !self.messages.reaction_retry_visible()
+        })
+        .await
+        {
+            probe_fail("reaction add result");
+            return;
+        }
+        probe_step("reaction remove");
+        if !self.messages.probe_choose_quick_reaction(104, "👍") {
+            probe_fail("reaction remove quick row");
+            return;
+        }
+        if !poll_until(3500, || {
+            self.messages
+                .reaction(104, "👍")
+                .is_some_and(|reaction| !reaction.chosen && reaction.count == 1)
+        })
+        .await
+        {
+            probe_fail("reaction remove result");
+            return;
+        }
+        probe_step("reaction ellipsis chooser");
+        if !self.messages.probe_open_reaction_chooser(104)
+            || !self.messages.probe_pick_reaction_emoji("❤️")
+            || !poll_until(3500, || {
+                self.messages
+                    .reaction(104, "❤️")
+                    .is_some_and(|reaction| reaction.chosen && reaction.count == 1)
+            })
+            .await
+        {
+            probe_fail("reaction ellipsis chooser");
+            return;
+        }
+
+        // Resetting the history starts fresh image fills, making the slow
+        // viewer/chat-switch race deterministic even when earlier thumbnails
+        // have already completed.
+        if environment_listed("OMG_MOCK_SLOW", "DownloadMedia") {
+            probe_step("viewer download stale chat switch");
+            self.clone().force_reload(marta);
+            if !poll_until(3500, || {
+                !self.messages.is_loading() && self.messages.contains(103)
+            })
+            .await
+            {
+                probe_fail("viewer slow history reload");
+                return;
+            }
+            self.open_viewer(103);
+            if !self.viewer.is_open() {
+                probe_fail("viewer slow open");
+                return;
+            }
+            self.clone().open_chat(deni_for_draft);
+            glib::timeout_future(Duration::from_millis(1900)).await;
+            if self.open_chat.get() != Some(deni_for_draft)
+                || self.messages.header_title() != "Deni"
+                || self.viewer.is_open()
+            {
+                probe_fail("viewer stale completion");
+                return;
+            }
+            self.clone().open_chat(marta);
+            if !poll_until(3500, || {
+                self.open_chat.get() == Some(marta)
+                    && !self.messages.is_loading()
+                    && self.messages.contains(103)
+            })
+            .await
+            {
+                probe_fail("restore Marta after slow viewer");
+                return;
+            }
+        }
+        probe_step("viewer previous next close");
+        if !poll_until(4200, || {
+            matches!(self.messages.media_state(100), Some(MediaState::Done(_)))
+                && matches!(self.messages.media_state(103), Some(MediaState::Done(_)))
+        })
+        .await
+        {
+            probe_fail("viewer photos downloaded");
+            return;
+        }
+        self.open_viewer(103);
+        if !self.viewer.is_open() || self.viewer.current_id() != Some(103) {
+            probe_fail("viewer open");
+            return;
+        }
+        let _ = self.viewer.probe_key(gdk::Key::Left);
+        if self.viewer.current_id() != Some(100) {
+            probe_fail("viewer Left key");
+            return;
+        }
+        let _ = self.viewer.probe_key(gdk::Key::Right);
+        if self.viewer.current_id() != Some(103) {
+            probe_fail("viewer Right key");
+            return;
+        }
+        let _ = self.viewer.probe_key(gdk::Key::Escape);
+        if self.viewer.is_open() || !poll_until(1000, || self.messages.message_has_focus(103)).await
+        {
+            probe_fail("viewer Escape focus return");
+            return;
+        }
+
+        let news = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find_map(|(id, title)| (title == "Omarchy News").then_some(id));
+        let Some(news) = news else {
+            probe_fail("find Omarchy News");
+            return;
+        };
+        self.clone().open_chat(news);
+        probe_step("pinned message jump unpin");
+        if environment_listed("OMG_MOCK_FAIL_ONCE", "GetPinnedMessage") {
+            if !poll_until(3500, || self.messages.pinned_retry_visible()).await {
+                probe_fail("pinned message transient error");
+                return;
+            }
+            self.messages.trigger_pinned_retry();
+        }
+        if !poll_until(3500, || {
+            !self.messages.is_loading()
+                && self.messages.pinned_id() == Some(501)
+                && self.messages.pinned_bar_visible()
+                && self.messages.web_preview_visible(503)
+        })
+        .await
+        {
+            probe_fail("pinned message load");
+            return;
+        }
+        if self.messages.has_sender_name() {
+            probe_fail("channel sender names");
+            return;
+        }
+        self.messages.trigger_pinned();
+        if !poll_until(1000, || self.messages.message_has_focus(501)).await {
+            probe_fail("pinned message jump");
+            return;
+        }
+        self.clone().unpin_message(501);
+        if !poll_until(3500, || self.messages.pinned_id().is_none()).await {
+            probe_fail("pinned message unpin");
+            return;
+        }
+
+        self.clone().open_chat(deni_for_draft);
+        if !poll_until(3500, || {
+            self.open_chat.get() == Some(deni_for_draft)
+                && !self.messages.is_loading()
+                && self.messages.contains(201)
+        })
+        .await
+        {
+            probe_fail("open Deni for forward");
+            return;
+        }
+        if environment_listed("OMG_MOCK_SLOW", "ForwardMessages") {
+            probe_step("forward stale chat switch");
+            self.open_forward(vec![201]);
+            if !self.forward.probe_select("Marta") {
+                probe_fail("forward slow select target");
+                return;
+            }
+            self.forward.probe_submit();
+            self.clone().open_chat(news);
+            glib::timeout_future(Duration::from_millis(1800)).await;
+            if self.open_chat.get() != Some(news)
+                || self.forward.is_open()
+                || self.messages.header_title() != "Omarchy News"
+            {
+                probe_fail("forward stale completion");
+                return;
+            }
+            self.clone().open_chat(deni_for_draft);
+            if !poll_until(3500, || {
+                self.open_chat.get() == Some(deni_for_draft)
+                    && !self.messages.is_loading()
+                    && self.messages.contains(201)
+            })
+            .await
+            {
+                probe_fail("restore Deni after slow forward");
+                return;
+            }
+        }
+        probe_step("forward Deni to Marta");
+        self.open_forward(vec![201]);
+        if !self.forward.is_open() || !self.forward.probe_select("Marta") {
+            probe_fail("forward dialog target");
+            return;
+        }
+        self.forward.probe_submit();
+        if environment_listed("OMG_MOCK_FAIL_ONCE", "ForwardMessages") {
+            if !poll_until(3800, || {
+                self.forward.is_open()
+                    && self
+                        .forward
+                        .probe_status()
+                        .contains("mock: transient failure")
+            })
+            .await
+            {
+                probe_fail("forward transient error");
+                return;
+            }
+            probe_step("forward retry");
+            self.forward.probe_submit();
+        }
+        if !poll_until(4200, || {
+            self.open_chat.get() == Some(marta)
+                && !self.messages.is_loading()
+                && self.messages.messages().iter().any(|message| {
+                    message.text == "the build is green again"
+                        && message.forwarded_from.as_deref() == Some("Deni")
+                        && self
+                            .messages
+                            .forwarded_header_text(message.id)
+                            .is_some_and(|header| header.contains("Forwarded from Deni"))
+                })
+        })
+        .await
+        {
+            probe_fail("forward success and header");
+            return;
+        }
+
+        probe_step("video and gif cards");
+        self.clone().open_chat(group);
+        if !poll_until(3500, || {
+            !self.messages.is_loading()
+                && self.messages.has_media_card(MediaKind::Video)
+                && self.messages.has_media_card(MediaKind::Gif)
+        })
+        .await
+        {
+            probe_fail("video and gif cards");
+            return;
+        }
+        let old_project = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find_map(|(id, title)| (title == "Old project").then_some(id));
+        let Some(old_project) = old_project else {
+            probe_fail("find Old project");
+            return;
+        };
+        probe_step("media card stale download");
+        let launches_before_switch = self.probe_media_launches.get();
+        if !self.messages.trigger_media(404) {
+            probe_fail("video card Download");
+            return;
+        }
+        self.clone().open_chat(old_project);
+        glib::timeout_future(Duration::from_millis(2600)).await;
+        if self.open_chat.get() != Some(old_project)
+            || self.probe_media_launches.get() != launches_before_switch
+        {
+            probe_fail("media stale completion launched");
+            return;
+        }
+        probe_step("audio video-note unsupported cards");
+        if !poll_until(3500, || {
+            !self.messages.is_loading()
+                && self.messages.has_media_card(MediaKind::Audio)
+                && self.messages.has_media_card(MediaKind::VideoNote)
+                && self.messages.has_media_card(MediaKind::Unsupported)
+        })
+        .await
+        {
+            probe_fail("archived media cards");
+            return;
+        }
+        probe_step("media card Download done");
+        let launches_before_audio = self.probe_media_launches.get();
+        if !self.messages.trigger_media(702)
+            || !poll_until(4200, || {
+                matches!(self.messages.media_state(702), Some(MediaState::Done(_)))
+                    && self.probe_media_launches.get() == launches_before_audio.wrapping_add(1)
+            })
+            .await
+        {
+            probe_fail("audio card Download to Done/open");
+            return;
+        }
+        probe_step("media card unavailable");
+        let launches_before_unavailable = self.probe_media_launches.get();
+        if !self.messages.trigger_media(703)
+            || !poll_until(4200, || {
+                matches!(self.messages.media_state(703), Some(MediaState::Failed))
+            })
+            .await
+            || self.probe_media_launches.get() != launches_before_unavailable
+        {
+            probe_fail("video-note unavailable without launch");
+            return;
+        }
+        self.clone().open_chat(marta);
+        if !poll_until(3500, || {
+            self.open_chat.get() == Some(marta)
+                && !self.messages.is_loading()
+                && self.messages.contains(104)
+        })
+        .await
+        {
+            probe_fail("restore Marta after daily-use probe");
+            return;
+        }
 
         let Some(window) = self.window() else {
             probe_fail("sidebar resize window");
@@ -4574,6 +6054,10 @@ impl ShellInner {
             probe_fail("pagination merge");
             return;
         }
+        if self.messages.receipt_text(91).as_deref() != Some(icons::CHECK_DOUBLE) {
+            probe_fail("pagination preserves read-outbox ticks");
+            return;
+        }
 
         self.messages.set_composer_text("probe message");
         self.clone().submit_composer();
@@ -4591,6 +6075,19 @@ impl ShellInner {
             return;
         };
         let typing_generation = self.messages.typing_generation();
+        if self.messages.receipt_text(sent_id).as_deref() != Some(icons::CHECK) {
+            probe_fail("sent message initial receipt");
+            return;
+        }
+        probe_step("read outbox receipt");
+        if !poll_until(3500, || {
+            self.messages.receipt_text(sent_id).as_deref() == Some(icons::CHECK_DOUBLE)
+        })
+        .await
+        {
+            probe_fail("read outbox receipt");
+            return;
+        }
         probe_step("typing event");
         if !poll_until(3000, || {
             self.messages.typing_generation() > typing_generation
