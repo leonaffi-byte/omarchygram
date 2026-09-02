@@ -613,6 +613,123 @@ async fn get_dialogs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<ChatSummary>
             draft,
         });
     }
+    // The archive folder is not part of iter_dialogs; fetch it raw. A failure
+    // there must not hide the main list.
+    match get_archived_dialogs(client, ctx, now).await {
+        Ok(archived) => out.extend(archived),
+        Err(e) => eprintln!("omarchygram: archived dialogs unavailable: {e}"),
+    }
+    Ok(out)
+}
+
+/// Dialogs in Telegram's archive folder (folder_id 1), built from the raw
+/// response because grammers' dialog iterator cannot select a folder.
+async fn get_archived_dialogs(client: &Client, ctx: &Arc<Ctx>, now: i32) -> Result<Vec<ChatSummary>, TgError> {
+    use grammers_client::session::types::PeerAuth;
+    use tl::enums::messages::Dialogs as D;
+    let r = client
+        .invoke(&tl::functions::messages::GetDialogs {
+            exclude_pinned: false,
+            folder_id: Some(1),
+            offset_date: 0,
+            offset_id: 0,
+            offset_peer: tl::enums::InputPeer::Empty,
+            limit: 100,
+            hash: 0,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let (dialogs, messages, chats, users) = match r {
+        D::Dialogs(d) => (d.dialogs, d.messages, d.chats, d.users),
+        D::Slice(d) => (d.dialogs, d.messages, d.chats, d.users),
+        D::NotModified(_) => return Ok(vec![]),
+    };
+    let mut out = Vec::new();
+    for dialog in dialogs {
+        let tl::enums::Dialog::Dialog(d) = dialog else { continue };
+        let chat_id = peer_chat_id(&d.peer);
+        // Resolve the peer from the response's user/chat lists.
+        let (title, kind, username, photo_id, presence, contact, peer_ref) = match &d.peer {
+            tl::enums::Peer::User(pu) => {
+                let Some(tl::enums::User::User(u)) = users.iter().find(|u| matches!(u, tl::enums::User::User(x) if x.id == pu.user_id)) else { continue };
+                let (name, username, _phone, presence, _has_photo, contact) = user_facts(u);
+                let kind = if u.is_self { ChatKind::Saved } else if u.bot { ChatKind::Bot } else { ChatKind::User };
+                let photo_id = match &u.photo { Some(tl::enums::UserProfilePhoto::Photo(p)) => Some(p.photo_id), _ => None };
+                let title = if u.is_self { "Saved Messages".to_string() } else { name };
+                let peer_ref = PeerRef { id: PeerId::user_unchecked(u.id), auth: PeerAuth::from_hash(u.access_hash.unwrap_or(0)) };
+                (title, kind, username, photo_id, presence, contact, peer_ref)
+            }
+            tl::enums::Peer::Chat(pc) => {
+                let Some(tl::enums::Chat::Chat(c)) = chats.iter().find(|c| matches!(c, tl::enums::Chat::Chat(x) if x.id == pc.chat_id)) else { continue };
+                let photo_id = match &c.photo { tl::enums::ChatPhoto::Photo(p) => Some(p.photo_id), _ => None };
+                (c.title.clone(), ChatKind::Group, String::new(), photo_id, Presence::Unknown, false, PeerId::chat_unchecked(c.id).to_ambient_ref())
+            }
+            tl::enums::Peer::Channel(pc) => {
+                let Some(tl::enums::Chat::Channel(c)) = chats.iter().find(|c| matches!(c, tl::enums::Chat::Channel(x) if x.id == pc.channel_id)) else { continue };
+                let photo_id = match &c.photo { tl::enums::ChatPhoto::Photo(p) => Some(p.photo_id), _ => None };
+                let kind = if c.megagroup { ChatKind::Group } else { ChatKind::Channel };
+                let peer_ref = PeerRef { id: PeerId::channel_unchecked(c.id), auth: PeerAuth::from_hash(c.access_hash.unwrap_or(0)) };
+                (c.title.clone(), kind, c.username.clone().unwrap_or_default(), photo_id, Presence::Unknown, false, peer_ref)
+            }
+        };
+        ctx.remember(chat_id, peer_ref, Some(&title));
+        if let Some(pid) = photo_id {
+            ctx.photos.lock().unwrap().insert(chat_id, pid);
+        }
+        let muted = is_muted(&d.notify_settings, now);
+        ctx.meta.lock().unwrap().insert(
+            chat_id,
+            DialogMeta { kind, contact, muted, unread: d.unread_count > 0, archived: true },
+        );
+        // Last message: raw, preview only (the full conversion needs grammers' peer map).
+        let last = messages.iter().find_map(|m| match m {
+            tl::enums::Message::Message(x) if x.id == d.top_message && peer_chat_id(&x.peer_id) == chat_id => Some(x),
+            _ => None,
+        });
+        let (last_message, last_time, last_msg_id, last_outgoing) = match last {
+            Some(m) => {
+                let preview = if !m.message.is_empty() {
+                    m.message.clone()
+                } else {
+                    match &m.media {
+                        Some(tl::enums::MessageMedia::Photo(_)) => "[photo]".to_string(),
+                        Some(tl::enums::MessageMedia::Document(_)) => "[file]".to_string(),
+                        Some(_) => "[message]".to_string(),
+                        None => String::new(),
+                    }
+                };
+                (
+                    preview,
+                    Local.timestamp_opt(m.date as i64, 0).single(),
+                    m.id,
+                    m.out,
+                )
+            }
+            None => (String::new(), None, d.top_message, false),
+        };
+        out.push(ChatSummary {
+            id: chat_id,
+            title,
+            kind,
+            username,
+            last_message,
+            last_sender: String::new(),
+            last_time,
+            last_msg_id,
+            last_outgoing,
+            unread: d.unread_count,
+            mentions: d.unread_mentions_count,
+            unread_mark: d.unread_mark,
+            read_inbox_max_id: d.read_inbox_max_id,
+            read_outbox_max_id: d.read_outbox_max_id,
+            pinned: d.pinned,
+            muted,
+            archived: true,
+            presence,
+            has_photo: photo_id.is_some(),
+            draft: draft_text(d.draft.as_ref()),
+        });
+    }
     Ok(out)
 }
 

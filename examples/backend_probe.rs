@@ -39,7 +39,8 @@ async fn main() {
             let groups = d.iter().filter(|c| matches!(c.kind, omarchygram::tg::ChatKind::Group)).count();
             let channels = d.iter().filter(|c| matches!(c.kind, omarchygram::tg::ChatKind::Channel)).count();
             let drafts = d.iter().filter(|c| !c.draft.is_empty()).count();
-            format!("{} dialogs, {pinned} pinned, {muted} muted, {photos} with photo, {groups} groups, {channels} channels, {drafts} drafts", d.len())
+            let archived = d.iter().filter(|c| c.archived).count();
+            format!("{} dialogs, {pinned} pinned, {muted} muted, {photos} with photo, {groups} groups, {channels} channels, {drafts} drafts, {archived} archived", d.len())
         }).map_err(|e| e.clone()),
     );
     let Ok(dialogs) = dialogs else { return };
@@ -84,6 +85,9 @@ async fn main() {
                 format!("{} msgs, {spans} formatted, {media} media, {fwd} forwarded", h.len())
             }).map_err(|e| e.clone()),
         );
+    }
+    if let Some(c) = dialogs.iter().find(|c| c.archived) {
+        step("get_history(archived)", tg.get_history(c.id, None).await.map(|h| format!("{} msgs in an archived chat", h.len())));
     }
     step("search_chats", tg.search_chats("telegram").await.map(|c| format!("{} results", c.len())));
     println!("done");

@@ -57,5 +57,5 @@ MERGED. Wave 5 (Telegram parity: layout/chrome, in-app configuration, daily-use 
   settings toggles in an in-app Animations menu. Keep ALL as options.
 
 ## Wave 5 backend notes (2026-09-02)
-- Archived dialogs are not fetched by the real backend yet: grammers 0.10 `iter_dialogs` has no folder option; needs a raw `messages.getDialogs { folder_id: 1 }` path. The mock serves an archived chat so the UI is ready.
+- Archived dialogs come from a raw `messages.getDialogs { folder_id: 1 }` call (grammers' iterator has no folder option); their peers are built from the response's access hashes, so history/media in archived chats work.
 - Drafts are saved without their reply target (raw `InputReplyTo` shape varies by layer).
