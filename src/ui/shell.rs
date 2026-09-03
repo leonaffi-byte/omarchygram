@@ -4120,7 +4120,9 @@ impl ShellInner {
                     return;
                 }
                 if let Some(source) = self.typing_timeout.borrow_mut().take() {
-                    source.remove();
+                    if let Some(live) = glib::MainContext::default().find_source_by_id(&source) {
+                        live.destroy();
+                    }
                 }
                 let generation = self.messages.set_typing(&name);
                 let epoch = self.epoch.get();
@@ -7589,8 +7591,12 @@ impl ShellInner {
     }
 
     fn bump_epoch(&self) -> u64 {
+        // The timeout may already have fired and removed itself (GLib-CRITICAL
+        // "Source ID … was not found" aborted a log-out under fatal-criticals).
         if let Some(source) = self.typing_timeout.borrow_mut().take() {
-            source.remove();
+            if let Some(live) = glib::MainContext::default().find_source_by_id(&source) {
+                live.destroy();
+            }
         }
         let next = self.epoch.get().wrapping_add(1);
         self.epoch.set(next);

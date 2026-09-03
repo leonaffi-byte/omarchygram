@@ -166,8 +166,12 @@ fn camera_source() -> Result<Option<PathBuf>, String> {
 pub async fn video_start(size: u32) -> Result<async_channel::Receiver<Vec<u8>>, String> {
     let size = size.clamp(64, 640) & !1; // h264 wants even dimensions
     let mut guard = video_slot().lock().await;
-    if guard.is_some() {
-        return Err("a video recording is already running".into());
+    // A start right after a cancel/stop must not race the previous teardown
+    // (the UI fires cancel without awaiting it): the new recording supersedes
+    // whatever is still in the slot.
+    if let Some(mut stale) = guard.take() {
+        let _ = stale.child.kill().await;
+        let _ = std::fs::remove_file(&stale.path);
     }
     if !ffmpeg_available() {
         return Err("ffmpeg is not installed — run: sudo pacman -S ffmpeg".into());
