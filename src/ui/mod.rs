@@ -14,6 +14,7 @@ pub mod lottie;
 pub mod markup;
 pub mod menus;
 pub mod messages;
+pub mod player;
 pub mod newgroup;
 pub mod poll;
 pub mod polldialog;

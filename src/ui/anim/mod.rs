@@ -611,6 +611,11 @@ impl Effects {
         effects
     }
 
+    /// Master animation toggle (GTK `gtk-enable-animations` setting).
+    pub fn animations_enabled() -> bool {
+        EffectsCore::animations_enabled()
+    }
+
     pub fn bind(&self, root: &impl IsA<gtk::Widget>, overlay_host: &gtk::Overlay) {
         *self.core.root.borrow_mut() = Some(root.as_ref().downgrade());
         *self.core.overlay_host.borrow_mut() = Some(overlay_host.downgrade());

@@ -20,9 +20,11 @@ use super::icons;
 use super::lottie;
 use super::markup;
 use super::menus::{self, ChatAction, PopoverSlot};
+use super::player;
 use super::recorder::{RecorderBar, RecorderUiAction};
 use super::scheduled::{ScheduledAction, ScheduledPanel, SendLaterPopover};
 use super::virtual_chat::is_virtual;
+use crate::settings::SettingsStore;
 
 mod bubble_clamp_imp {
     use std::cell::{Cell, RefCell};
@@ -294,6 +296,10 @@ pub enum MessageAction {
     RetryPinned,
     Delete(i32),
     Media(i32),
+    MediaSeek(i32, f64),
+    MediaSpeed(i32),
+    MediaMute(i32),
+    MediaFullscreen(i32),
     Paginate,
     CancelMode,
     CopyMessageId(i32),
@@ -353,6 +359,7 @@ struct MessageEntry {
     row: MessageRow,
     media_state: MediaState,
     media_retryable: bool,
+    autoplay_requested: Cell<bool>,
 }
 
 #[derive(Default)]
@@ -518,6 +525,10 @@ struct MessagesInner {
     map_tiles: Cell<bool>,
     /// Message ids whose contact has been added to the address book (6B).
     added_contacts: RefCell<HashSet<i32>>,
+    settings: RefCell<Option<Rc<SettingsStore>>>,
+    probe: Cell<bool>,
+    player_throttle: RefCell<Option<glib::SourceId>>,
+    widget: gtk::Box,
 }
 
 pub struct MessagesView {
@@ -1054,6 +1065,10 @@ impl MessagesView {
             effects,
             map_tiles: Cell::new(true),
             added_contacts: RefCell::new(HashSet::new()),
+            settings: RefCell::new(None),
+            probe: Cell::new(false),
+            player_throttle: RefCell::new(None),
+            widget: widget.clone(),
         });
         let view = Self { widget, inner };
         {
@@ -1378,6 +1393,7 @@ impl MessagesView {
             adjustment.connect_value_changed(move |adjustment| {
                 // Wave 6D: scrolling a sticker out of view pauses it.
                 sync_lottie_visibility(&inner);
+                MessagesView::of(&inner).player_visibility_throttled();
                 if inner.suppress_paging.get() {
                     return;
                 }
@@ -1415,6 +1431,16 @@ impl MessagesView {
                     }
                 }
             });
+        }
+
+        {
+            // Rows resize as their media lands, so the viewport contents change
+            // without any scrolling: re-check which players are on screen.
+            let inner = self.inner.clone();
+            self.inner
+                .scroll
+                .vadjustment()
+                .connect_changed(move |_| MessagesView::of(&inner).player_visibility_throttled());
         }
     }
 
@@ -2003,6 +2029,7 @@ impl MessagesView {
     pub fn reset_chat(&self, chat_id: i64, title: &str, epoch: u64) {
         self.exit_selection_mode();
         self.hide_recorder();
+        self.reset_players();
         self.move_focus_before_removal(&self.widget);
         self.clear_recent_presence();
         self.inner.virtual_mode.set(is_virtual(chat_id));
@@ -2246,6 +2273,7 @@ impl MessagesView {
             }
             inner.suppress_paging.set(false);
         });
+        self.player_visibility_throttled();
         inserted
     }
 
@@ -2299,6 +2327,7 @@ impl MessagesView {
                     row,
                     media_state,
                     media_retryable: false,
+                    autoplay_requested: Cell::new(false),
                 },
             );
             self.inner.store.borrow_mut().order.push(id);
@@ -2473,24 +2502,11 @@ impl MessagesView {
                 }
             }
             Some(
-                MediaKind::Document
-                | MediaKind::Voice
-                | MediaKind::Video
-                | MediaKind::Gif
-                | MediaKind::Audio
-                | MediaKind::VideoNote
-                | MediaKind::Unsupported,
+                MediaKind::Voice | MediaKind::Audio | MediaKind::Video | MediaKind::VideoNote | MediaKind::Gif,
             ) => {
-                let button = media_card(message);
-                let action = self.inner.action.clone();
-                let msg_id = message.id;
-                button.connect_clicked(move |_| {
-                    if let Some(callback) = action.borrow().as_ref().cloned() {
-                        callback(MessageAction::Media(msg_id));
-                    }
-                });
-                media_slot.append(&button);
-                media_button = Some(button);
+                let row = self.build_player(message);
+                media_slot.append(&row.widget);
+                media_button = Some(row.play_button);
                 if message.media == Some(MediaKind::Voice) {
                     let transcribe = gtk::Button::with_label("transcribe");
                     transcribe.add_css_class("omg-attach");
@@ -2506,6 +2522,18 @@ impl MessagesView {
                     media_slot.append(&transcribe);
                     transcribe_button = Some(transcribe);
                 }
+            }
+            Some(MediaKind::Document | MediaKind::Unsupported) => {
+                let button = media_card(message);
+                let action = self.inner.action.clone();
+                let msg_id = message.id;
+                button.connect_clicked(move |_| {
+                    if let Some(callback) = action.borrow().as_ref().cloned() {
+                        callback(MessageAction::Media(msg_id));
+                    }
+                });
+                media_slot.append(&button);
+                media_button = Some(button);
             }
             None => {}
         }
@@ -4332,11 +4360,14 @@ impl MessagesView {
     pub fn has_media_card(&self, kind: MediaKind) -> bool {
         self.inner.store.borrow().entries.values().any(|entry| {
             entry.msg.media == Some(kind)
-                && entry
+                && (entry
                     .row
                     .media_button
                     .as_ref()
                     .is_some_and(gtk::prelude::WidgetExt::is_visible)
+                    // An inline player IS the card, even while it autoplays
+                    // (no PLAY button on top) or shows an inline error.
+                    || player::exists(entry.msg.id))
         })
     }
 
@@ -4464,16 +4495,24 @@ impl MessagesView {
     }
 
     pub fn finish_media_path(&self, msg_id: i32, path: PathBuf) -> bool {
-        let button = {
+        let (button, message) = {
             let mut store = self.inner.store.borrow_mut();
             let Some(entry) = store.entries.get_mut(&msg_id) else {
                 return false;
             };
             entry.media_state = MediaState::Done(path.clone());
-            entry.row.media_button.clone()
+            (entry.row.media_button.clone(), entry.msg.clone())
         };
         if let Some(button) = button {
             button.set_sensitive(true);
+        }
+        // A `.webm` sticker is a muted looping video, not an image (§2.2).
+        if message.media == Some(MediaKind::Sticker)
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("webm"))
+        {
+            self.swap_in_player(&message, &path);
         }
         let callbacks = self
             .inner
@@ -4684,12 +4723,28 @@ impl MessagesView {
                 }
             }
             Some(
-                MediaKind::Document
-                | MediaKind::Voice
-                | MediaKind::Video
-                | MediaKind::Gif
+                MediaKind::Voice
                 | MediaKind::Audio
+                | MediaKind::Video
                 | MediaKind::VideoNote
+                | MediaKind::Gif,
+            ) => {
+                // Inline players render their own inline error label.
+                if self.player_exists(msg_id) {
+                    self.player_set_error(msg_id, "unavailable");
+                } else if let (Some(button), Some(base)) = (button, base) {
+                    button.set_child(None::<&gtk::Widget>);
+                    let label = if retryable {
+                        format!("{base} — Retry")
+                    } else {
+                        format!("{base} (unavailable)")
+                    };
+                    button.set_label(&label);
+                    button.set_sensitive(retryable);
+                }
+            }
+            Some(
+                MediaKind::Document
                 | MediaKind::Contact
                 | MediaKind::Dice
                 | MediaKind::Poll
@@ -4882,6 +4937,214 @@ impl MessagesView {
     /// Setter for `settings.media.map_tiles` (gates the 6B map download).
     pub fn set_map_tiles(&self, enabled: bool) {
         self.inner.map_tiles.set(enabled);
+    }
+
+    /// Replace a row's media slot with an inline player and start it.
+    fn swap_in_player(&self, message: &Msg, path: &std::path::Path) {
+        let slot = self
+            .inner
+            .store
+            .borrow()
+            .entries
+            .get(&message.id)
+            .map(|entry| entry.row.media_slot.clone());
+        let Some(slot) = slot else { return };
+        self.move_focus_before_removal(&slot);
+        while let Some(child) = slot.first_child() {
+            slot.remove(&child);
+        }
+        let row = self.build_player(message);
+        slot.append(&row.widget);
+        if let Some(entry) = self.inner.store.borrow_mut().entries.get_mut(&message.id) {
+            entry.row.media_button = Some(row.play_button);
+        }
+        // A .webm sticker is a muted loop: autoplay only under the same gates
+        // as GIFs (§2.2) — otherwise poster + PLAY.
+        let autoplay = self
+            .inner
+            .settings
+            .borrow()
+            .clone()
+            .is_some_and(|settings| settings.get().media.autoplay_gifs)
+            && player::animations_on()
+            && self.row_visible(message.id);
+        player::open_path(message.id, path, autoplay);
+    }
+
+    /// The inline player for one media row (§2.1/§2.2).
+    fn build_player(&self, message: &Msg) -> player::PlayerRow {
+        let settings = self
+            .inner
+            .settings
+            .borrow()
+            .clone()
+            .unwrap_or_else(SettingsStore::new);
+        let action = self.inner.action.clone();
+        let callback: Rc<dyn Fn(MessageAction)> = Rc::new(move |media_action| {
+            if let Some(callback) = action.borrow().as_ref().cloned() {
+                callback(media_action);
+            }
+        });
+        player::create(message, callback, self.inner.probe.get(), settings)
+    }
+
+    // ----- Wave 6A inline playback hooks (specs/spec-wave6.md §2) -----
+
+    /// Provide the settings store (speed persistence + autoplay flags).
+    pub fn set_player_settings(&self, settings: Rc<SettingsStore>) {
+        *self.inner.settings.borrow_mut() = Some(settings);
+    }
+
+    pub fn set_probe(&self, probe: bool) {
+        self.inner.probe.set(probe);
+    }
+
+    /// Hand a downloaded file to the row's inline player and start it.
+    pub fn play_media(&self, msg_id: i32, path: PathBuf, autoplay: bool) {
+        player::open_path(msg_id, &path, autoplay);
+    }
+
+    pub fn toggle_media(&self, msg_id: i32) {
+        player::toggle(msg_id);
+    }
+
+    pub fn player_seek(&self, msg_id: i32, fraction: f64) {
+        player::seek(msg_id, fraction);
+    }
+
+    pub fn player_toggle_mute(&self, msg_id: i32) {
+        player::toggle_muted(msg_id);
+    }
+
+    pub fn player_fullscreen(&self, msg_id: i32) {
+        player::open_fullscreen(msg_id);
+    }
+
+    pub fn player_close_fullscreen(&self) {
+        player::close_fullscreen();
+    }
+
+    pub fn player_set_error(&self, msg_id: i32, text: &str) {
+        player::set_error(msg_id, text);
+    }
+
+    pub fn player_state(&self, msg_id: i32) -> player::PlayerState {
+        player::state_of(msg_id)
+    }
+
+    pub fn player_speed(&self, msg_id: i32) -> f64 {
+        player::speed_of(msg_id)
+    }
+
+    /// Playback position in seconds (the probe asserts that a seek moves it).
+    pub fn player_position(&self, msg_id: i32) -> f64 {
+        player::position_of(msg_id)
+    }
+
+    pub fn player_exists(&self, msg_id: i32) -> bool {
+        player::exists(msg_id)
+    }
+
+    pub fn player_registry_empty(&self) -> bool {
+        player::registry_empty()
+    }
+
+    pub fn player_fullscreen_open(&self) -> bool {
+        player::fullscreen_open()
+    }
+
+    /// Cycle the speed pill (1x → 1.5x → 2x) exactly as a click on it does.
+    pub fn player_cycle_speed(&self, msg_id: i32) -> f64 {
+        player::cycle_speed(msg_id)
+    }
+
+    /// Sound players currently playing — at most one by §2.3.
+    pub fn active_player_count(&self) -> usize {
+        player::active_sound_count()
+    }
+
+    pub fn reset_players(&self) {
+        player::stop_all();
+    }
+
+    pub fn scroll_to_bottom(&self) {
+        let adjustment = self.inner.scroll.vadjustment();
+        adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
+    }
+
+    /// Pause players whose row left the viewport, resume muted loops that came
+    /// back, and start autoplay downloads for visible gifs/circles (§2.2/§2.3).
+    fn player_visibility(&self) {
+        player::visibility_tick(&|id| self.row_visible(id));
+        let Some(settings) = self.inner.settings.borrow().clone() else {
+            return;
+        };
+        let media = settings.get().media;
+        let animations = player::animations_on();
+        let autoplay_gifs = media.autoplay_gifs && animations;
+        let autoplay_notes = media.autoplay_video_notes && animations;
+        if !autoplay_gifs && !autoplay_notes {
+            return;
+        }
+        // Collect first: the action callback re-enters the store.
+        let pending: Vec<i32> = {
+            let store = self.inner.store.borrow();
+            store
+                .order
+                .iter()
+                .filter_map(|id| {
+                    let entry = store.entries.get(id)?;
+                    let wanted = match entry.msg.media {
+                        Some(MediaKind::Gif) => autoplay_gifs,
+                        Some(MediaKind::VideoNote) => autoplay_notes,
+                        _ => false,
+                    };
+                    (wanted
+                        && matches!(entry.media_state, MediaState::NotStarted)
+                        && !entry.autoplay_requested.get())
+                    .then_some(*id)
+                })
+                .collect()
+        };
+        for id in pending {
+            if !self.row_visible(id) {
+                continue;
+            }
+            let requested = self
+                .inner
+                .store
+                .borrow()
+                .entries
+                .get(&id)
+                .map(|entry| entry.autoplay_requested.replace(true));
+            if requested != Some(false) {
+                continue;
+            }
+            if let Some(callback) = self.inner.action.borrow().as_ref().cloned() {
+                callback(MessageAction::Media(id));
+            }
+        }
+    }
+
+    /// Re-wrap the shared inner state (signal handlers only hold the `Rc`).
+    fn of(inner: &Rc<MessagesInner>) -> Self {
+        MessagesView {
+            widget: inner.widget.clone(),
+            inner: inner.clone(),
+        }
+    }
+
+    /// Throttled entry point for the scroll handler (§2.3).
+    fn player_visibility_throttled(&self) {
+        if let Some(source) = self.inner.player_throttle.borrow_mut().take() {
+            remove_source_if_present(source);
+        }
+        let inner = self.inner.clone();
+        let source = glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+            let _ = inner.player_throttle.borrow_mut().take();
+            MessagesView::of(&inner).player_visibility();
+        });
+        *self.inner.player_throttle.borrow_mut() = Some(source);
     }
 
     pub fn set_typing(&self, name: &str) -> u64 {
