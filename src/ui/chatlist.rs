@@ -80,6 +80,7 @@ pub struct ChatList {
     back_button: gtk::Button,
     archived_title: gtk::Label,
     search: gtk::SearchEntry,
+    stories_slot: gtk::Box,
     folder_bar: gtk::Box,
     content: gtk::Stack,
     list: gtk::ListBox,
@@ -141,6 +142,9 @@ impl ChatList {
         search.set_hexpand(true);
         top_bar.append(&search);
         widget.append(&top_bar);
+
+        let stories_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        widget.append(&stories_slot);
 
         let folder_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         folder_bar.add_css_class("omg-folder-tabs");
@@ -250,6 +254,7 @@ impl ChatList {
             back_button,
             archived_title,
             search,
+            stories_slot,
             folder_bar,
             content,
             list,
@@ -731,6 +736,20 @@ impl ChatList {
             self.update_row(previous);
         }
         self.update_row(chat_id);
+    }
+
+    pub fn set_stories_strip(&self, strip: &gtk::Widget) {
+        while let Some(child) = self.stories_slot.first_child() {
+            self.stories_slot.remove(&child);
+        }
+        self.stories_slot.append(strip);
+    }
+
+    pub fn probe_chat_story_ring(&self, chat_id: i64) -> Option<crate::tg::StoryRing> {
+        self.rows
+            .borrow()
+            .get(&chat_id)
+            .map(|row| row.avatar.story_ring())
     }
 
     pub fn selected(&self) -> Option<i64> {
@@ -1221,6 +1240,7 @@ impl ChatList {
             row.avatar
                 .bind(&self.tg, chat_id, title, summary.has_photo && show_avatars);
         }
+        row.avatar.set_story_ring(summary.story_ring);
         row.muted.set_visible(summary.muted);
         row.time.set_label(&format_time(summary.last_time));
         let draft = !summary.draft.is_empty() && self.selected.get() != Some(chat_id);

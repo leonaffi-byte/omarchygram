@@ -117,6 +117,26 @@ impl Avatar {
     pub fn key(&self) -> i64 {
         self.key.get()
     }
+
+    pub fn set_story_ring(&self, ring: crate::tg::StoryRing) {
+        self.widget.remove_css_class("omg-story-unread");
+        self.widget.remove_css_class("omg-story-read");
+        match ring {
+            crate::tg::StoryRing::None => {}
+            crate::tg::StoryRing::Unread => self.widget.add_css_class("omg-story-unread"),
+            crate::tg::StoryRing::Read => self.widget.add_css_class("omg-story-read"),
+        }
+    }
+
+    pub fn story_ring(&self) -> crate::tg::StoryRing {
+        if self.widget.has_css_class("omg-story-unread") {
+            crate::tg::StoryRing::Unread
+        } else if self.widget.has_css_class("omg-story-read") {
+            crate::tg::StoryRing::Read
+        } else {
+            crate::tg::StoryRing::None
+        }
+    }
 }
 
 fn square_pixbuf(

@@ -28,3 +28,7 @@ pub mod viewer;
 pub mod virtual_chat;
 /// Wave 6D rasterizer (orchestrator-owned; see specs/spec-wave6.md §5.1).
 pub mod lottie_backend;
+/// Wave 6F: stories strip and viewer.
+pub mod stories;
+/// Wave 6F: video note recorder.
+pub mod videonote;

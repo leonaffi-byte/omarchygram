@@ -1653,3 +1653,66 @@ button.omg-scheduled-bar:focus-visible {
   color: var(--red);
 }
 /* ---- end 6C ---- */
+
+/* ---- wave 6F ---- */
+.omg-round {
+  border-radius: 50%;
+}
+
+.omg-video-recorder-bar {
+  background-color: var(--bg-dark);
+  padding: 8px 12px;
+  border-top: 1px solid var(--bg-lighter);
+}
+
+.omg-story-unread {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.omg-story-read {
+  outline: 2px solid var(--muted);
+  outline-offset: 1px;
+}
+
+.omg-stories-strip {
+  min-height: 72px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--bg-lighter);
+}
+
+button.omg-story-item {
+  background-image: none;
+  background-color: transparent;
+  border: none;
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+
+button.omg-story-item:hover,
+button.omg-story-item:focus-visible {
+  background-color: var(--selection);
+}
+
+.omg-story-viewer {
+  background-color: rgba(0, 0, 0, 0.85);
+}
+
+.omg-story-stage {
+  background-color: var(--bg-darker);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 6px;
+}
+
+.omg-story-segment {
+  background-color: var(--bg-lighter);
+  min-height: 3px;
+  border-radius: 2px;
+}
+
+.omg-story-segment-fill {
+  background-color: var(--accent);
+  min-height: 3px;
+  border-radius: 2px;
+}
+/* ---- end 6F ---- */
