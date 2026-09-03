@@ -290,26 +290,23 @@ StoriesChanged,
 `MessageChanged` also fires for live-location updates (the message's
 `location.live.last_update` moves) and for `dice.value` becoming final.
 
-### 1.6 Local services (orchestrator, `src/local/`, used by 6F)
+### 1.6 Local services (orchestrator, `src/local/`, used by 6F) — IMPLEMENTED
 
 ```rust
-// src/local/record.rs (existing voice recorder pattern)
-/// Starts recording a video circle with ffmpeg: camera → square MP4 (h264,
-/// `size` px, ≤ 60 s) + a live preview stream. Returns a handle.
-pub fn record_video_note_start(size: u32) -> Result<VideoRecorder, String>;
-pub struct VideoRecorder { … }
-impl VideoRecorder {
-    /// Preview frames: RGBA `size`×`size`, ~10 fps, arrive on the GLib main
-    /// context via this receiver.
-    pub fn frames(&self) -> async_channel::Receiver<Vec<u8>>;
-    /// Stops and returns (mp4 path, duration secs).
-    pub async fn stop(self) -> Result<(PathBuf, u32), String>;
-    pub fn cancel(self);
-}
-/// Where the camera comes from: `OMG_CAMERA` (a /dev/videoN path) else the
-/// first /dev/video*, else — only in --smoke — ffmpeg's `testsrc` pattern.
-/// No camera and not smoke → Err("no camera found").
+// on the `Local` handle (src/local/mod.rs), awaited on the GLib main context
+/// Starts recording a `size`×`size` video circle with ffmpeg (camera → h264
+/// MP4 + aac, ≤ 60 s). The receiver streams RGBA preview frames
+/// (`size`×`size`, ~10 fps, newest wins) — wrap each in a `gdk::MemoryTexture`
+/// (`R8g8b8a8`, stride size*4).
+pub async fn video_start(&self, size: u32) -> Result<async_channel::Receiver<Vec<u8>>, String>;
+/// Stops and returns (mp4 path, duration secs).
+pub async fn video_stop(&self) -> Result<(PathBuf, u32), String>;
+pub async fn video_cancel(&self);
 ```
+Camera: `OMG_CAMERA` (a /dev/videoN path, or `test` for ffmpeg's test
+pattern), else the first /dev/video*, else — only in smoke/mock mode — the
+test pattern. `OMG_MOCK_CAMERA=none` → `Err("no camera found")` (probe
+hook). Missing ffmpeg → `Err("ffmpeg is not installed …")`.
 
 ### 1.7 Playback prerequisites (system)
 

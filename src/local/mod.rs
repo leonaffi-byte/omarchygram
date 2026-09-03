@@ -38,6 +38,9 @@ enum Cmd {
     RecordStart(oneshot::Sender<Result<(), String>>),
     RecordStop(oneshot::Sender<Result<(PathBuf, u32), String>>),
     RecordCancel(oneshot::Sender<()>),
+    VideoStart(u32, oneshot::Sender<Result<async_channel::Receiver<Vec<u8>>, String>>),
+    VideoStop(oneshot::Sender<Result<(PathBuf, u32), String>>),
+    VideoCancel(oneshot::Sender<()>),
 }
 
 #[derive(Clone)]
@@ -79,6 +82,16 @@ impl Local {
                             }
                             Cmd::RecordCancel(tx) => {
                                 record::cancel().await;
+                                let _ = tx.send(());
+                            }
+                            Cmd::VideoStart(size, tx) => {
+                                let _ = tx.send(record::video_start(size).await);
+                            }
+                            Cmd::VideoStop(tx) => {
+                                let _ = tx.send(record::video_stop().await);
+                            }
+                            Cmd::VideoCancel(tx) => {
+                                record::video_cancel().await;
                                 let _ = tx.send(());
                             }
                         }
@@ -149,6 +162,34 @@ impl Local {
     pub async fn record_cancel(&self) {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Cmd::RecordCancel(tx)).is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    // ----- wave 6F: video notes -----
+
+    /// Start recording a `size`×`size` video circle (ffmpeg: camera → h264
+    /// MP4, ≤ 60 s). The receiver streams RGBA preview frames (`size`×`size`,
+    /// ~10 fps); await it on the GLib main context and wrap each frame in a
+    /// `gdk::MemoryTexture` (R8g8b8a8). Camera: `OMG_CAMERA` (device path or
+    /// "test"), else the first /dev/video*, else the test pattern in smoke
+    /// mode; `OMG_MOCK_CAMERA=none` → Err("no camera found").
+    pub async fn video_start(&self, size: u32) -> Result<async_channel::Receiver<Vec<u8>>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Cmd::VideoStart(size, tx)).map_err(|_| "local services are gone".to_string())?;
+        rx.await.map_err(|_| "local services dropped the request".to_string())?
+    }
+
+    /// Stop and get the MP4 plus its duration in seconds.
+    pub async fn video_stop(&self) -> Result<(PathBuf, u32), String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Cmd::VideoStop(tx)).map_err(|_| "local services are gone".to_string())?;
+        rx.await.map_err(|_| "local services dropped the request".to_string())?
+    }
+
+    pub async fn video_cancel(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Cmd::VideoCancel(tx)).is_ok() {
             let _ = rx.await;
         }
     }
