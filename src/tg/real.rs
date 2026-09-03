@@ -23,7 +23,7 @@ use grammers_client::peer::Role;
 use grammers_client::peer::Peer;
 use grammers_client::message::{InputMessage, Message};
 use grammers_client::session::storages::SqliteSession;
-use grammers_client::session::types::{PeerId, PeerRef};
+use grammers_client::session::types::{PeerAuth, PeerId, PeerRef};
 use grammers_client::session::updates::UpdatesLike;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool, SignInError};
@@ -32,10 +32,11 @@ use tokio::sync::mpsc;
 
 use super::archive::Archive;
 use super::{
-    parse_markdown, paths, reject, to_markdown, AuthState, BackendFlags, BotCommand, ButtonKind, ChatInfo, ChatKind,
-    ChatSummary, Command, Contact, ContactCard, DiceInfo, Event, Folder, GeoPoint, Gif, KeyButton, Keyboard,
-    LiveLocation, LocationInfo, Me, MediaKind, Member, MemberRole, Msg, MuteMode, Poll, PollOption, Presence, Reaction,
-    SharedKind, Span, SpanKind, Sticker, StickerPack, StoryRing, TgError, WebPreview,
+    parse_markdown, paths, reject, split_topic_chat_id, to_markdown, topic_chat_id, AuthState, BackendFlags, BotCommand,
+    ButtonKind, ChatInfo, ChatKind, ChatSummary, Command, Contact, ContactCard, DiceInfo, Event, Folder, GeoPoint, Gif,
+    KeyButton, Keyboard, LiveLocation, LocationInfo, Me, MediaKind, Member, MemberRole, Msg, MuteMode, Poll, PollDraft,
+    PollOption, Presence, Reaction, SharedKind, Span, SpanKind, Sticker, StickerPack, Story, StoryPeer, StoryRing,
+    TgError, Topic, WebPreview,
 };
 
 /// Shared between the command loop, spawned data tasks, and the update loop.
@@ -58,6 +59,16 @@ struct Ctx {
     forums: Mutex<HashSet<i64>>,
     /// Story rings from the last stories fetch (wave 6F).
     story_rings: Mutex<HashMap<i64, StoryRing>>,
+    /// When the story rings were last fetched (refreshed with the dialogs every 5 min).
+    stories_fetched: Mutex<Option<std::time::Instant>>,
+    /// Raw polls by poll id — `updateMessagePoll` may carry results only.
+    polls: Mutex<HashMap<i64, tl::types::Poll>>,
+    /// Story media by (peer chat id, story id), for `download_story`.
+    story_media: Mutex<HashMap<(i64, i32), tl::enums::MessageMedia>>,
+    /// OpenStreetMap tiles (wave 6B).
+    http: reqwest::Client,
+    /// Lets command handlers push events (poll results, story rings…).
+    events: async_channel::Sender<Event>,
 }
 
 #[derive(Clone, Copy)]
@@ -77,7 +88,9 @@ impl Ctx {
         }
     }
 
+    /// Topic ids resolve to their forum's peer.
     fn peer(&self, chat_id: i64) -> Result<PeerRef, TgError> {
+        let (chat_id, _) = real_chat(chat_id);
         self.peers
             .lock()
             .unwrap()
@@ -153,6 +166,15 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
             sticker_sets: Mutex::new(HashMap::new()),
             forums: Mutex::new(HashSet::new()),
             story_rings: Mutex::new(HashMap::new()),
+            stories_fetched: Mutex::new(None),
+            polls: Mutex::new(HashMap::new()),
+            story_media: Mutex::new(HashMap::new()),
+            http: reqwest::Client::builder()
+                .user_agent("omarchygram/0.1 (Telegram client for Omarchy)")
+                .timeout(std::time::Duration::from_secs(12))
+                .build()
+                .unwrap_or_default(),
+            events: events.clone(),
             meta: Mutex::new(HashMap::new()),
         }),
         events,
@@ -359,29 +381,106 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
         Command::DownloadGif { gif_id, respond } => {
             let _ = respond.send(download_document_by_id(&client, &ctx, gif_id, false).await);
         }
-        // Wave 6 commands land in the real implementation commit; until then
-        // they fail cleanly instead of being mistaken for auth commands.
-        cmd @ (Command::DownloadMap { .. }
-        | Command::SendVote { .. }
-        | Command::AddContact { .. }
-        | Command::SendPoll { .. }
-        | Command::SendLocation { .. }
-        | Command::SendTextAt { .. }
-        | Command::SendFileAt { .. }
-        | Command::GetScheduled { .. }
-        | Command::SendScheduledNow { .. }
-        | Command::DeleteScheduled { .. }
-        | Command::PressButton { .. }
-        | Command::GetTopics { .. }
-        | Command::CreateTopic { .. }
-        | Command::SendVideoNote { .. }
-        | Command::SendLiveLocation { .. }
-        | Command::UpdateLiveLocation { .. }
-        | Command::StopLiveLocation { .. }
-        | Command::GetStoryPeers(_)
-        | Command::GetStories { .. }
-        | Command::DownloadStory { .. }
-        | Command::MarkStoriesSeen { .. }) => reject(cmd, "not available yet"),
+        // ----- wave 6 -----
+        Command::DownloadMap { point, zoom, width, height, respond } => {
+            let _ = respond.send(download_map(&ctx, point, zoom, width, height).await);
+        }
+        Command::SendVote { chat_id, msg_id, options, respond } => {
+            let _ = respond.send(send_vote(&client, &ctx, chat_id, msg_id, &options).await);
+        }
+        Command::AddContact { user_id, first_name, last_name, phone, respond } => {
+            let _ = respond.send(add_contact(&client, &ctx, user_id, &first_name, &last_name, &phone).await);
+        }
+        Command::SendPoll { chat_id, draft, respond } => {
+            let _ = respond.send(send_poll(&client, &ctx, chat_id, draft).await);
+        }
+        Command::SendLocation { chat_id, point, respond } => {
+            let media = tl::enums::InputMedia::GeoPoint(tl::types::InputMediaGeoPoint { geo_point: input_geo(point) });
+            let _ = respond.send(send_media_msg(&client, &ctx, chat_id, media, "").await);
+        }
+        Command::SendTextAt { chat_id, text, reply_to, at, respond } => {
+            let _ = respond.send(send_raw(&client, &ctx, chat_id, None, &text, reply_to, Some(at)).await.map(|_| ()));
+        }
+        Command::SendFileAt { chat_id, path, caption, at, respond } => {
+            let _ = respond.send(send_file_at(&client, &ctx, chat_id, &path, &caption, at).await);
+        }
+        Command::GetScheduled { chat_id, respond } => {
+            let _ = respond.send(get_scheduled(&client, &ctx, chat_id).await);
+        }
+        Command::SendScheduledNow { chat_id, ids, respond } => {
+            let r = client
+                .invoke(&tl::functions::messages::SendScheduledMessages { peer: input_peer_or_err(&ctx, chat_id), id: ids })
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("send now failed: {e}"));
+            let _ = respond.send(r);
+            let (forum_id, _) = real_chat(chat_id);
+            let _ = ctx.events.send(Event::ScheduledChanged { chat_id: forum_id }).await;
+        }
+        Command::DeleteScheduled { chat_id, ids, respond } => {
+            let r = client
+                .invoke(&tl::functions::messages::DeleteScheduledMessages { peer: input_peer_or_err(&ctx, chat_id), id: ids })
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("delete failed: {e}"));
+            let _ = respond.send(r);
+            let (forum_id, _) = real_chat(chat_id);
+            let _ = ctx.events.send(Event::ScheduledChanged { chat_id: forum_id }).await;
+        }
+        Command::PressButton { chat_id, msg_id, data, respond } => {
+            let _ = respond.send(press_button(&client, &ctx, chat_id, msg_id, data).await);
+        }
+        Command::GetTopics { forum_id, respond } => {
+            let _ = respond.send(get_topics(&client, &ctx, forum_id).await);
+        }
+        Command::CreateTopic { forum_id, title, respond } => {
+            let _ = respond.send(create_topic(&client, &ctx, forum_id, &title).await);
+        }
+        Command::SendVideoNote { chat_id, path, duration, size, respond } => {
+            let _ = respond.send(send_video_note(&client, &ctx, chat_id, &path, duration, size).await);
+        }
+        Command::SendLiveLocation { chat_id, point, period_secs, respond } => {
+            let media = tl::enums::InputMedia::GeoLive(tl::types::InputMediaGeoLive {
+                stopped: false,
+                geo_point: input_geo(point),
+                heading: None,
+                period: Some(period_secs.clamp(60, 86_400) as i32),
+                proximity_notification_radius: None,
+            });
+            let _ = respond.send(send_media_msg(&client, &ctx, chat_id, media, "").await);
+        }
+        Command::UpdateLiveLocation { chat_id, msg_id, point, respond } => {
+            let media = tl::enums::InputMedia::GeoLive(tl::types::InputMediaGeoLive {
+                stopped: false,
+                geo_point: input_geo(point),
+                heading: None,
+                period: None,
+                proximity_notification_radius: None,
+            });
+            let _ = respond.send(edit_media(&client, &ctx, chat_id, msg_id, media).await);
+        }
+        Command::StopLiveLocation { chat_id, msg_id, respond } => {
+            let media = tl::enums::InputMedia::GeoLive(tl::types::InputMediaGeoLive {
+                stopped: true,
+                geo_point: tl::enums::InputGeoPoint::Empty,
+                heading: None,
+                period: None,
+                proximity_notification_radius: None,
+            });
+            let _ = respond.send(edit_media(&client, &ctx, chat_id, msg_id, media).await);
+        }
+        Command::GetStoryPeers(tx) => {
+            let _ = tx.send(get_story_peers(&client, &ctx).await);
+        }
+        Command::GetStories { chat_id, respond } => {
+            let _ = respond.send(get_stories(&client, &ctx, chat_id).await);
+        }
+        Command::DownloadStory { chat_id, story_id, respond } => {
+            let _ = respond.send(download_story(&client, &ctx, chat_id, story_id).await);
+        }
+        Command::MarkStoriesSeen { chat_id, up_to_id, respond } => {
+            let _ = respond.send(mark_stories_seen(&client, &ctx, chat_id, up_to_id).await);
+        }
         other => reject(other, "auth commands are handled serially"),
     }
 }
@@ -563,6 +662,7 @@ impl Backend {
 }
 
 async fn get_dialogs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<ChatSummary>, TgError> {
+    refresh_story_rings(client, ctx, false).await;
     let mut iter = client.iter_dialogs().limit(200);
     let mut out = Vec::new();
     let now = Local::now().timestamp() as i32;
@@ -894,6 +994,10 @@ async fn get_history(
     before_id: Option<i32>,
 ) -> Result<Vec<Msg>, TgError> {
     let peer = ctx.peer(chat_id)?;
+    let (forum_id, topic) = real_chat(chat_id);
+    if let Some(topic) = topic {
+        return get_topic_history(client, ctx, forum_id, topic, before_id).await;
+    }
     let mut iter = client.iter_messages(peer).limit(50);
     if let Some(before) = before_id {
         iter = iter.offset_id(before);
@@ -907,6 +1011,35 @@ async fn get_history(
     }
     out.reverse(); // newest last (display order)
     merge_deleted(ctx, chat_id, before_id, &mut out).await;
+    Ok(out)
+}
+
+/// One page of a forum topic (messages.getReplies on the topic's root), newest
+/// last. The raw page only lends its ids: grammers' `Message` cannot be built
+/// from raw outside the crate, so the page is refetched by id.
+async fn get_topic_history(client: &Client, ctx: &Arc<Ctx>, forum_id: i64, topic: i32, before_id: Option<i32>) -> Result<Vec<Msg>, TgError> {
+    let peer = ctx.peer(forum_id)?;
+    let r = client
+        .invoke(&tl::functions::messages::GetReplies {
+            peer: peer.into(),
+            msg_id: topic,
+            offset_id: before_id.unwrap_or(0),
+            offset_date: 0,
+            add_offset: 0,
+            limit: 50,
+            max_id: 0,
+            min_id: 0,
+            hash: 0,
+        })
+        .await
+        .map_err(|e| format!("topic history failed: {e}"))?;
+    let ids: Vec<i32> = raw_messages(r).iter().filter_map(raw_message_id).collect();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let fetched = client.get_messages_by_id(peer, &ids).await.map_err(|e| e.to_string())?;
+    let mut out: Vec<Msg> = fetched.into_iter().flatten().map(|m| convert(ctx, &m, forum_id)).collect();
+    out.sort_by_key(|m| m.id);
     Ok(out)
 }
 
@@ -1000,10 +1133,24 @@ async fn download_media(
     chat_id: i64,
     msg_id: i32,
 ) -> Result<Option<PathBuf>, TgError> {
+    let (chat_id, _) = real_chat(chat_id);
     let media = { ctx.media.lock().unwrap().get(&(chat_id, msg_id)).cloned() };
     let Some(media) = media else {
         return Ok(None);
     };
+    // Locations render as a map; nothing to download from Telegram.
+    let point = match &media {
+        Media::Geo(g) => Some(GeoPoint { lat: g.raw.lat, lon: g.raw.long }),
+        Media::Venue(v) => v.geo.as_ref().map(|g| GeoPoint { lat: g.raw.lat, lon: g.raw.long }),
+        Media::GeoLive(l) => l.geo.as_ref().map(|g| GeoPoint { lat: g.raw.lat, lon: g.raw.long }),
+        _ => None,
+    };
+    if let Some(point) = point {
+        return download_map(ctx, point, 15, 320, 180).await;
+    }
+    if matches!(media, Media::Contact(_) | Media::Dice(_) | Media::Poll(_)) {
+        return Ok(None);
+    }
     let dir = paths::media_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
@@ -1021,7 +1168,13 @@ async fn download_media(
 
     let ext = match &media {
         Media::Photo(_) => "jpg".to_string(),
-        Media::Sticker(_) => "webp".to_string(),
+        // Animated (.tgs) and video (.webm) stickers are handed over raw
+        // (wave 6A/6D render them); static ones become png below.
+        Media::Sticker(s) => match sticker_mime(s).as_str() {
+            "application/x-tgsticker" => "tgs".to_string(),
+            "video/webm" => "webm".to_string(),
+            _ => "webp".to_string(),
+        },
         // The extension comes from a REMOTE sender's filename and decides
         // which handler later opens the file — allow only plain ascii.
         Media::Document(d) => d
@@ -1070,6 +1223,9 @@ async fn send_text(
     text: &str,
     reply_to: Option<i32>,
 ) -> Result<Msg, TgError> {
+    if in_topic(chat_id) {
+        return send_raw(client, ctx, chat_id, None, text, reply_to, None).await?.ok_or_else(|| "sent, but not returned".to_string());
+    }
     let peer = ctx.peer(chat_id)?;
     let input = input_from_markdown(ctx, text).reply_to(reply_to);
     let sent = client
@@ -1087,6 +1243,10 @@ async fn send_file(
     caption: &str,
 ) -> Result<Msg, TgError> {
     let peer = ctx.peer(chat_id)?;
+    if in_topic(chat_id) {
+        let media = upload_as_media(client, path).await?;
+        return send_media_msg(client, ctx, chat_id, media, caption).await;
+    }
     let uploaded = client
         .upload_file(path)
         .await
@@ -1142,6 +1302,13 @@ async fn mark_read(
     }
     let peer = ctx.peer(chat_id)?;
     let input_peer: tl::enums::InputPeer = peer.into();
+    if let (_, Some(topic)) = real_chat(chat_id) {
+        client
+            .invoke(&tl::functions::messages::ReadDiscussion { peer: input_peer, msg_id: topic, read_max_id: up_to })
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     // ReadHistory with max_id = the id the UI actually displayed, so a message
     // racing this request is never marked read unseen.
     match input_peer {
@@ -1176,6 +1343,9 @@ fn register_media(ctx: &Ctx, m: &Message, chat_id: i64) {
 fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
     let mi = media_info(m.media().as_ref(), m.date().with_timezone(&Local), m.edit_date().map(|d| d.with_timezone(&Local)));
     register_media(ctx, m, chat_id);
+    if let Some(Media::Poll(p)) = m.media() {
+        ctx.polls.lock().unwrap().insert(p.raw.id, p.raw.clone());
+    }
 
     let reactions = match &m.raw {
         tl::enums::Message::Message(raw) => raw
@@ -1330,6 +1500,12 @@ async fn consume_updates(
                 if events.send(Event::NewMessage(msg)).await.is_err() {
                     return;
                 }
+                // A topic's preview/unread changed (or a topic was created).
+                if ctx.forums.lock().unwrap().contains(&chat_id)
+                    && events.send(Event::TopicsChanged { forum_id: chat_id }).await.is_err()
+                {
+                    return;
+                }
             }
             Ok(Update::MessageEdited(m)) => {
                 let chat_id = m.peer_id().bot_api_dialog_id_unchecked();
@@ -1378,7 +1554,7 @@ async fn consume_updates(
                         }
                     }
                 }
-                if let Some(ev) = event_from_raw(&raw.raw) {
+                if let Some(ev) = event_from_raw(&ctx, &raw.raw) {
                     if events.send(ev).await.is_err() {
                         return;
                     }
@@ -1845,8 +2021,7 @@ async fn download_document_by_id(client: &Client, ctx: &Arc<Ctx>, id: i64, stick
     let dir = paths::media_dir();
     private_dir(&dir)?;
     let mime = doc.mime_type.as_str();
-    if sticker && mime != "image/webp" && mime != "image/png" {
-        // .tgs / .webm stickers cannot be rendered here.
+    if sticker && !matches!(mime, "image/webp" | "image/png" | "application/x-tgsticker" | "video/webm") {
         return Ok(None);
     }
     let ext = match mime {
@@ -1854,6 +2029,8 @@ async fn download_document_by_id(client: &Client, ctx: &Arc<Ctx>, id: i64, stick
         "image/png" => "png",
         "video/mp4" => "mp4",
         "image/gif" => "gif",
+        "application/x-tgsticker" => "tgs",
+        "video/webm" => "webm",
         _ => "bin",
     };
     let stem = format!("doc_{id}");
@@ -2088,6 +2265,16 @@ async fn send_voice(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, path: &std::p
     use grammers_client::media::Attribute;
     let peer = ctx.peer(chat_id)?;
     let uploaded = client.upload_file(path).await.map_err(|e| format!("upload failed: {e}"))?;
+    if in_topic(chat_id) {
+        let media = uploaded_document(uploaded.raw.clone(), "audio/ogg", vec![tl::enums::DocumentAttribute::Audio(tl::types::DocumentAttributeAudio {
+            voice: true,
+            duration: duration as i32,
+            title: None,
+            performer: None,
+            waveform: None,
+        })]);
+        return send_media_msg(client, ctx, chat_id, media, "").await;
+    }
     let input = InputMessage::new()
         .document(uploaded)
         .mime_type("audio/ogg")
@@ -2113,6 +2300,9 @@ async fn send_document_by_id(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, id: 
         ttl_seconds: None,
         query: None,
     });
+    if in_topic(chat_id) {
+        return send_media_msg(client, ctx, chat_id, media, "").await;
+    }
     let sent = client
         .send_message(peer, InputMessage::new().media(media))
         .await
@@ -2522,6 +2712,851 @@ fn text_of(t: &tl::enums::TextWithEntities) -> String {
     t.text.clone()
 }
 
+// ===================== wave 6: topics, polls, scheduled, bots, maps, stories =====================
+
+/// (real chat id, topic id) — topic ids are synthetic (see `tg::topic_chat_id`).
+fn real_chat(chat_id: i64) -> (i64, Option<i32>) {
+    match split_topic_chat_id(chat_id) {
+        Some((forum_id, topic)) => (forum_id, Some(topic)),
+        None => (chat_id, None),
+    }
+}
+
+/// Sends need a topic header for every topic but General (1).
+fn in_topic(chat_id: i64) -> bool {
+    matches!(real_chat(chat_id), (_, Some(t)) if t != 1)
+}
+
+fn input_peer_or_err(ctx: &Ctx, chat_id: i64) -> tl::enums::InputPeer {
+    input_peer(ctx, chat_id).unwrap_or(tl::enums::InputPeer::Empty)
+}
+
+fn input_geo(point: GeoPoint) -> tl::enums::InputGeoPoint {
+    tl::enums::InputGeoPoint::Point(tl::types::InputGeoPoint { lat: point.lat, long: point.lon, accuracy_radius: None })
+}
+
+fn random_id() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static COUNTER: AtomicI64 = AtomicI64::new(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    nanos ^ (COUNTER.fetch_add(1, Ordering::Relaxed) << 24) ^ ((std::process::id() as i64) << 48)
+}
+
+fn text_and_entities(ctx: &Ctx, text: &str) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
+    if !ctx.flags.lock().unwrap().markdown_send {
+        return (text.to_string(), None);
+    }
+    let (plain, spans) = parse_markdown(text);
+    if spans.is_empty() {
+        (text.to_string(), None)
+    } else {
+        let entities = entities_from_spans(&plain, &spans);
+        (plain, Some(entities))
+    }
+}
+
+fn reply_header(reply_to: Option<i32>, topic: Option<i32>) -> Option<tl::enums::InputReplyTo> {
+    let topic = topic.filter(|t| *t != 1);
+    let reply_to_msg_id = reply_to.or(topic)?;
+    Some(tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+        reply_to_msg_id,
+        top_msg_id: topic,
+        reply_to_peer_id: None,
+        quote_text: None,
+        quote_entities: None,
+        quote_offset: None,
+        monoforum_peer_id: None,
+        todo_item_id: None,
+        poll_option: None,
+    }))
+}
+
+/// The id of the message a send produced (`updateMessageID` pairs it with our random id).
+fn sent_message_id(updates: &tl::enums::Updates, random_id: i64) -> Option<i32> {
+    use tl::enums::Updates as U;
+    let list = match updates {
+        U::Updates(u) => &u.updates,
+        U::Combined(u) => &u.updates,
+        U::UpdateShortSentMessage(u) => return Some(u.id),
+        _ => return None,
+    };
+    list.iter().find_map(|u| match u {
+        tl::enums::Update::MessageId(m) if m.random_id == random_id => Some(m.id),
+        _ => None,
+    })
+}
+
+fn updates_list(updates: &tl::enums::Updates) -> &[tl::enums::Update] {
+    match updates {
+        tl::enums::Updates::Updates(u) => &u.updates,
+        tl::enums::Updates::Combined(u) => &u.updates,
+        _ => &[],
+    }
+}
+
+/// Raw send (messages.sendMessage / sendMedia) for topics and scheduled
+/// sends, which grammers' `send_message` cannot express. Returns the sent
+/// message (refetched by id) or None for scheduled sends.
+async fn send_raw(
+    client: &Client,
+    ctx: &Arc<Ctx>,
+    chat_id: i64,
+    media: Option<tl::enums::InputMedia>,
+    text: &str,
+    reply_to: Option<i32>,
+    schedule: Option<DateTime<Local>>,
+) -> Result<Option<Msg>, TgError> {
+    let (forum_id, topic) = real_chat(chat_id);
+    let peer = input_peer(ctx, forum_id)?;
+    let (message, entities) = text_and_entities(ctx, text);
+    let reply_to = reply_header(reply_to, topic);
+    let random_id = random_id();
+    let schedule_date = schedule.map(|at| at.timestamp() as i32);
+    let updates = match media {
+        Some(media) => client
+            .invoke(&tl::functions::messages::SendMedia {
+                silent: false,
+                background: false,
+                clear_draft: true,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer,
+                reply_to,
+                media,
+                message,
+                random_id,
+                reply_markup: None,
+                entities,
+                schedule_date,
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+            })
+            .await,
+        None => client
+            .invoke(&tl::functions::messages::SendMessage {
+                no_webpage: false,
+                silent: false,
+                background: false,
+                clear_draft: true,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer,
+                reply_to,
+                message,
+                random_id,
+                reply_markup: None,
+                entities,
+                schedule_date,
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+                rich_message: None,
+            })
+            .await,
+    }
+    .map_err(|e| format!("send failed: {e}"))?;
+    emit_poll_updates(ctx, &updates).await;
+    if schedule.is_some() {
+        let _ = ctx.events.send(Event::ScheduledChanged { chat_id: forum_id }).await;
+        return Ok(None);
+    }
+    let id = sent_message_id(&updates, random_id).ok_or_else(|| "sent, but Telegram returned no message id".to_string())?;
+    let sent = get_messages(client, ctx, forum_id, &[id]).await?;
+    Ok(sent.into_iter().next())
+}
+
+/// Sends one media message (topic-aware) and returns it.
+async fn send_media_msg(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, media: tl::enums::InputMedia, caption: &str) -> Result<Msg, TgError> {
+    send_raw(client, ctx, chat_id, Some(media), caption, None, None)
+        .await?
+        .ok_or_else(|| "sent, but the message was not returned".to_string())
+}
+
+fn uploaded_document(file: tl::enums::InputFile, mime: &str, attributes: Vec<tl::enums::DocumentAttribute>) -> tl::enums::InputMedia {
+    tl::enums::InputMedia::UploadedDocument(tl::types::InputMediaUploadedDocument {
+        nosound_video: false,
+        force_file: false,
+        spoiler: false,
+        file,
+        thumb: None,
+        mime_type: mime.to_string(),
+        attributes,
+        stickers: None,
+        video_cover: None,
+        video_timestamp: None,
+        ttl_seconds: None,
+    })
+}
+
+/// Uploads a file as a photo (image extensions) or a named document.
+async fn upload_as_media(client: &Client, path: &std::path::Path) -> Result<tl::enums::InputMedia, TgError> {
+    let uploaded = client.upload_file(path).await.map_err(|e| format!("upload failed: {e}"))?;
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let is_image = ["png", "jpg", "jpeg", "webp"].contains(&ext.as_str());
+    if is_image {
+        return Ok(tl::enums::InputMedia::UploadedPhoto(tl::types::InputMediaUploadedPhoto {
+            spoiler: false,
+            live_photo: false,
+            file: uploaded.raw,
+            stickers: None,
+            ttl_seconds: None,
+            video: None,
+        }));
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+    let mime = match ext.as_str() {
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    };
+    Ok(uploaded_document(
+        uploaded.raw,
+        mime,
+        vec![tl::enums::DocumentAttribute::Filename(tl::types::DocumentAttributeFilename { file_name: name })],
+    ))
+}
+
+async fn send_file_at(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, path: &std::path::Path, caption: &str, at: DateTime<Local>) -> Result<(), TgError> {
+    if at <= Local::now() {
+        return Err("the time is in the past".into());
+    }
+    let media = upload_as_media(client, path).await?;
+    send_raw(client, ctx, chat_id, Some(media), caption, None, Some(at)).await.map(|_| ())
+}
+
+async fn send_video_note(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, path: &std::path::Path, duration: u32, size: u32) -> Result<Msg, TgError> {
+    let uploaded = client.upload_file(path).await.map_err(|e| format!("upload failed: {e}"))?;
+    let media = uploaded_document(
+        uploaded.raw,
+        "video/mp4",
+        vec![tl::enums::DocumentAttribute::Video(tl::types::DocumentAttributeVideo {
+            round_message: true,
+            supports_streaming: true,
+            nosound: false,
+            duration: duration as f64,
+            w: size as i32,
+            h: size as i32,
+            preload_prefix_size: None,
+            video_start_ts: None,
+            video_codec: None,
+        })],
+    );
+    send_media_msg(client, ctx, chat_id, media, "").await
+}
+
+async fn edit_media(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, msg_id: i32, media: tl::enums::InputMedia) -> Result<(), TgError> {
+    let (forum_id, _) = real_chat(chat_id);
+    client
+        .invoke(&tl::functions::messages::EditMessage {
+            no_webpage: false,
+            invert_media: false,
+            peer: input_peer(ctx, forum_id)?,
+            id: msg_id,
+            message: None,
+            media: Some(media),
+            reply_markup: None,
+            entities: None,
+            schedule_date: None,
+            schedule_repeat_period: None,
+            quick_reply_shortcut_id: None,
+            rich_message: None,
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("edit failed: {e}"))
+}
+
+// ----- polls -----
+
+async fn emit_poll_updates(ctx: &Ctx, updates: &tl::enums::Updates) {
+    for u in updates_list(updates) {
+        if let tl::enums::Update::MessagePoll(_) = u {
+            if let Some(ev) = event_from_raw(ctx, u) {
+                let _ = ctx.events.send(ev).await;
+            }
+        }
+    }
+}
+
+async fn send_vote(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, msg_id: i32, options: &[usize]) -> Result<(), TgError> {
+    let (forum_id, _) = real_chat(chat_id);
+    let media = ctx.media.lock().unwrap().get(&(forum_id, msg_id)).cloned();
+    let Some(Media::Poll(poll)) = media else {
+        return Err("not a poll".into());
+    };
+    if poll.raw.closed {
+        return Err("this poll is closed".into());
+    }
+    let mut bytes = Vec::new();
+    for &i in options {
+        let answer = poll.raw.answers.get(i).ok_or_else(|| "no such option".to_string())?;
+        let option = match answer {
+            tl::enums::PollAnswer::Answer(a) => a.option.clone(),
+            tl::enums::PollAnswer::InputPollAnswer(_) => return Err("no such option".into()),
+        };
+        bytes.push(option);
+    }
+    let updates = client
+        .invoke(&tl::functions::messages::SendVote { peer: input_peer(ctx, forum_id)?, msg_id, options: bytes })
+        .await
+        .map_err(|e| format!("vote failed: {e}"))?;
+    emit_poll_updates(ctx, &updates).await;
+    Ok(())
+}
+
+async fn send_poll(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, draft: PollDraft) -> Result<Msg, TgError> {
+    let question = draft.question.trim().to_string();
+    let options: Vec<String> = draft.options.iter().map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect();
+    if question.is_empty() {
+        return Err("the poll needs a question".into());
+    }
+    if !(2..=10).contains(&options.len()) {
+        return Err("a poll needs 2 to 10 options".into());
+    }
+    if draft.quiz && draft.correct_option.is_none_or(|i| i >= options.len()) {
+        return Err("a quiz needs a correct answer".into());
+    }
+    let text = |s: &str| tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities { text: s.to_string(), entities: vec![] });
+    let poll = tl::types::Poll {
+        id: 0,
+        closed: false,
+        public_voters: !draft.anonymous,
+        multiple_choice: draft.multiple_choice && !draft.quiz,
+        quiz: draft.quiz,
+        open_answers: false,
+        revoting_disabled: false,
+        shuffle_answers: false,
+        hide_results_until_close: false,
+        creator: false,
+        subscribers_only: false,
+        question: text(&question),
+        answers: options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                tl::enums::PollAnswer::Answer(tl::types::PollAnswer { text: text(o), option: vec![i as u8], media: None, added_by: None, date: None })
+            })
+            .collect(),
+        close_period: None,
+        close_date: None,
+        countries_iso2: None,
+        hash: 0,
+    };
+    let media = tl::enums::InputMedia::Poll(Box::new(tl::types::InputMediaPoll {
+        poll: tl::enums::Poll::Poll(poll),
+        correct_answers: draft.quiz.then(|| vec![draft.correct_option.unwrap_or(0) as i32]),
+        attached_media: None,
+        solution: draft.solution.filter(|s| !s.trim().is_empty()),
+        solution_entities: None,
+        solution_media: None,
+    }));
+    send_media_msg(client, ctx, chat_id, media, "").await
+}
+
+// ----- contacts -----
+
+async fn add_contact(client: &Client, ctx: &Arc<Ctx>, user_id: i64, first_name: &str, last_name: &str, phone: &str) -> Result<(), TgError> {
+    if first_name.is_empty() && last_name.is_empty() {
+        return Err("a name is required".into());
+    }
+    let tl::enums::InputPeer::User(u) = input_peer(ctx, user_id)? else {
+        return Err("not a user".into());
+    };
+    client
+        .invoke(&tl::functions::contacts::AddContact {
+            add_phone_privacy_exception: false,
+            id: tl::enums::InputUser::User(tl::types::InputUser { user_id: u.user_id, access_hash: u.access_hash }),
+            first_name: first_name.to_string(),
+            last_name: last_name.to_string(),
+            phone: phone.to_string(),
+            note: None,
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("add contact failed: {e}"))
+}
+
+// ----- scheduled -----
+
+fn raw_messages(r: tl::enums::messages::Messages) -> Vec<tl::enums::Message> {
+    use tl::enums::messages::Messages as M;
+    match r {
+        M::Messages(m) => m.messages,
+        M::Slice(m) => m.messages,
+        M::ChannelMessages(m) => m.messages,
+        M::NotModified(_) => vec![],
+    }
+}
+
+fn raw_message_id(m: &tl::enums::Message) -> Option<i32> {
+    match m {
+        tl::enums::Message::Message(m) => Some(m.id),
+        tl::enums::Message::Service(m) => Some(m.id),
+        tl::enums::Message::Empty(_) => None,
+    }
+}
+
+fn raw_message_chat_id(m: &tl::enums::Message) -> Option<i64> {
+    match m {
+        tl::enums::Message::Message(m) => Some(peer_chat_id(&m.peer_id)),
+        tl::enums::Message::Service(m) => Some(peer_chat_id(&m.peer_id)),
+        tl::enums::Message::Empty(_) => None,
+    }
+}
+
+/// A `Msg` straight from a raw message (scheduled history, topic previews):
+/// no sender resolution beyond "You"/empty, no reactions, no archive.
+fn convert_raw(ctx: &Ctx, raw: &tl::types::Message, chat_id: i64) -> Msg {
+    let date = Local.timestamp_opt(raw.date as i64, 0).single().unwrap_or_else(Local::now);
+    let edited = raw.edit_date.and_then(|d| Local.timestamp_opt(d as i64, 0).single());
+    let media = raw.media.clone().and_then(Media::from_raw);
+    let mi = media_info(media.as_ref(), date, edited);
+    let text = raw.message.clone();
+    let spans = spans_from_entities(&text, raw.entities.as_deref().unwrap_or(&[]));
+    let markdown = to_markdown(&text, &spans);
+    let chat_title = ctx.titles.lock().unwrap().get(&chat_id).cloned().unwrap_or_default();
+    let topic_id = ctx.forums.lock().unwrap().contains(&chat_id).then(|| match raw.reply_to.as_ref() {
+        Some(tl::enums::MessageReplyHeader::Header(h)) if h.forum_topic => h.reply_to_top_id.or(h.reply_to_msg_id).unwrap_or(1),
+        _ => 1,
+    });
+    Msg {
+        id: raw.id,
+        chat_id,
+        chat_title,
+        sender: if raw.out { "You".to_string() } else { String::new() },
+        sender_id: raw.from_id.as_ref().and_then(|p| match p {
+            tl::enums::Peer::User(u) => Some(u.user_id),
+            _ => None,
+        }),
+        text,
+        spans,
+        markdown,
+        ts: date,
+        outgoing: raw.out,
+        media: mi.kind,
+        doc_name: mi.doc_name,
+        doc_size: mi.doc_size,
+        duration: mi.duration,
+        photo_size: mi.photo_size,
+        sticker_emoji: mi.sticker_emoji,
+        webpage: mi.webpage,
+        forwarded_from: None,
+        views: raw.views,
+        reply_to: raw.reply_to.as_ref().and_then(|r| match r {
+            tl::enums::MessageReplyHeader::Header(h) => h.reply_to_msg_id,
+            _ => None,
+        }),
+        reactions: vec![],
+        edited: raw.edit_date.is_some() && !raw.edit_hide,
+        deleted: false,
+        pinned: raw.pinned,
+        location: mi.location,
+        contact: mi.contact,
+        dice: mi.dice,
+        poll: mi.poll,
+        keyboard: None,
+        topic_id,
+        scheduled: false,
+        audio_title: mi.audio_title,
+        audio_performer: mi.audio_performer,
+        round: mi.round,
+    }
+}
+
+async fn get_scheduled(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<Vec<Msg>, TgError> {
+    let (forum_id, _) = real_chat(chat_id);
+    let r = client
+        .invoke(&tl::functions::messages::GetScheduledHistory { peer: input_peer(ctx, forum_id)?, hash: 0 })
+        .await
+        .map_err(|e| format!("scheduled messages failed: {e}"))?;
+    let mut out: Vec<Msg> = raw_messages(r)
+        .iter()
+        .filter_map(|m| match m {
+            tl::enums::Message::Message(raw) => Some(convert_raw(ctx, raw, forum_id)),
+            _ => None,
+        })
+        .map(|mut m| {
+            m.scheduled = true;
+            m
+        })
+        .collect();
+    out.sort_by_key(|m| (m.ts, m.id));
+    Ok(out)
+}
+
+// ----- bots -----
+
+async fn press_button(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, msg_id: i32, data: Vec<u8>) -> Result<Option<String>, TgError> {
+    let (forum_id, _) = real_chat(chat_id);
+    let r = client
+        .invoke(&tl::functions::messages::GetBotCallbackAnswer {
+            game: false,
+            peer: input_peer(ctx, forum_id)?,
+            msg_id,
+            data: Some(data),
+            password: None,
+        })
+        .await
+        .map_err(|e| format!("button failed: {e}"))?;
+    let tl::enums::messages::BotCallbackAnswer::Answer(a) = r;
+    Ok(a.message.filter(|m| !m.is_empty()).or(a.url.filter(|u| !u.is_empty())))
+}
+
+// ----- forum topics -----
+
+async fn get_topics(client: &Client, ctx: &Arc<Ctx>, forum_id: i64) -> Result<Vec<Topic>, TgError> {
+    let r = client
+        .invoke(&tl::functions::messages::GetForumTopics {
+            peer: input_peer(ctx, forum_id)?,
+            q: None,
+            offset_date: 0,
+            offset_id: 0,
+            offset_topic: 0,
+            limit: 100,
+        })
+        .await
+        .map_err(|e| format!("topics failed: {e}"))?;
+    let tl::enums::messages::ForumTopics::Topics(t) = r;
+    ctx.forums.lock().unwrap().insert(forum_id);
+    let previews: HashMap<i32, Msg> = t
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            tl::enums::Message::Message(raw) => Some((raw.id, convert_raw(ctx, raw, forum_id))),
+            _ => None,
+        })
+        .collect();
+    let mut out: Vec<Topic> = t
+        .topics
+        .iter()
+        .filter_map(|topic| match topic {
+            tl::enums::ForumTopic::Topic(x) => {
+                let last = previews.get(&x.top_message);
+                Some(Topic {
+                    id: x.id,
+                    chat_id: topic_chat_id(forum_id, x.id),
+                    forum_id,
+                    title: x.title.clone(),
+                    icon_emoji: String::new(),
+                    unread: x.unread_count,
+                    last_message: last.map(preview_of).unwrap_or_default(),
+                    last_time: last.map(|m| m.ts).or_else(|| Local.timestamp_opt(x.date as i64, 0).single()),
+                    pinned: x.pinned,
+                    closed: x.closed,
+                })
+            }
+            tl::enums::ForumTopic::Deleted(_) => None,
+        })
+        .collect();
+    out.sort_by_key(|t| (std::cmp::Reverse(t.pinned), std::cmp::Reverse(t.last_time)));
+    Ok(out)
+}
+
+async fn create_topic(client: &Client, ctx: &Arc<Ctx>, forum_id: i64, title: &str) -> Result<Topic, TgError> {
+    if title.is_empty() {
+        return Err("the topic needs a title".into());
+    }
+    let updates = client
+        .invoke(&tl::functions::messages::CreateForumTopic {
+            title_missing: false,
+            peer: input_peer(ctx, forum_id)?,
+            title: title.to_string(),
+            icon_color: None,
+            icon_emoji_id: None,
+            random_id: random_id(),
+            send_as: None,
+        })
+        .await
+        .map_err(|e| format!("create topic failed: {e}"))?;
+    let created = updates_list(&updates).iter().find_map(|u| match u {
+        tl::enums::Update::NewChannelMessage(x) => match &x.message {
+            tl::enums::Message::Service(s) => Some(s.id),
+            _ => None,
+        },
+        _ => None,
+    });
+    let topics = get_topics(client, ctx, forum_id).await?;
+    topics
+        .into_iter()
+        .find(|t| created.is_some_and(|id| id == t.id) || (created.is_none() && t.title == title))
+        .ok_or_else(|| "topic created, but not listed yet".to_string())
+}
+
+// ----- maps -----
+
+/// Stitches OpenStreetMap tiles into a `width`×`height` PNG centered on
+/// `point` (cached by rounded coordinates). Network trouble is `Ok(None)`.
+async fn download_map(ctx: &Arc<Ctx>, point: GeoPoint, zoom: u8, width: u32, height: u32) -> Result<Option<PathBuf>, TgError> {
+    let zoom = zoom.clamp(1, 19);
+    let width = width.clamp(16, 1024);
+    let height = height.clamp(16, 1024);
+    let dir = paths::media_dir().join("maps");
+    private_dir(&dir)?;
+    let path = dir.join(format!("{:.5}_{:.5}_{zoom}_{width}x{height}.png", point.lat, point.lon));
+    if path.exists() {
+        return Ok(Some(path));
+    }
+    let n = (1u64 << zoom) as f64;
+    let lat = point.lat.clamp(-85.0511, 85.0511).to_radians();
+    let cx = (point.lon + 180.0) / 360.0 * n * 256.0;
+    let cy = (1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0 * n * 256.0;
+    let left = cx - width as f64 / 2.0;
+    let top = cy - height as f64 / 2.0;
+    let tx0 = (left / 256.0).floor() as i64;
+    let tx1 = ((left + width as f64 - 1.0) / 256.0).floor() as i64;
+    let ty0 = (top / 256.0).floor() as i64;
+    let ty1 = ((top + height as f64 - 1.0) / 256.0).floor() as i64;
+    let mut canvas = image::RgbaImage::from_pixel(width, height, image::Rgba([0xe0, 0xe0, 0xe0, 0xff]));
+    for ty in ty0..=ty1 {
+        for tx in tx0..=tx1 {
+            let max = n as i64;
+            let (wx, wy) = (tx.rem_euclid(max), ty);
+            if wy < 0 || wy >= max {
+                continue;
+            }
+            let url = format!("https://tile.openstreetmap.org/{zoom}/{wx}/{wy}.png");
+            let bytes = match ctx.http.get(&url).send().await {
+                Ok(r) if r.status().is_success() => match r.bytes().await {
+                    Ok(b) => b,
+                    Err(_) => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            let Ok(tile) = image::load_from_memory(&bytes) else { return Ok(None) };
+            let tile = tile.to_rgba8();
+            let ox = (tx as f64 * 256.0 - left).round() as i64;
+            let oy = (ty as f64 * 256.0 - top).round() as i64;
+            for (px, py, pixel) in tile.enumerate_pixels() {
+                let x = ox + px as i64;
+                let y = oy + py as i64;
+                if x >= 0 && y >= 0 && (x as u32) < width && (y as u32) < height {
+                    canvas.put_pixel(x as u32, y as u32, *pixel);
+                }
+            }
+        }
+    }
+    let (mx, my) = (width as i32 / 2, height as i32 / 2);
+    for y in (my - 9).max(0)..(my + 9).min(height as i32) {
+        for x in (mx - 9).max(0)..(mx + 9).min(width as i32) {
+            let d2 = (x - mx).pow(2) + (y - my).pow(2);
+            if d2 <= 36 {
+                canvas.put_pixel(x as u32, y as u32, image::Rgba([0xd0, 0x3a, 0x2f, 0xff]));
+            } else if d2 <= 64 {
+                canvas.put_pixel(x as u32, y as u32, image::Rgba([0xff, 0xff, 0xff, 0xff]));
+            }
+        }
+    }
+    canvas.save(&path).map_err(|e| e.to_string())?;
+    chmod_600(&path);
+    Ok(Some(path))
+}
+
+// ----- stories -----
+
+fn peer_name(users: &[tl::enums::User], chats: &[tl::enums::Chat], chat_id: i64) -> (String, bool) {
+    for u in users {
+        if let tl::enums::User::User(u) = u {
+            if u.id == chat_id {
+                let (name, _, _, _, has_photo, _) = user_facts(u);
+                return (name, has_photo);
+            }
+        }
+    }
+    for c in chats {
+        match c {
+            tl::enums::Chat::Channel(c) if -1_000_000_000_000 - c.id == chat_id => {
+                let has_photo = matches!(c.photo, tl::enums::ChatPhoto::Photo(_));
+                return (c.title.clone(), has_photo);
+            }
+            tl::enums::Chat::Chat(c) if -c.id == chat_id => {
+                let has_photo = matches!(c.photo, tl::enums::ChatPhoto::Photo(_));
+                return (c.title.clone(), has_photo);
+            }
+            _ => {}
+        }
+    }
+    (String::new(), false)
+}
+
+/// Caches the peers of a stories response so `get_stories` can address them.
+fn remember_story_peers(ctx: &Ctx, users: &[tl::enums::User], chats: &[tl::enums::Chat]) {
+    for u in users {
+        if let tl::enums::User::User(u) = u {
+            let (name, ..) = user_facts(u);
+            let peer_ref = PeerRef { id: PeerId::user_unchecked(u.id), auth: PeerAuth::from_hash(u.access_hash.unwrap_or(0)) };
+            if ctx.peer(u.id).is_err() {
+                ctx.remember(u.id, peer_ref, Some(&name));
+            }
+        }
+    }
+    for c in chats {
+        if let tl::enums::Chat::Channel(c) = c {
+            let chat_id = -1_000_000_000_000 - c.id;
+            let peer_ref = PeerRef { id: PeerId::channel_unchecked(c.id), auth: PeerAuth::from_hash(c.access_hash.unwrap_or(0)) };
+            if ctx.peer(chat_id).is_err() {
+                ctx.remember(chat_id, peer_ref, Some(&c.title));
+            }
+        }
+    }
+}
+
+fn story_unread(ps: &tl::types::PeerStories) -> bool {
+    let max_read = ps.max_read_id.unwrap_or(0);
+    ps.stories.iter().any(|s| matches!(s, tl::enums::StoryItem::Item(i) if i.id > max_read))
+}
+
+async fn fetch_all_stories(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<StoryPeer>, TgError> {
+    let r = client
+        .invoke(&tl::functions::stories::GetAllStories { next: false, hidden: false, state: None })
+        .await
+        .map_err(|e| format!("stories failed: {e}"))?;
+    let tl::enums::stories::AllStories::Stories(all) = r else {
+        return Ok(vec![]);
+    };
+    remember_story_peers(ctx, &all.users, &all.chats);
+    let mut rings = HashMap::new();
+    let mut peers = Vec::new();
+    for ps in &all.peer_stories {
+        let tl::enums::PeerStories::Stories(ps) = ps;
+        let chat_id = peer_chat_id(&ps.peer);
+        let unread = story_unread(ps);
+        let (name, has_photo) = peer_name(&all.users, &all.chats, chat_id);
+        rings.insert(chat_id, if unread { StoryRing::Unread } else { StoryRing::Read });
+        peers.push(StoryPeer { chat_id, name, unread, has_photo });
+    }
+    peers.sort_by_key(|p| (std::cmp::Reverse(p.unread), p.name.to_lowercase()));
+    *ctx.story_rings.lock().unwrap() = rings;
+    *ctx.stories_fetched.lock().unwrap() = Some(std::time::Instant::now());
+    Ok(peers)
+}
+
+/// Refreshes `ctx.story_rings` at most every 5 minutes (`force` ignores the age).
+async fn refresh_story_rings(client: &Client, ctx: &Arc<Ctx>, force: bool) {
+    let fresh = ctx
+        .stories_fetched
+        .lock()
+        .unwrap()
+        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(300));
+    if fresh && !force {
+        return;
+    }
+    if let Err(e) = fetch_all_stories(client, ctx).await {
+        eprintln!("omarchygram: stories unavailable: {e}");
+        *ctx.stories_fetched.lock().unwrap() = Some(std::time::Instant::now());
+    }
+}
+
+async fn get_story_peers(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<StoryPeer>, TgError> {
+    fetch_all_stories(client, ctx).await
+}
+
+fn story_of(ctx: &Ctx, chat_id: i64, item: &tl::types::StoryItem, max_read: i32) -> Story {
+    ctx.story_media.lock().unwrap().insert((chat_id, item.id), item.media.clone());
+    let (video, duration) = match &item.media {
+        tl::enums::MessageMedia::Document(d) => {
+            let duration = match d.document.as_ref() {
+                Some(tl::enums::Document::Document(doc)) => doc.attributes.iter().find_map(|a| match a {
+                    tl::enums::DocumentAttribute::Video(v) => Some(v.duration.round() as u32),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            (true, duration)
+        }
+        _ => (false, None),
+    };
+    Story {
+        id: item.id,
+        chat_id,
+        ts: Local.timestamp_opt(item.date as i64, 0).single().unwrap_or_else(Local::now),
+        expires: Local.timestamp_opt(item.expire_date as i64, 0).single().unwrap_or_else(Local::now),
+        video,
+        duration,
+        caption: item.caption.clone().unwrap_or_default(),
+        seen: item.id <= max_read,
+    }
+}
+
+async fn get_stories(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<Vec<Story>, TgError> {
+    let r = client
+        .invoke(&tl::functions::stories::GetPeerStories { peer: input_peer(ctx, chat_id)? })
+        .await
+        .map_err(|e| format!("stories failed: {e}"))?;
+    let tl::enums::stories::PeerStories::Stories(ps) = r;
+    remember_story_peers(ctx, &ps.users, &ps.chats);
+    let tl::enums::PeerStories::Stories(ps) = ps.stories;
+    let max_read = ps.max_read_id.unwrap_or(0);
+    let mut out: Vec<Story> = ps
+        .stories
+        .iter()
+        .filter_map(|s| match s {
+            tl::enums::StoryItem::Item(i) => Some(story_of(ctx, chat_id, i, max_read)),
+            _ => None,
+        })
+        .collect();
+    out.sort_by_key(|s| s.id);
+    Ok(out)
+}
+
+async fn download_story(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, story_id: i32) -> Result<Option<PathBuf>, TgError> {
+    let raw = ctx.story_media.lock().unwrap().get(&(chat_id, story_id)).cloned();
+    let Some(raw) = raw else {
+        return Err("open the story list first".into());
+    };
+    let Some(media) = Media::from_raw(raw) else {
+        return Ok(None);
+    };
+    let ext = match &media {
+        Media::Photo(_) => "jpg",
+        Media::Document(_) => "mp4",
+        _ => return Ok(None),
+    };
+    let dir = paths::media_dir();
+    private_dir(&dir)?;
+    let path = dir.join(format!("story_{}_{story_id}.{ext}", chat_id.unsigned_abs()));
+    if path.exists() {
+        return Ok(Some(path));
+    }
+    client.download_media(&media, &path).await.map_err(|e| format!("download failed: {e}"))?;
+    chmod_600(&path);
+    Ok(Some(path))
+}
+
+async fn mark_stories_seen(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, up_to_id: i32) -> Result<(), TgError> {
+    client
+        .invoke(&tl::functions::stories::ReadStories { peer: input_peer(ctx, chat_id)?, max_id: up_to_id })
+        .await
+        .map_err(|e| format!("read stories failed: {e}"))?;
+    *ctx.stories_fetched.lock().unwrap() = None;
+    let _ = ctx.events.send(Event::StoriesChanged).await;
+    Ok(())
+}
+
+fn sticker_mime(s: &grammers_client::media::Sticker) -> String {
+    match s.document.raw.document.as_ref() {
+        Some(tl::enums::Document::Document(d)) => d.mime_type.clone(),
+        _ => String::new(),
+    }
+}
+
 // ===================== wave 5: stickers & gifs =====================
 
 async fn sticker_packs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<StickerPack>, TgError> {
@@ -2630,9 +3665,28 @@ async fn saved_gifs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<Gif>, TgError
 
 // ===================== wave 5: raw updates =====================
 
-fn event_from_raw(u: &tl::enums::Update) -> Option<Event> {
+fn event_from_raw(ctx: &Ctx, u: &tl::enums::Update) -> Option<Event> {
     use tl::enums::Update as U;
     Some(match u {
+        U::MessagePoll(x) => {
+            let tl::enums::PollResults::Results(results) = &x.results;
+            let poll = match &x.poll {
+                Some(tl::enums::Poll::Poll(p)) => {
+                    ctx.polls.lock().unwrap().insert(p.id, p.clone());
+                    p.clone()
+                }
+                None => ctx.polls.lock().unwrap().get(&x.poll_id).cloned()?,
+            };
+            Event::PollChanged { poll_id: x.poll_id, poll: poll_of(&poll, results) }
+        }
+        U::NewScheduledMessage(x) => Event::ScheduledChanged { chat_id: raw_message_chat_id(&x.message)? },
+        U::DeleteScheduledMessages(x) => Event::ScheduledChanged { chat_id: peer_chat_id(&x.peer) },
+        U::PinnedForumTopic(x) => Event::TopicsChanged { forum_id: peer_chat_id(&x.peer) },
+        U::PinnedForumTopics(x) => Event::TopicsChanged { forum_id: peer_chat_id(&x.peer) },
+        U::Story(_) | U::ReadStories(_) => {
+            *ctx.stories_fetched.lock().unwrap() = None;
+            Event::StoriesChanged
+        }
         U::ReadHistoryOutbox(x) => Event::ReadOutbox { chat_id: peer_chat_id(&x.peer), max_id: x.max_id },
         U::ReadChannelOutbox(x) => Event::ReadOutbox { chat_id: -1_000_000_000_000 - x.channel_id, max_id: x.max_id },
         U::ReadHistoryInbox(x) => Event::ReadInbox { chat_id: peer_chat_id(&x.peer), max_id: x.max_id },

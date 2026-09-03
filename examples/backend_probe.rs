@@ -90,5 +90,67 @@ async fn main() {
         step("get_history(archived)", tg.get_history(c.id, None).await.map(|h| format!("{} msgs in an archived chat", h.len())));
     }
     step("search_chats", tg.search_chats("telegram").await.map(|c| format!("{} results", c.len())));
+
+    // ----- wave 6 (read-only) -----
+    step("get_story_peers", tg.get_story_peers().await.map(|p| format!("{} peers with stories, {} unread", p.len(), p.iter().filter(|x| x.unread).count())));
+    if let Ok(peers) = tg.get_story_peers().await {
+        if let Some(p) = peers.first() {
+            let stories = tg.get_stories(p.chat_id).await;
+            step("get_stories", stories.as_ref().map(|s| format!("{} stories, {} video", s.len(), s.iter().filter(|x| x.video).count())).map_err(|e| e.clone()));
+            if let Ok(s) = stories {
+                if let Some(st) = s.first() {
+                    step("download_story", tg.download_story(p.chat_id, st.id).await.map(|p| format!("{:?}", p.map(|p| p.exists()))));
+                }
+            }
+        }
+    }
+    let forums = dialogs.iter().filter(|c| c.forum).count();
+    step("forums", Ok(format!("{forums} forum dialogs")));
+    if let Some(f) = dialogs.iter().find(|c| c.forum) {
+        let topics = tg.get_topics(f.id).await;
+        step("get_topics", topics.as_ref().map(|t| format!("{} topics, {} pinned, {} closed, {} with unread", t.len(), t.iter().filter(|x| x.pinned).count(), t.iter().filter(|x| x.closed).count(), t.iter().filter(|x| x.unread > 0).count())).map_err(|e| e.clone()));
+        if let Ok(t) = topics {
+            if let Some(topic) = t.iter().find(|x| !x.last_message.is_empty()).or(t.first()) {
+                let hist = tg.get_history(topic.chat_id, None).await;
+                step(
+                    "get_history(topic)",
+                    hist.as_ref().map(|h| format!("{} msgs, {} carry topic_id {}", h.len(), h.iter().filter(|m| m.topic_id == Some(topic.id)).count(), topic.id)).map_err(|e| e.clone()),
+                );
+                if let Ok(h) = hist {
+                    if let Some(m) = h.first() {
+                        step("get_messages(topic)", tg.get_messages(topic.chat_id, vec![m.id]).await.map(|v| format!("{} fetched", v.len())));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(c) = dialogs.iter().find(|c| matches!(c.kind, omarchygram::tg::ChatKind::User)) {
+        step("get_scheduled", tg.get_scheduled(c.id).await.map(|s| format!("{} scheduled", s.len())));
+    }
+    if let Some(b) = dialogs.iter().find(|c| matches!(c.kind, omarchygram::tg::ChatKind::Bot)) {
+        step("get_chat_info(bot)", tg.get_chat_info(b.id).await.map(|i| format!("{} commands", i.bot_commands.len())));
+        step("get_history(bot)", tg.get_history(b.id, None).await.map(|h| format!("{} msgs, {} with keyboards", h.len(), h.iter().filter(|m| m.keyboard.is_some()).count())));
+    }
+    let media_kinds: std::collections::BTreeMap<String, usize> = {
+        let mut counts = std::collections::BTreeMap::new();
+        for c in dialogs.iter().take(12) {
+            if let Ok(h) = tg.get_history(c.id, None).await {
+                for m in h {
+                    if let Some(k) = m.media {
+                        *counts.entry(format!("{k:?}")).or_insert(0) += 1;
+                    }
+                    if m.poll.is_some() {
+                        *counts.entry("poll payload".into()).or_insert(0) += 1;
+                    }
+                    if m.location.is_some() {
+                        *counts.entry("location payload".into()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        counts
+    };
+    step("media kinds in the 12 newest chats", Ok(format!("{media_kinds:?}")));
+    step("download_map", tg.download_map(omarchygram::tg::GeoPoint { lat: 52.52, lon: 13.405 }, 15, 320, 180).await.map(|p| format!("{:?}", p.map(|p| p.exists()))));
     println!("done");
 }
