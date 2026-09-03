@@ -7770,7 +7770,7 @@ impl ShellInner {
             match self.tg.download_media(chat_id, msg_id).await {
                 // Wave 6D: a .tgs sticker is Lottie, not an image — it must
                 // never reach the texture decoder below.
-                Ok(Some(path)) if is_lottie(&path) => {
+                Ok(Some(path)) if kind == MediaKind::Sticker && is_lottie(&path) => {
                     if !self.is_current(chat_id, epoch) || !self.messages.contains(msg_id) {
                         return;
                     }
@@ -12138,6 +12138,13 @@ impl ShellInner {
             probe_fail(&format!("lottie sticker error: {error}"));
             return false;
         }
+        if sticker.logical_size() != lottie::BUBBLE_SIZE
+            || sticker.raster_size()
+                != (lottie::BUBBLE_SIZE * sticker.scale_factor()) as u32
+        {
+            probe_fail("lottie logical size / DPI raster size");
+            return false;
+        }
         // The row is the newest message, but a settling layout can leave it
         // below the viewport — an off-screen sticker is paused by design.
         if !self.messages.row_visible(813) {
@@ -12175,6 +12182,7 @@ impl ShellInner {
         if !poll_until(3_000, || {
             !self.messages.row_visible(813)
                 && !sticker.is_animating()
+                && sticker.frame_index() == 0
                 && lottie::animating_count() == 0
         })
         .await
@@ -12204,7 +12212,7 @@ impl ShellInner {
         probe_step("lottie master toggle");
         self.settings
             .update(|settings| settings.media.animated_stickers = false);
-        if !poll_until(2_000, || !sticker.is_animating()).await {
+        if !poll_until(2_000, || !sticker.is_animating() && sticker.frame_index() == 0).await {
             probe_fail("animated_stickers off pauses playback");
             return false;
         }
@@ -12227,7 +12235,7 @@ impl ShellInner {
         // The animations master switch pauses stickers as well (§1.8).
         if let Some(gtk_settings) = gtk::Settings::default() {
             gtk_settings.set_gtk_enable_animations(false);
-            if !poll_until(2_000, || !sticker.is_animating()).await {
+            if !poll_until(2_000, || !sticker.is_animating() && sticker.frame_index() == 0).await {
                 gtk_settings.set_gtk_enable_animations(true);
                 probe_fail("animations master off pauses stickers");
                 return false;
@@ -12290,6 +12298,13 @@ impl ShellInner {
             probe_fail("animated sticker cell widget");
             return false;
         };
+        if self.stickers.sticker_cell_size(9104)
+            != Some(((lottie::CELL_SIZE, lottie::CELL_SIZE), (lottie::CELL_SIZE, lottie::CELL_SIZE)))
+            || cell.logical_size() != lottie::CELL_SIZE
+        {
+            probe_fail("animated sticker picker cell size");
+            return false;
+        }
         if cell.is_animating() {
             probe_fail("animated sticker cell animates without hover");
             return false;
@@ -12307,7 +12322,7 @@ impl ShellInner {
             probe_fail("animated sticker cell hover leave");
             return false;
         }
-        if !poll_until(2_000, || !cell.is_animating()).await {
+        if !poll_until(2_000, || !cell.is_animating() && cell.frame_index() == 0).await {
             probe_fail("animated sticker cell pauses on leave");
             return false;
         }
@@ -12315,6 +12330,26 @@ impl ShellInner {
         glib::timeout_future(Duration::from_millis(300)).await;
         if cell.frames_shown() != left {
             probe_fail("unhovered animated sticker cell kept rendering");
+            return false;
+        }
+
+        probe_step("lottie picker first-frame cache");
+        self.stickers.probe_select_pack("recent");
+        if !poll_until(4_000, || self.stickers.current_pack() == "recent").await {
+            probe_fail("switch away from cached sticker pack");
+            return false;
+        }
+        self.stickers.probe_select_pack(&pack);
+        if !poll_until(8_000, || {
+            self.stickers.current_pack() == pack
+                && self
+                    .stickers
+                    .lottie(9104)
+                    .is_some_and(|sticker| sticker.is_ready() && sticker.seeded_from_cache())
+        })
+        .await
+        {
+            probe_fail("rebuilt picker cell did not use first-frame cache");
             return false;
         }
         self.close_stickers();

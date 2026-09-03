@@ -60,7 +60,7 @@ pub struct StickerPicker {
     cells: Rc<RefCell<HashMap<i64, StickerCell>>>,
     paths: Rc<RefCell<HashMap<i64, PathBuf>>>,
     /// Cells whose image download or decode failed. They keep their emoji
-    /// placeholder and stay sendable (only `animated` blocks a send).
+    /// placeholder and stay sendable.
     unavailable: Rc<RefCell<HashSet<i64>>>,
     generation: Rc<Cell<u64>>,
     content_generation: Rc<Cell<u64>>,
@@ -388,7 +388,8 @@ impl StickerPicker {
             return false;
         };
         picture.add_css_class("omg-lottie");
-        let sticker = lottie::Sticker::new(&picture, &path, lottie::CELL_SIZE);
+        let sticker =
+            lottie::Sticker::new_cached(&picture, &path, lottie::CELL_SIZE, sticker_id);
         {
             let picture = picture.clone();
             sticker.connect_ready(move || picture.set_visible(true));
@@ -432,6 +433,17 @@ impl StickerPicker {
             .borrow()
             .get(&sticker_id)
             .and_then(|cell| cell.lottie.borrow().clone())
+    }
+
+    /// Probe helper for §5.2's 96×96 picker cell/picture contract.
+    pub fn sticker_cell_size(&self, sticker_id: i64) -> Option<((i32, i32), (i32, i32))> {
+        let cell = self.cells.borrow().get(&sticker_id).cloned()?;
+        let button = cell.button.upgrade()?;
+        let picture = cell.picture.upgrade()?;
+        Some((
+            (button.width_request(), button.height_request()),
+            (picture.width_request(), picture.height_request()),
+        ))
     }
 
     /// A GIF whose mp4 arrived (wave 6: the mock renders one with ffmpeg;
@@ -550,14 +562,13 @@ impl StickerPicker {
         !self.stickers.borrow().is_empty()
     }
 
-    /// Wave 6D: animated .tgs stickers are sendable; only .webm video
-    /// stickers still are not.
+    /// Wave 6D: both .tgs and 6A-backed .webm stickers are sendable.
     pub fn sticker_sendable(&self, sticker_id: i64) -> bool {
         self.stickers
             .borrow()
             .iter()
             .find(|sticker| sticker.id == sticker_id)
-            .is_some_and(|sticker| !sticker.video)
+            .is_some()
     }
 
     pub fn downloaded_ids(&self) -> Vec<i64> {
@@ -644,7 +655,7 @@ impl StickerPicker {
         for (index, sticker) in self.stickers.borrow().clone().into_iter().enumerate() {
             let button = gtk::Button::new();
             button.add_css_class("omg-sticker-cell");
-            button.set_size_request(64, 64);
+            button.set_size_request(lottie::CELL_SIZE, lottie::CELL_SIZE);
             let overlay = gtk::Overlay::new();
             // .webm video stickers have no preview surface yet.
             let placeholder = gtk::Label::new(Some(if sticker.video {
@@ -657,19 +668,17 @@ impl StickerPicker {
             let picture = gtk::Picture::new();
             picture.set_can_shrink(true);
             picture.set_content_fit(gtk::ContentFit::Contain);
-            picture.set_size_request(56, 56);
+            picture.set_size_request(lottie::CELL_SIZE, lottie::CELL_SIZE);
             picture.set_visible(false);
             overlay.add_overlay(&picture);
             button.set_child(Some(&overlay));
-            // Wave 6D: animated .tgs stickers are sendable and rendered.
-            button.set_sensitive(!sticker.video);
-            if !sticker.video {
-                let action = self.action.clone();
-                let id = sticker.id;
-                button.connect_clicked(move |_| {
-                    emit(&action, StickerAction::Send(StickerSend::Sticker(id)));
-                });
-            }
+            // 6A supplies .webm playback after send; the picker may retain
+            // its static "webm" placeholder, but the cell is still usable.
+            let action = self.action.clone();
+            let id = sticker.id;
+            button.connect_clicked(move |_| {
+                emit(&action, StickerAction::Send(StickerSend::Sticker(id)));
+            });
             let lottie: Rc<RefCell<Option<lottie::Sticker>>> = Rc::new(RefCell::new(None));
             let hovered = Rc::new(Cell::new(false));
             if sticker.animated && !sticker.video {

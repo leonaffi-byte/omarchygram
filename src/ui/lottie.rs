@@ -9,8 +9,8 @@
 //! when GTK animations are off.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -34,17 +34,26 @@ pub const CELL_SIZE: i32 = 96;
 const MAX_ANIMATING: usize = 6;
 /// 60 Hz cap for the render thread.
 const MIN_INTERVAL: Duration = Duration::from_millis(16);
-/// Rasterizing above this edge length is pointless on a 256px bubble.
-const MAX_PIXELS: i32 = 512;
+/// Picker first frames survive grid rebuilds, but remain bounded at personal-
+/// client scale. Entries are keyed by Telegram sticker id and replaced when
+/// their display scale changes.
+const FIRST_FRAME_CACHE_CAPACITY: usize = 64;
 
 enum Command {
-    Load { id: u64, bytes: Vec<u8>, size: u32 },
+    Load {
+        id: u64,
+        generation: u64,
+        bytes: Vec<u8>,
+        size: u32,
+        emit_first: bool,
+    },
     Play(u64),
     Pause(u64),
     Drop(u64),
 }
 
 struct Frame {
+    generation: u64,
     index: usize,
     size: u32,
     data: Vec<u8>,
@@ -52,10 +61,13 @@ struct Frame {
 
 #[derive(Default)]
 struct Pending {
+    /// Initial frames are never coalesced away by a later animation frame;
+    /// the UI needs frame zero as its stable paused texture.
+    initial_frames: HashMap<u64, Frame>,
     /// Latest frame per sticker: an unconsumed frame is replaced, never
     /// queued, so a slow UI thread can never fall behind.
     frames: HashMap<u64, Frame>,
-    errors: Vec<(u64, String)>,
+    errors: Vec<(u64, u64, String)>,
 }
 
 struct Bus {
@@ -64,11 +76,27 @@ struct Bus {
 }
 
 impl Bus {
-    fn frame(&self, id: u64, index: usize, size: u32, data: &[u8]) {
+    fn initial_frame(&self, id: u64, generation: u64, size: u32, data: &[u8]) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.initial_frames.insert(
+                id,
+                Frame {
+                    generation,
+                    index: 0,
+                    size,
+                    data: data.to_vec(),
+                },
+            );
+        }
+        let _ = self.wake.try_send(());
+    }
+
+    fn frame(&self, id: u64, generation: u64, index: usize, size: u32, data: &[u8]) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.frames.insert(
                 id,
                 Frame {
+                    generation,
                     index,
                     size,
                     data: data.to_vec(),
@@ -78,10 +106,11 @@ impl Bus {
         let _ = self.wake.try_send(());
     }
 
-    fn error(&self, id: u64, message: String) {
+    fn error(&self, id: u64, generation: u64, message: String) {
         if let Ok(mut pending) = self.pending.lock() {
+            pending.initial_frames.remove(&id);
             pending.frames.remove(&id);
-            pending.errors.push((id, message));
+            pending.errors.push((id, generation, message));
         }
         let _ = self.wake.try_send(());
     }
@@ -89,6 +118,7 @@ impl Bus {
 
 struct Live {
     anim: Animation<'static>,
+    generation: u64,
     frames: usize,
     playhead: usize,
     interval: Duration,
@@ -146,10 +176,10 @@ fn render_thread(commands: mpsc::Receiver<Command>, bus: Arc<Bus>) {
             let index = animation.playhead;
             let size = animation.anim.size();
             match animation.anim.render(index) {
-                Ok(frame) => bus.frame(*id, index, size, frame),
+                Ok(frame) => bus.frame(*id, animation.generation, index, size, frame),
                 Err(error) => {
                     animation.playing = false;
-                    bus.error(*id, error);
+                    bus.error(*id, animation.generation, error);
                 }
             }
             animation.due = (animation.due + animation.interval).max(now);
@@ -165,29 +195,39 @@ fn apply(
     bus: &Bus,
 ) {
     match command {
-        Command::Load { id, bytes, size } => {
+        Command::Load {
+            id,
+            generation,
+            bytes,
+            size,
+            emit_first,
+        } => {
             let Some(engine) = engine else {
-                bus.error(id, "animated stickers are unavailable".into());
+                bus.error(id, generation, "animated stickers are unavailable".into());
                 return;
             };
             let mut anim = match engine.load(&bytes, size) {
                 Ok(anim) => anim,
-                Err(error) => return bus.error(id, error),
+                Err(error) => return bus.error(id, generation, error),
             };
             let frames = anim.frame_count().max(1);
             let interval =
                 Duration::from_secs_f64(1.0 / anim.fps().clamp(1.0, 120.0)).max(MIN_INTERVAL);
             let size = anim.size();
-            // The first frame is always rendered: it is what a paused, an
-            // off-screen and a settings-disabled sticker shows.
-            match anim.render(0) {
-                Ok(frame) => bus.frame(id, 0, size, frame),
-                Err(error) => return bus.error(id, error),
+            // A cache-seeded picker cell already has frame zero. Otherwise
+            // render it before playback: paused and disabled stickers must
+            // always have an initial frame to restore.
+            if emit_first {
+                match anim.render(0) {
+                    Ok(frame) => bus.initial_frame(id, generation, size, frame),
+                    Err(error) => return bus.error(id, generation, error),
+                }
             }
             live.insert(
                 id,
                 Live {
                     anim,
+                    generation,
                     frames,
                     playhead: 0,
                     interval,
@@ -296,6 +336,16 @@ impl LottieFrame {
 struct StickerInner {
     id: u64,
     frame_paintable: LottieFrame,
+    picture: glib::WeakRef<gtk::Picture>,
+    path: PathBuf,
+    logical_size: i32,
+    pixels: Cell<u32>,
+    generation: Cell<u64>,
+    loading: Cell<bool>,
+    loaded: Cell<bool>,
+    cache_key: Option<i64>,
+    seeded_from_cache: Cell<bool>,
+    first_frame: RefCell<Option<gdk::Texture>>,
     /// The owner wants playback (row visible / picker cell hovered).
     wants: Cell<bool>,
     /// A slot was granted and the render thread is ticking this sticker.
@@ -327,49 +377,69 @@ impl Sticker {
     /// renders into `picture` at `size` logical pixels (scaled for the
     /// display). Playback starts only once the owner calls `set_playing`.
     pub fn new(picture: &gtk::Picture, path: &Path, size: i32) -> Sticker {
+        Self::new_inner(picture, path, size, None)
+    }
+
+    /// Picker constructor: reuse a bounded frame-zero texture keyed by the
+    /// Telegram sticker id. A seeded cell defers file IO and ThorVG parsing
+    /// until it is hovered.
+    pub fn new_cached(picture: &gtk::Picture, path: &Path, size: i32, sticker_id: i64) -> Sticker {
+        Self::new_inner(picture, path, size, Some(sticker_id))
+    }
+
+    fn new_inner(
+        picture: &gtk::Picture,
+        path: &Path,
+        size: i32,
+        cache_key: Option<i64>,
+    ) -> Sticker {
         let host = registry();
         let id = host.next_id.get();
         host.next_id.set(id.wrapping_add(1));
-        let scale = picture.scale_factor().clamp(1, 3);
-        let pixels = (size.max(8).saturating_mul(scale)).clamp(8, MAX_PIXELS) as u32;
-        let frame_paintable = LottieFrame::new(pixels as i32);
+        let logical_size = size.max(8);
+        let pixels = raster_pixels(logical_size, picture.scale_factor());
+        // Intrinsic dimensions are logical pixels. The texture behind this
+        // paintable is independently rasterized at the display scale.
+        let frame_paintable = LottieFrame::new(logical_size);
+        let cached = cache_key.and_then(|key| cached_first_frame(key, pixels));
+        let seeded = cached.is_some();
+        if let Some(texture) = cached.as_ref() {
+            frame_paintable.set_texture(texture);
+        }
         picture.set_paintable(Some(&frame_paintable));
         let inner = Rc::new(StickerInner {
             id,
             frame_paintable,
+            picture: picture.downgrade(),
+            path: path.to_path_buf(),
+            logical_size,
+            pixels: Cell::new(pixels),
+            generation: Cell::new(1),
+            loading: Cell::new(false),
+            loaded: Cell::new(false),
+            cache_key,
+            seeded_from_cache: Cell::new(seeded),
+            first_frame: RefCell::new(cached),
             wants: Cell::new(false),
             animating: Cell::new(false),
-            ready: Cell::new(false),
+            ready: Cell::new(seeded),
             frame: Cell::new(0),
-            frames: Cell::new(0),
+            frames: Cell::new(u64::from(seeded)),
             error: RefCell::new(None),
             ready_callback: RefCell::new(None),
             error_callback: RefCell::new(None),
         });
-        host.stickers
-            .borrow_mut()
-            .insert(id, Rc::downgrade(&inner));
-        let path = path.to_path_buf();
-        glib::MainContext::default().spawn_local(async move {
-            let read = gio::spawn_blocking(move || std::fs::read(&path)).await;
-            let active = registry();
-            // The row (or picker cell) may be gone already; never hand the
-            // render thread an animation nobody will ever drop.
-            if !active.is_alive(id) {
-                return;
-            }
-            match read {
-                Ok(Ok(bytes)) => {
-                    let _ = active.commands.send(Command::Load {
-                        id,
-                        bytes,
-                        size: pixels,
-                    });
-                }
-                Ok(Err(error)) => active.deliver_error(id, format!("sticker unavailable: {error}")),
-                Err(_) => active.deliver_error(id, "sticker unavailable".into()),
-            }
+        host.stickers.borrow_mut().insert(id, Rc::downgrade(&inner));
+        let weak = Rc::downgrade(&inner);
+        picture.connect_scale_factor_notify(move |_| {
+            let Some(inner) = weak.upgrade() else { return };
+            registry().reload_for_scale(&inner);
         });
+        // Cache misses render frame zero eagerly. Cache hits remain cheap
+        // static cells until the owner actually asks them to animate.
+        if inner.first_frame.borrow().is_none() {
+            host.ensure_loaded(&inner);
+        }
         Sticker { inner }
     }
 
@@ -403,7 +473,11 @@ impl Sticker {
         if self.inner.wants.replace(playing) == playing {
             return;
         }
-        registry().sync(self.inner.id);
+        let registry = registry();
+        if playing {
+            registry.ensure_loaded(&self.inner);
+        }
+        registry.sync(self.inner.id);
     }
 
     pub fn is_ready(&self) -> bool {
@@ -417,6 +491,25 @@ impl Sticker {
 
     pub fn frame_index(&self) -> usize {
         self.inner.frame.get()
+    }
+
+    pub fn logical_size(&self) -> i32 {
+        self.inner.logical_size
+    }
+
+    pub fn raster_size(&self) -> u32 {
+        self.inner.pixels.get()
+    }
+
+    pub fn scale_factor(&self) -> i32 {
+        self.inner
+            .picture
+            .upgrade()
+            .map_or(1, |picture| picture.scale_factor().max(1))
+    }
+
+    pub fn seeded_from_cache(&self) -> bool {
+        self.inner.seeded_from_cache.get()
     }
 
     /// Frames put on screen since the sticker was created (probe helper: a
@@ -463,21 +556,27 @@ impl Registry {
             let weak = Rc::downgrade(&registry);
             glib::MainContext::default().spawn_local(async move {
                 while wakeups.recv().await.is_ok() {
-                    let Some(registry) = weak.upgrade() else { return };
-                    let (frames, errors) = {
+                    let Some(registry) = weak.upgrade() else {
+                        return;
+                    };
+                    let (initial_frames, frames, errors) = {
                         let Ok(mut pending) = bus.pending.lock() else {
                             continue;
                         };
                         (
+                            std::mem::take(&mut pending.initial_frames),
                             std::mem::take(&mut pending.frames),
                             std::mem::take(&mut pending.errors),
                         )
                     };
+                    for (id, frame) in initial_frames {
+                        registry.deliver_frame(id, frame);
+                    }
                     for (id, frame) in frames {
                         registry.deliver_frame(id, frame);
                     }
-                    for (id, message) in errors {
-                        registry.deliver_error(id, message);
+                    for (id, generation, message) in errors {
+                        registry.deliver_error(id, generation, message);
                     }
                 }
             });
@@ -498,8 +597,73 @@ impl Registry {
         weak.and_then(|weak| weak.upgrade())
     }
 
-    fn is_alive(&self, id: u64) -> bool {
-        self.upgrade(id).is_some()
+    fn ensure_loaded(&self, sticker: &Rc<StickerInner>) {
+        if sticker.loaded.get() || sticker.loading.replace(true) {
+            return;
+        }
+        let id = sticker.id;
+        let generation = sticker.generation.get();
+        let pixels = sticker.pixels.get();
+        let emit_first = sticker.first_frame.borrow().is_none();
+        let path = sticker.path.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let read = gio::spawn_blocking(move || std::fs::read(&path)).await;
+            let active = registry();
+            let Some(sticker) = active.upgrade(id) else {
+                return;
+            };
+            if sticker.generation.get() != generation {
+                return;
+            }
+            sticker.loading.set(false);
+            match read {
+                Ok(Ok(bytes)) => {
+                    sticker.loaded.set(true);
+                    let _ = active.commands.send(Command::Load {
+                        id,
+                        generation,
+                        bytes,
+                        size: pixels,
+                        emit_first,
+                    });
+                }
+                Ok(Err(error)) => {
+                    active.deliver_error(id, generation, format!("sticker unavailable: {error}"));
+                }
+                Err(_) => active.deliver_error(id, generation, "sticker unavailable".into()),
+            }
+        });
+    }
+
+    fn reload_for_scale(&self, sticker: &Rc<StickerInner>) {
+        let Some(picture) = sticker.picture.upgrade() else {
+            return;
+        };
+        let pixels = raster_pixels(sticker.logical_size, picture.scale_factor());
+        if sticker.pixels.replace(pixels) == pixels {
+            return;
+        }
+        sticker
+            .generation
+            .set(sticker.generation.get().wrapping_add(1));
+        sticker.loading.set(false);
+        sticker.loaded.set(false);
+        sticker.seeded_from_cache.set(false);
+        if let Some(texture) = sticker
+            .cache_key
+            .and_then(|key| cached_first_frame(key, pixels))
+        {
+            sticker.frame_paintable.set_texture(&texture);
+            *sticker.first_frame.borrow_mut() = Some(texture);
+            sticker.frame.set(0);
+            sticker.ready.set(true);
+            sticker.seeded_from_cache.set(true);
+        } else {
+            sticker.first_frame.borrow_mut().take();
+        }
+        if sticker.wants.get() || sticker.first_frame.borrow().is_none() {
+            self.ensure_loaded(sticker);
+        }
     }
 
     fn deliver_frame(&self, id: u64, frame: Frame) {
@@ -507,6 +671,20 @@ impl Registry {
             self.forget(id);
             return;
         };
+        if frame.generation != sticker.generation.get() {
+            return;
+        }
+        if !sticker.animating.get() {
+            if frame.index != 0 {
+                return;
+            }
+            // A periodic wraparound frame zero may already be queued when
+            // playback pauses. The cached initial texture is already on
+            // screen, so do not count or repaint that stale delivery.
+            if sticker.first_frame.borrow().is_some() {
+                return;
+            }
+        }
         let bytes = glib::Bytes::from_owned(frame.data);
         let texture = gdk::MemoryTexture::new(
             frame.size as i32,
@@ -516,6 +694,13 @@ impl Registry {
             frame.size as usize * 4,
         );
         sticker.frame_paintable.set_texture(&texture);
+        if frame.index == 0 {
+            let texture = texture.upcast::<gdk::Texture>();
+            *sticker.first_frame.borrow_mut() = Some(texture.clone());
+            if let Some(key) = sticker.cache_key {
+                cache_first_frame(key, frame.size, texture);
+            }
+        }
         sticker.frame.set(frame.index);
         sticker.frames.set(sticker.frames.get().wrapping_add(1));
         if !sticker.ready.replace(true) {
@@ -528,12 +713,15 @@ impl Registry {
         }
     }
 
-    fn deliver_error(&self, id: u64, message: String) {
-        self.release(id);
+    fn deliver_error(&self, id: u64, generation: u64, message: String) {
         let Some(sticker) = self.upgrade(id) else {
             self.forget(id);
             return;
         };
+        if sticker.generation.get() != generation {
+            return;
+        }
+        self.release(id);
         *sticker.error.borrow_mut() = Some(message.clone());
         let callback = sticker.error_callback.borrow().clone();
         if let Some(callback) = callback {
@@ -605,6 +793,12 @@ impl Registry {
         };
         if let Some(sticker) = self.upgrade(id) {
             sticker.animating.set(false);
+            // Restore frame zero immediately. A noninitial frame already
+            // queued by the render thread is rejected by `deliver_frame`.
+            if let Some(texture) = sticker.first_frame.borrow().clone() {
+                sticker.frame_paintable.set_texture(&texture);
+                sticker.frame.set(0);
+            }
         }
         if held {
             let _ = self.commands.send(Command::Pause(id));
@@ -629,9 +823,7 @@ impl Registry {
                     .iter()
                     .filter(|(id, weak)| {
                         !slots.contains(id)
-                            && weak
-                                .upgrade()
-                                .is_some_and(|sticker| sticker.wants.get())
+                            && weak.upgrade().is_some_and(|sticker| sticker.wants.get())
                     })
                     .map(|(id, _)| *id)
                     .collect::<Vec<_>>();
@@ -646,11 +838,62 @@ impl Registry {
     }
 }
 
+#[derive(Clone)]
+struct CachedFirstFrame {
+    pixels: u32,
+    texture: gdk::Texture,
+}
+
+#[derive(Default)]
+struct FirstFrameCache {
+    entries: HashMap<i64, CachedFirstFrame>,
+    oldest_first: VecDeque<i64>,
+}
+
+impl FirstFrameCache {
+    fn get(&mut self, sticker_id: i64, pixels: u32) -> Option<gdk::Texture> {
+        let texture = self
+            .entries
+            .get(&sticker_id)
+            .filter(|entry| entry.pixels == pixels)
+            .map(|entry| entry.texture.clone())?;
+        self.oldest_first.retain(|id| *id != sticker_id);
+        self.oldest_first.push_back(sticker_id);
+        Some(texture)
+    }
+
+    fn insert(&mut self, sticker_id: i64, pixels: u32, texture: gdk::Texture) {
+        self.entries
+            .insert(sticker_id, CachedFirstFrame { pixels, texture });
+        self.oldest_first.retain(|id| *id != sticker_id);
+        self.oldest_first.push_back(sticker_id);
+        while self.entries.len() > FIRST_FRAME_CACHE_CAPACITY {
+            let Some(oldest) = self.oldest_first.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
+fn raster_pixels(logical_size: i32, scale_factor: i32) -> u32 {
+    logical_size.max(8).saturating_mul(scale_factor.max(1)) as u32
+}
+
+fn cached_first_frame(sticker_id: i64, pixels: u32) -> Option<gdk::Texture> {
+    FIRST_FRAMES.with(|cache| cache.borrow_mut().get(sticker_id, pixels))
+}
+
+fn cache_first_frame(sticker_id: i64, pixels: u32, texture: gdk::Texture) {
+    FIRST_FRAMES.with(|cache| cache.borrow_mut().insert(sticker_id, pixels, texture));
+}
+
 thread_local! {
     static REGISTRY: RefCell<Option<Rc<Registry>>> = const { RefCell::new(None) };
     /// `settings.media.animated_stickers`; kept outside the registry so
     /// reading settings never starts the render thread.
     static ENABLED: Cell<bool> = const { Cell::new(true) };
+    static FIRST_FRAMES: RefCell<FirstFrameCache> = RefCell::new(FirstFrameCache::default());
 }
 
 fn registry() -> Rc<Registry> {
