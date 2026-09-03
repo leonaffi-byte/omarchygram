@@ -570,6 +570,8 @@ struct ShellInner {
     /// SwitchInline text waiting for the chat the switcher picks (§6.1).
     pending_inline_query: RefCell<Option<String>>,
     forum_topics: RefCell<Vec<Topic>>,
+    /// Only the newest get_topics completion may replace the visible list.
+    forum_topics_generation: Cell<u64>,
     info: InfoPanel,
     contacts: ContactsDialog,
     new_group: NewGroupDialog,
@@ -822,6 +824,7 @@ impl Shell {
             forum_list_open: Cell::new(false),
             pending_inline_query: RefCell::new(None),
             forum_topics: RefCell::new(Vec::new()),
+            forum_topics_generation: Cell::new(0),
             info,
             contacts,
             new_group,
@@ -1036,6 +1039,16 @@ impl ShellInner {
             this.switcher.set_on_open(Rc::new(move |chat_id| {
                 if let Some(this) = weak.upgrade() {
                     this.open_chat(chat_id);
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.switcher.set_on_cancel(Rc::new(move || {
+                if let Some(this) = weak.upgrade() {
+                    this.pending_inline_query.borrow_mut().take();
+                    this.clear_window_focus();
+                    this.messages.focus_composer();
                 }
             }));
         }
@@ -4683,6 +4696,8 @@ impl ShellInner {
     }
 
     fn load_forum_topics(self: &Rc<Self>, forum_id: i64, epoch: u64) {
+        let generation = self.forum_topics_generation.get().wrapping_add(1);
+        self.forum_topics_generation.set(generation);
         let tg = self.tg.clone();
         let session_epoch = self.session_epoch.get();
         let weak = Rc::downgrade(self);
@@ -4693,12 +4708,12 @@ impl ShellInner {
             }) else {
                 return;
             };
+            if this.forum_topics_generation.get() != generation {
+                return;
+            }
             match result {
                 Ok(topics) => {
-                    *this.forum_topics.borrow_mut() = topics.clone();
-                    if this.is_current(forum_id, epoch) && this.forum_list_open.get() {
-                        this.topics.set_topics(topics);
-                    }
+                    this.apply_forum_topics(forum_id, epoch, generation, topics);
                 }
                 Err(error) => {
                     shell_log!("get_topics({forum_id}): {error}");
@@ -4708,6 +4723,25 @@ impl ShellInner {
                 }
             }
         });
+    }
+
+    /// Apply only the newest forum load. Keeping this check next to the UI
+    /// mutation also makes refresh ordering directly assertable by the probe.
+    fn apply_forum_topics(
+        &self,
+        forum_id: i64,
+        epoch: u64,
+        generation: u64,
+        topics: Vec<Topic>,
+    ) -> bool {
+        if self.forum_topics_generation.get() != generation {
+            return false;
+        }
+        *self.forum_topics.borrow_mut() = topics.clone();
+        if self.is_current(forum_id, epoch) && self.forum_list_open.get() {
+            self.topics.set_topics(topics);
+        }
+        true
     }
 
     /// `TopicsChanged`, or a new message in a topic of the open forum.
@@ -4727,6 +4761,7 @@ impl ShellInner {
         glib::MainContext::default().spawn_local(async move {
             match self.tg.create_topic(forum_id, &title).await {
                 Ok(topic) => {
+                    self.topics.finish_create();
                     // The backend also emits TopicsChanged; refetch so the new
                     // row carries the backend's ordering and counts.
                     self.load_forum_topics(forum_id, epoch);
@@ -4736,8 +4771,8 @@ impl ShellInner {
                 }
                 Err(error) => {
                     shell_log!("create_topic({forum_id}): {error}");
-                    if self.is_current(forum_id, epoch) {
-                        self.messages.show_error(&error);
+                    if self.is_current(forum_id, epoch) && self.forum_list_open.get() {
+                        self.topics.show_create_error(&error);
                     }
                 }
             }
@@ -10601,6 +10636,14 @@ impl ShellInner {
         }
 
         // A Callback button: the answer renames the button (MessageChanged).
+        probe_step("bot keyboard rebuild focus");
+        if !self
+            .messages
+            .focus_keyboard_button(keyboard_id, "Lock")
+        {
+            probe_fail("bot keyboard focus setup");
+            return;
+        }
         probe_step("bot keyboard callback");
         if !self
             .messages
@@ -10621,6 +10664,10 @@ impl ShellInner {
         .await
         {
             probe_fail("bot keyboard callback label");
+            return;
+        }
+        if !self.messages.composer_has_focus() {
+            probe_fail("bot keyboard rebuild did not move focus");
             return;
         }
 
@@ -10677,6 +10724,24 @@ impl ShellInner {
             return;
         }
 
+        // Escape is consumed by the switcher's entry controller, so its
+        // explicit cancellation callback must discard SwitchInline text.
+        probe_step("bot switch inline cancel");
+        self.clone()
+            .switch_inline("stale".into(), false, "omarchy_bot".into());
+        if !self.switcher.is_open() || self.pending_inline_query.borrow().is_none() {
+            probe_fail("bot switch inline pending setup");
+            return;
+        }
+        self.switcher.cancel();
+        if self.switcher.is_open()
+            || self.pending_inline_query.borrow().is_some()
+            || !self.messages.composer_has_focus()
+        {
+            probe_fail("bot switch inline cancel retained pending text");
+            return;
+        }
+
         // "/" lists the bot's commands; Enter fills the selected one.
         probe_step("bot command autocomplete");
         self.messages.set_composer_text("/");
@@ -10711,6 +10776,11 @@ impl ShellInner {
 
         // An empty bot chat shows Start in place of the composer.
         self.clone().open_chat(helper_id);
+        probe_step("bot username seeded on reset");
+        if self.messages.bot_username() != "omarchy_helper_bot" {
+            probe_fail("bot username was not seeded synchronously");
+            return;
+        }
         if !poll_until(4000, || {
             self.open_chat.get() == Some(helper_id) && !self.messages.is_loading()
         })
@@ -10721,7 +10791,9 @@ impl ShellInner {
         }
         probe_step("bot start");
         if !poll_until(3000, || {
-            self.messages.start_button_visible() && !self.messages.composer_visible()
+            self.messages.start_button_visible()
+                && self.messages.start_button_has_focus()
+                && !self.messages.composer_visible()
         })
         .await
         {
@@ -10758,6 +10830,33 @@ impl ShellInner {
         }
         if self.topics.topic_titles().first().map(String::as_str) != Some("Bugs") {
             probe_fail("forum pinned topic first");
+            return;
+        }
+
+        probe_step("forum topic refresh focus");
+        if !self.topics.focus_index(0) {
+            probe_fail("forum topic focus setup");
+            return;
+        }
+        let generation = self.forum_topics_generation.get();
+        let current_topics = self.forum_topics.borrow().clone();
+        if !self.apply_forum_topics(forum_id, self.epoch.get(), generation, current_topics)
+            || !self.topics.header_control_has_focus()
+        {
+            probe_fail("forum topic refresh did not preserve safe focus");
+            return;
+        }
+
+        probe_step("forum stale refresh ignored");
+        let visible_topics = self.topics.topic_titles();
+        if self.apply_forum_topics(
+            forum_id,
+            self.epoch.get(),
+            generation.wrapping_sub(1),
+            Vec::new(),
+        ) || self.topics.topic_titles() != visible_topics
+        {
+            probe_fail("forum stale refresh replaced current rows");
             return;
         }
 
@@ -10819,18 +10918,39 @@ impl ShellInner {
         // New topic: the dialog creates it, the list grows, it opens.
         probe_step("forum create topic");
         self.topics.open_dialog();
-        if !self.topics.dialog_is_open() {
+        if !self.topics.dialog_is_open() || !self.topics.cancel_visible() {
             probe_fail("new topic dialog");
             return;
         }
         self.topics.set_dialog_title("Probe Topic");
+        probe_step("forum create topic retry state");
+        self.topics.show_create_error("probe: retryable failure");
+        if !self.topics.create_retry_visible()
+            || self.topics.create_error_text() != "probe: retryable failure"
+        {
+            probe_fail("new topic retry affordance");
+            return;
+        }
         self.topics.submit_dialog();
+        if !self.topics.dialog_is_open() || !self.topics.create_is_pending() {
+            probe_fail("new topic dialog closed while pending");
+            return;
+        }
+        if environment_listed("OMG_MOCK_FAIL_ONCE", "CreateTopic") {
+            probe_step("forum create topic backend retry");
+            if !poll_until(4000, || self.topics.create_retry_visible()).await {
+                probe_fail("new topic backend retry affordance");
+                return;
+            }
+            self.topics.submit_dialog();
+        }
         if !poll_until(5000, || {
             self.open_chat
                 .get()
                 .and_then(split_topic_chat_id)
                 .is_some_and(|(forum, _)| forum == forum_id)
                 && self.messages.header_title() == "Omarchy Forum › Probe Topic"
+                && !self.topics.dialog_is_open()
         })
         .await
         {

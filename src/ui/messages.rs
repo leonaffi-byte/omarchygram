@@ -1147,19 +1147,20 @@ impl MessagesView {
             selection_cancel,
         );
         {
-            let inner = view.inner.clone();
-            let on_choose = Rc::new({
-                let inner = inner.clone();
-                move |text: String| {
-                    inner.composer_signal_blocked.set(true);
-                    inner.composer.buffer().set_text(&format!("{text} "));
-                    inner.composer_signal_blocked.set(false);
-                    if let Some(popover) = inner.command_popover.borrow().as_ref() {
-                        popover.dismiss();
-                    }
-                    inner.composer.grab_focus();
+            let weak = Rc::downgrade(&view.inner);
+            let on_choose = Rc::new(move |text: String| {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                inner.composer_signal_blocked.set(true);
+                inner.composer.buffer().set_text(&format!("{text} "));
+                inner.composer_signal_blocked.set(false);
+                if let Some(popover) = inner.command_popover.borrow().as_ref() {
+                    popover.dismiss();
                 }
+                inner.composer.grab_focus();
             });
+            let inner = view.inner.clone();
             let popover = super::bots::CommandPopover::new(&inner.composer, on_choose);
             *inner.command_popover.borrow_mut() = Some(popover);
             let key_inner = inner.clone();
@@ -2238,6 +2239,7 @@ impl MessagesView {
         self.clear_topic_header();
         self.set_start_mode(false);
         *self.inner.bot_commands.borrow_mut() = Vec::new();
+        self.inner.bot_username.borrow_mut().clear();
     }
 
     pub fn clear_selection(&self, epoch: u64) {
@@ -2287,6 +2289,9 @@ impl MessagesView {
         self.inner
             .effects
             .empty_state(&self.inner.empty_effects, true);
+        self.set_start_mode(false);
+        self.inner.bot_commands.borrow_mut().clear();
+        self.inner.bot_username.borrow_mut().clear();
     }
 
     /// History-only reset for jump-to-date / jump-to-latest on the SAME chat:
@@ -3000,6 +3005,10 @@ impl MessagesView {
             &self.inner.action,
             is_live,
         );
+        // A server update may remove the keyboard button that currently owns
+        // focus. Move it to the stable composer before rebuilding or clearing
+        // the keyboard subtree (GTK4 teardown rule).
+        self.move_focus_before_removal(&row.keyboard_slot);
         if message.keyboard.is_some() {
             let action: Rc<dyn Fn(MessageAction)> = Rc::new({
                 let a = self.inner.action.clone();
@@ -4182,8 +4191,19 @@ impl MessagesView {
     /// with an empty history). `false` restores the composer.
     pub fn set_start_mode(&self, enabled: bool) {
         self.inner.bot_start.set(enabled);
-        self.inner.start_button.set_visible(enabled);
-        self.inner.composer_box.set_visible(!enabled);
+        if enabled {
+            // Map the stable target first, transfer focus out of the composer,
+            // and only then unmap the composer subtree.
+            self.inner.start_button.set_visible(true);
+            self.inner.start_button.grab_focus();
+            self.inner.composer_box.set_visible(false);
+        } else {
+            self.inner.composer_box.set_visible(true);
+            if self.inner.start_button.is_focus() {
+                self.inner.composer.grab_focus();
+            }
+            self.inner.start_button.set_visible(false);
+        }
     }
 
     /// Topic header: "Forum › Topic" with a back button to the topic list.
@@ -4497,6 +4517,18 @@ impl MessagesView {
             .is_some_and(|button| button.is_sensitive())
     }
 
+    /// Probe hook: focus a keyboard button before MessageChanged replaces it.
+    pub fn focus_keyboard_button(&self, msg_id: i32, label: &str) -> bool {
+        self.keyboard_buttons(msg_id)
+            .into_iter()
+            .find(|button| base_label(button) == label)
+            .is_some_and(|button| button.grab_focus())
+    }
+
+    pub fn composer_has_focus(&self) -> bool {
+        self.inner.composer.is_focus()
+    }
+
     /// The bot-alert bar is the error bar wearing `omg-info` (§6.1).
     pub fn info_visible(&self) -> bool {
         self.inner.error.is_visible() && self.inner.error.has_css_class("omg-info")
@@ -4504,6 +4536,14 @@ impl MessagesView {
 
     pub fn start_button_visible(&self) -> bool {
         self.inner.start_button.is_visible()
+    }
+
+    pub fn start_button_has_focus(&self) -> bool {
+        self.inner.start_button.is_focus()
+    }
+
+    pub fn bot_username(&self) -> String {
+        self.inner.bot_username.borrow().clone()
     }
 
     pub fn command_popover_open(&self) -> bool {
@@ -5826,6 +5866,9 @@ impl MessagesView {
             .header_avatar
             .bind(tg, summary.id, &summary.title, summary.has_photo);
         self.inner.chat_kind.set(summary.kind);
+        // History rows can arrive before ChatInfo. Seed SwitchInline keyboards
+        // synchronously so a newly opened bot never inherits the prior bot.
+        *self.inner.bot_username.borrow_mut() = summary.username.clone();
         self.inner
             .read_outbox
             .set(self.inner.read_outbox.get().max(summary.read_outbox_max_id));
@@ -7073,4 +7116,3 @@ mod wave5_tests {
         assert!(!selection.remove_deleted(&[20, 99]));
     }
 }
-

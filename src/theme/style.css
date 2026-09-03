@@ -1776,10 +1776,10 @@ button.omg-media-play:focus-visible {
   margin-top: 4px;
 }
 
-/* Darker than both bubble fills, so the buttons read as buttons. */
+/* The lighter theme surface distinguishes keyboard buttons from bubbles. */
 button.omg-keyboard-btn {
   background-image: none;
-  background-color: var(--bg-darker);
+  background-color: var(--bg-lighter);
   color: var(--fg);
   border: 1px solid var(--bg-lighter);
   border-radius: 4px;
