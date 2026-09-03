@@ -321,13 +321,13 @@ glib::wrapper! {
 }
 
 impl LottieFrame {
-    fn new(size: i32) -> LottieFrame {
+    pub fn new(size: i32) -> LottieFrame {
         let frame: LottieFrame = glib::Object::new();
         frame.imp().size.set((size, size));
         frame
     }
 
-    fn set_texture(&self, texture: &impl IsA<gdk::Texture>) {
+    pub fn set_texture(&self, texture: &impl IsA<gdk::Texture>) {
         *self.imp().texture.borrow_mut() = Some(texture.as_ref().clone());
         self.invalidate_contents();
     }

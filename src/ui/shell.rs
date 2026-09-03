@@ -4396,6 +4396,29 @@ impl ShellInner {
                 }
             });
         }
+        // Screenshot hook: OMG_SMOKE_SCROLL=<message id> scrolls the opened
+        // chat to that row (bin/shot cannot scroll; the UI review needed the
+        // cards above the fold).
+        if let Some(target) = std::env::var("OMG_SMOKE_SCROLL")
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+        {
+            let weak = Rc::downgrade(self);
+            glib::MainContext::default().spawn_local(async move {
+                let ready = poll_until(8_000, || {
+                    weak.upgrade().is_some_and(|this| {
+                        this.open_chat.get().is_some_and(|id| !is_virtual(id))
+                            && !this.messages.is_loading()
+                            && this.messages.contains(target)
+                    })
+                })
+                .await;
+                if let Some(this) = weak.upgrade().filter(|_| ready) {
+                    glib::timeout_future(Duration::from_millis(300)).await;
+                    this.messages.scroll_to_message(target);
+                }
+            });
+        }
         if let Some(msg_id) = std::env::var("OMG_SMOKE_FORWARD")
             .ok()
             .and_then(|value| value.parse::<i32>().ok())

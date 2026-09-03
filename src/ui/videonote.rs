@@ -182,7 +182,12 @@ impl VideoRecorderBar {
         let (abort_tx, abort_rx) = async_channel::bounded::<()>(1);
         *self.frame_channel_abort.borrow_mut() = Some(abort_tx);
 
-        let picture = self.preview_picture.clone();
+        // One stable paintable whose texture is swapped per frame: replacing
+        // the Picture's paintable 10× a second queues a relayout every time,
+        // which breaks offscreen snapshots (empty render node) and costs
+        // layout work; the Lottie frame paintable only redraws.
+        let frame_paintable = super::lottie::LottieFrame::new(240);
+        self.preview_picture.set_paintable(Some(&frame_paintable));
         let has_frame = self.has_frame.clone();
         glib::MainContext::default().spawn_local(async move {
             loop {
@@ -201,7 +206,7 @@ impl VideoRecorderBar {
                                 &bytes,
                                 240 * 4,
                             );
-                            picture.set_paintable(Some(&texture));
+                            frame_paintable.set_texture(&texture);
                             has_frame.set(true);
                         }
                     }

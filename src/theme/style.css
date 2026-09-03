@@ -1976,3 +1976,10 @@ button.omg-story-item:focus-visible {
   border-radius: 2px;
 }
 /* ---- end 6F ---- */
+
+/* ---- wave 6 orchestrator: map grid pin ---- */
+.omg-map-pin {
+  color: var(--red);
+  font-size: 22px;
+  margin-top: -22px; /* the glyph's tip marks the point */
+}

@@ -98,7 +98,21 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
             let window = window.clone();
             let app = app.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
-                let ok = snapshot_window(&window, std::path::Path::new(&path));
+                // A snapshot taken while a relayout is pending (a ticking
+                // label, a live preview) yields an empty node: retry on later
+                // frames before giving up.
+                let mut ok = false;
+                for _ in 0..20 {
+                    ok = snapshot_window(&window, std::path::Path::new(&path));
+                    if ok {
+                        break;
+                    }
+                    let ctx = glib::MainContext::default();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+                    while std::time::Instant::now() < deadline {
+                        ctx.iteration(false);
+                    }
+                }
                 if !ok {
                     eprintln!("omarchygram: OMG_SMOKE_SHOT failed");
                 }
@@ -126,16 +140,32 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
 /// Render the toplevel's child into a PNG through GSK (no screen capture).
 fn snapshot_window(window: &gtk::ApplicationWindow, path: &std::path::Path) -> bool {
     use gtk::prelude::NativeExt;
-    let Some(child) = window.child() else { return false };
-    let Some(renderer) = window.renderer() else { return false };
+    let Some(child) = window.child() else {
+        eprintln!("omarchygram: snapshot: window has no child");
+        return false;
+    };
+    let Some(renderer) = window.renderer() else {
+        eprintln!("omarchygram: snapshot: window has no renderer (not realized?)");
+        return false;
+    };
     let paintable = gtk::WidgetPaintable::new(Some(&child));
     let snapshot = gtk::Snapshot::new();
     let (w, h) = (child.width() as f64, child.height() as f64);
     if w < 1.0 || h < 1.0 {
+        eprintln!("omarchygram: snapshot: child is {w}x{h}");
         return false;
     }
     gtk::prelude::PaintableExt::snapshot(&paintable, &snapshot, w, h);
-    let Some(node) = snapshot.to_node() else { return false };
+    let Some(node) = snapshot.to_node() else {
+        eprintln!("omarchygram: snapshot: empty render node");
+        return false;
+    };
     let texture = renderer.render_texture(&node, Some(&gtk::graphene::Rect::new(0.0, 0.0, w as f32, h as f32)));
-    texture.save_to_png(path).is_ok()
+    match texture.save_to_png(path) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("omarchygram: snapshot: save failed: {error}");
+            false
+        }
+    }
 }

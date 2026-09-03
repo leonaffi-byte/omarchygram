@@ -153,7 +153,17 @@ impl LocationDialog {
         grid.set_row_spacing(2);
         grid.set_column_spacing(2);
         grid.set_halign(gtk::Align::Center);
-        card.append(&grid);
+        // Tiles are marker-free; ONE pin marks the shared center of the grid.
+        let map_overlay = gtk::Overlay::new();
+        map_overlay.set_halign(gtk::Align::Center);
+        map_overlay.set_child(Some(&grid));
+        let pin = gtk::Label::new(Some(super::icons::LOCATION));
+        pin.add_css_class("omg-map-pin");
+        pin.set_halign(gtk::Align::Center);
+        pin.set_valign(gtk::Align::Center);
+        pin.set_can_target(false);
+        map_overlay.add_overlay(&pin);
+        card.append(&map_overlay);
 
         let map_error = gtk::Label::new(None);
         map_error.add_css_class("omg-error");
@@ -509,7 +519,7 @@ impl LocationDialog {
             let tg = self.tg.clone();
             let weak = self.self_weak.borrow().clone();
             glib::MainContext::default().spawn_local(async move {
-                let texture = match tg.download_map(center, zoom, CELL, CELL).await {
+                let texture = match tg.download_map_tile(center, zoom, CELL, CELL).await {
                     Ok(Some(path)) => {
                         gdk::Texture::from_file(&gio::File::for_path(&path)).ok()
                     }
