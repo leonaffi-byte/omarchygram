@@ -7,7 +7,7 @@ transcription, AI draft/translate/summarize, ticketed shell gate). Wave 4
 (animations: all 54 Motion Lab effects as toggles + presets + previews) is
 MERGED. Wave 5 (Telegram parity: layout/chrome, in-app configuration, daily-use and regular-use functions — specs/spec-wave5.md) is IN PROGRESS: backend contract + real implementation merged 2026-09-02; all four UI packages (5A layout/chrome, 5B in-app configuration, 5C daily-use functions, 5D regular-use functions) MERGED 2026-09-02. Wave 5 is complete. Wave 6 (Telegram media parity: playback,
 location, polls, remaining media kinds, scheduling, bots, topics, stories, calls) is
-IN PROGRESS (2026-09-03): backend contract + real implementation + video-note recorder merged; 6A (in-app playback), 6B (cards, polls), 6C (poll/location dialogs, send later, scheduled), 6D (animated stickers), 6E (bots, forums) MERGED; 6F (video notes, live location, stories) in progress; 6G calls: spike done, deferred (see the Wave 6 section at the end). Secret chats are
+MERGED 2026-09-03 except calls: backend contract + real implementation + video-note recorder, 6A (in-app playback), 6B (cards, polls), 6C (poll/location dialogs, send later, scheduled), 6D (animated stickers), 6E (bots, forums), 6F (video notes, live location, stories) are all on main and gate-green; 6G calls: spike done, deferred to a later wave via ntgcalls (see the Wave 6 section at the end). Secret chats are
 deliberately left out.
 
 ## Design decisions (orchestrator-owned)
@@ -125,7 +125,7 @@ not exist.
 - Forum topics: topic list for forum supergroups, open a topic as a chat,
   topic name in the header, create topic.
 
-### 6F — Capture and live features (large)
+### 6F — Capture and live features (large) — MERGED 2026-09-03 (desktop note: there is no position source on this machine — no geoclue — so "live location" sends a point with a duration and the user updates it by hand from the card; periodic automatic updates need a location provider and are not implemented)
 - Record and send video circles (webcam via PipeWire/GStreamer, round preview
   while recording).
 - Live location: send with a duration, periodic updates while the app runs,

@@ -585,6 +585,10 @@ struct ShellInner {
     own_live_locations: RefCell<Vec<(i64, i32, DateTime<Local>)>>,
     live_expiry_timer: RefCell<Option<glib::SourceId>>,
     video_recording_active: Cell<bool>,
+    /// A cancel/stop of the previous recording is still in flight in the
+    /// local service (its commands run concurrently): a new start must wait
+    /// for it, or the late teardown kills the new recording.
+    video_teardown_pending: Cell<bool>,
     paned: gtk::Paned,
     content_paned: gtk::Paned,
     effects: Rc<Effects>,
@@ -833,6 +837,7 @@ impl Shell {
             own_live_locations: RefCell::new(Vec::new()),
             live_expiry_timer: RefCell::new(None),
             video_recording_active: Cell::new(false),
+            video_teardown_pending: Cell::new(false),
             paned,
             content_paned,
             effects,
@@ -3474,6 +3479,14 @@ impl ShellInner {
         let local = self.local.clone();
         let this = self.clone();
         glib::MainContext::default().spawn_local(async move {
+            let mut waited = 0;
+            while this.video_teardown_pending.get() && waited < 5_000 {
+                glib::timeout_future(Duration::from_millis(50)).await;
+                waited += 50;
+            }
+            if !this.video_recording_active.get() {
+                return;
+            }
             match local.video_start(240).await {
                 Ok(rx) => {
                     if this.video_recording_active.get() {
@@ -3495,8 +3508,11 @@ impl ShellInner {
         }
         self.messages.hide_video_note();
         let local = self.local.clone();
+        let this = self.clone();
+        self.video_teardown_pending.set(true);
         glib::MainContext::default().spawn_local(async move {
             local.video_cancel().await;
+            this.video_teardown_pending.set(false);
         });
     }
 
@@ -3518,12 +3534,15 @@ impl ShellInner {
         let local = self.local.clone();
         let tg = self.tg.clone();
         let this = self.clone();
+        self.video_teardown_pending.set(true);
         glib::MainContext::default().spawn_local(async move {
             let stop_res = local.video_stop().await;
+            this.video_teardown_pending.set(false);
             this.messages.hide_video_note();
             let (path, duration) = match stop_res {
                 Ok(res) => res,
                 Err(error) => {
+                    shell_log!("video note stop: {error}");
                     this.finish_mutation();
                     this.messages.show_error(&error);
                     return;
@@ -9337,11 +9356,17 @@ impl ShellInner {
 
         probe_step("player stops on chat switch");
         self.clone().open_chat(marta);
+        // Marta may legitimately hold a muted autoplay circle (the 6F probe
+        // sent one there); what must be gone are Media Lab's players and any
+        // sound.
         if !poll_until(5000, || {
             self.open_chat.get() == Some(marta)
                 && !self.messages.is_loading()
                 && self.messages.contains(104)
-                && self.messages.player_registry_empty()
+                && !self.messages.player_exists(800)
+                && !self.messages.player_exists(801)
+                && !self.messages.player_exists(802)
+                && self.messages.active_player_count() == 0
                 && !self.messages.player_fullscreen_open()
         })
         .await
@@ -12348,7 +12373,7 @@ impl ShellInner {
             probe_fail("video note record: bar not recording");
             return false;
         }
-        if !poll_until(6_000, || self.messages.video_recorder_has_frame()).await {
+        if !poll_until(12_000, || self.messages.video_recorder_has_frame()).await {
             probe_fail("video note record: no frame received");
             return false;
         }
@@ -12370,10 +12395,13 @@ impl ShellInner {
             .filter(|m| m.media == Some(MediaKind::VideoNote))
             .count();
         self.clone().start_video_note();
-        if !poll_until(6_000, || self.messages.video_recorder_has_frame()).await {
+        if !poll_until(12_000, || self.messages.video_recorder_has_frame()).await {
             probe_fail("video note send: no frame received");
             return false;
         }
+        // Record a realistic second before sending: a sub-second clip has no
+        // finalized mp4 yet and the recorder rejects it as empty.
+        glib::timeout_future(Duration::from_millis(1_200)).await;
         self.messages.probe_video_recorder_send();
         if !poll_until(6_000, || {
             !self.messages.video_recorder_visible()
