@@ -286,6 +286,7 @@ struct ShellInner {
     auth_probe_started: Cell<bool>,
     probe_answer: Cell<Option<usize>>,
     probe_media_launches: Cell<u64>,
+    probe_uri_launches: Cell<u64>,
 }
 
 impl Shell {
@@ -483,6 +484,7 @@ impl Shell {
             auth_probe_started: Cell::new(false),
             probe_answer: Cell::new(None),
             probe_media_launches: Cell::new(0),
+            probe_uri_launches: Cell::new(0),
         });
         ShellInner::wire(&inner, dialogs_retry);
         Shell { widget, inner }
@@ -992,6 +994,7 @@ impl ShellInner {
         let generation = self.settings_gen.get().wrapping_add(1);
         self.settings_gen.set(generation);
         self.messages.set_time_format(settings.time_format());
+        self.messages.set_map_tiles(settings.media.map_tiles);
         self.messages.set_ghost(settings.ghost_mode);
         self.messages.set_edit_history(settings.edit_history);
         self.messages.set_ai_enabled(settings.ai.enabled);
@@ -3527,8 +3530,10 @@ impl ShellInner {
                 }
             }
             // Wave 6 events: handled by the 6B/6C/6E/6F packages (specs/spec-wave6.md).
-            Event::PollChanged { .. }
-            | Event::ScheduledChanged { .. }
+            Event::PollChanged { poll_id, poll } => {
+                self.messages.update_poll(poll_id, poll);
+            }
+            Event::ScheduledChanged { .. }
             | Event::TopicsChanged { .. }
             | Event::StoriesChanged => {}
             Event::NewMessage(message) => self.handle_new_message(message),
@@ -4074,6 +4079,26 @@ impl ShellInner {
             }
             MessageAction::OpenLink(url) => self.open_link(&url),
             MessageAction::OpenMention(user_id) => self.open_mention(user_id),
+            MessageAction::Vote { msg_id, options } => {
+                if let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
+                    self.vote(chat_id, msg_id, options);
+                }
+            }
+            MessageAction::RetractVote(msg_id) => {
+                if let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
+                    self.vote(chat_id, msg_id, Vec::new());
+                }
+            }
+            MessageAction::AddContact(msg_id) => self.add_contact(msg_id),
+            MessageAction::OpenInBrowser(url) => self.open_in_browser(&url),
+            MessageAction::StopLive(msg_id) => {
+                if let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
+                    self.stop_live(chat_id, msg_id);
+                }
+            }
+            MessageAction::RedownloadMedia(msg_id) => {
+                self.start_media_download(msg_id, false);
+            }
             MessageAction::UnpinMessage(msg_id) => self.unpin_message(msg_id),
             MessageAction::RetryPinned => {
                 if let Some(chat_id) = self.open_chat.get() {
@@ -4111,6 +4136,89 @@ impl ShellInner {
             MessageAction::Summarize(msg_id) => self.summarize_message(msg_id),
             MessageAction::Transcribe(msg_id) => self.request_transcription(msg_id),
         }
+    }
+
+    /// 6B: send a vote (empty `options` retracts) and reflect the result on the
+    /// poll card. `Event::PollChanged` re-renders the card on success.
+    fn vote(self: Rc<Self>, chat_id: i64, msg_id: i32, options: Vec<usize>) {
+        let Some(widget) = self.messages.card_widget(msg_id) else {
+            return;
+        };
+        crate::ui::poll::set_voting(&widget, true);
+        glib::MainContext::default().spawn_local(async move {
+            match self.tg.send_vote(chat_id, msg_id, options).await {
+                Ok(()) => {
+                    // The card is re-enabled by the incoming `Event::PollChanged`.
+                    if let Some(widget) = self.messages.card_widget(msg_id) {
+                        widget.set_sensitive(true);
+                    }
+                }
+                Err(error) => {
+                    if let Some(widget) = self.messages.card_widget(msg_id) {
+                        crate::ui::poll::set_error(&widget, &error);
+                        widget.set_sensitive(true);
+                    }
+                    self.messages.show_error(&error);
+                }
+            }
+        });
+    }
+
+    /// 6B: add a contact card's user to the address book.
+    fn add_contact(self: Rc<Self>, msg_id: i32) {
+        let Some(message) = self.messages.message(msg_id) else {
+            return;
+        };
+        let Some(contact) = message.contact.clone() else {
+            return;
+        };
+        let Some(user_id) = contact.user_id else {
+            return;
+        };
+        glib::MainContext::default().spawn_local(async move {
+            match self
+                .tg
+                .add_contact(
+                    user_id,
+                    &contact.first_name,
+                    &contact.last_name,
+                    &contact.phone,
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.messages.mark_contact_added(msg_id);
+                }
+                Err(error) => {
+                    self.messages.show_error(&error);
+                }
+            }
+        });
+    }
+
+    /// 6B: open an OpenStreetMap link in the default browser.
+    fn open_in_browser(self: &Rc<Self>, url: &str) {
+        let url = url.to_string();
+        if self.probe {
+            self.probe_uri_launches
+                .set(self.probe_uri_launches.get().wrapping_add(1));
+            return;
+        }
+        if let Err(error) =
+            gio::AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>)
+        {
+            shell_log!("open in browser: {error}");
+            self.messages.show_error(error.message());
+        }
+    }
+
+    /// 6B: stop sharing our own live location.
+    fn stop_live(self: Rc<Self>, chat_id: i64, msg_id: i32) {
+        glib::MainContext::default().spawn_local(async move {
+            if let Err(error) = self.tg.stop_live_location(chat_id, msg_id).await {
+                self.messages.show_error(&error);
+            }
+        });
     }
 
     fn open_in_chat_search(self: &Rc<Self>) {
@@ -6359,11 +6467,20 @@ impl ShellInner {
     }
 
     fn start_image_downloads(self: &Rc<Self>, ids: Vec<i32>) {
+        let map_tiles = self.settings.get().media.map_tiles;
         for msg_id in ids {
             if matches!(
                 self.messages.media_kind(msg_id),
                 Some(MediaKind::Photo | MediaKind::Sticker)
             ) {
+                self.clone().start_media_download(msg_id, false);
+            } else if map_tiles
+                && matches!(
+                    self.messages.media_kind(msg_id),
+                    Some(MediaKind::Location | MediaKind::Venue)
+                )
+                && self.messages.geo_needs_map(msg_id)
+            {
                 self.clone().start_media_download(msg_id, false);
             }
         }
@@ -6417,7 +6534,7 @@ impl ShellInner {
         };
         glib::MainContext::default().spawn_local(async move {
             match self.tg.download_media(chat_id, msg_id).await {
-                Ok(Some(path)) if matches!(kind, MediaKind::Photo | MediaKind::Sticker) => {
+                Ok(Some(path)) if matches!(kind, MediaKind::Photo | MediaKind::Sticker | MediaKind::Location | MediaKind::Venue) => {
                     let decode_path = path.clone();
                     let decoded =
                         gio::spawn_blocking(move || gdk::Texture::from_filename(&decode_path))
@@ -9514,6 +9631,290 @@ impl ShellInner {
             probe_fail("new group identity");
             return false;
         }
+
+        // ---- Package 6B: location / venue / contact / dice / polls ----
+        let open_by_title = |this: &Rc<Self>, title: &str| -> Option<i64> {
+            this.chatlist
+                .ordered()
+                .into_iter()
+                .find_map(|(id, t)| (t == title).then_some(id))
+        };
+
+        probe_step("cards open Media Lab");
+        let Some(media_lab) = open_by_title(&self, "Media Lab") else {
+            probe_fail("Media Lab fixture missing");
+            return false;
+        };
+        self.clone().open_chat(media_lab);
+        if !poll_until(
+            3_500,
+            || self.open_chat.get() == Some(media_lab) && !self.messages.is_loading(),
+        )
+        .await
+        {
+            probe_fail("cards open Media Lab");
+            return false;
+        }
+
+        probe_step("card location");
+        if !poll_until(
+            8_000,
+            || {
+                self.messages.geo_map_loaded(805)
+                    && self
+                        .messages
+                        .card_text(805)
+                        .map(|t| t.contains("13.40500"))
+                        .unwrap_or(false)
+            },
+        )
+        .await
+        {
+            probe_fail("card location");
+            return false;
+        }
+
+        probe_step("card venue");
+        if !poll_until(
+            3_500,
+            || {
+                self.messages
+                    .card_text(806)
+                    .map(|t| t.contains("Café Einstein") && t.contains("Kurfürstenstraße"))
+                    .unwrap_or(false)
+            },
+        )
+        .await
+        {
+            probe_fail("card venue");
+            return false;
+        }
+
+        probe_step("card live location");
+        if !poll_until(
+            3_500,
+            || {
+                self.messages
+                    .card_text(807)
+                    .map(|t| t.contains("Live") || t.contains("Sharing ended"))
+                    .unwrap_or(false)
+            },
+        )
+        .await
+        {
+            probe_fail("card live location");
+            return false;
+        }
+
+        probe_step("card contact");
+        if !poll_until(
+            3_500,
+            || {
+                self.messages
+                    .card_text(808)
+                    .map(|t| t.contains("Marta") && t.contains("Open chat"))
+                    .unwrap_or(false)
+            },
+        )
+        .await
+        {
+            probe_fail("card contact");
+            return false;
+        }
+
+        probe_step("card contact unknown");
+        if !poll_until(
+            3_500,
+            || {
+                self.messages
+                    .card_text(809)
+                    .map(|t| t.contains("Unknown Caller") && !t.contains("Open chat"))
+                    .unwrap_or(false)
+            },
+        )
+        .await
+        {
+            probe_fail("card contact unknown");
+            return false;
+        }
+
+        probe_step("card dice");
+        if !poll_until(
+            3_500,
+            || self.messages.card_text(810).map(|t| t.contains("Rolled 4")).unwrap_or(false),
+        )
+        .await
+        {
+            probe_fail("card dice");
+            return false;
+        }
+
+        probe_step("card dice rolling");
+        if !poll_until(
+            3_500,
+            || self.messages.card_text(812).map(|t| t.contains("Rolling")).unwrap_or(false),
+        )
+        .await
+        {
+            probe_fail("card dice rolling");
+            return false;
+        }
+
+        probe_step("cards open Polls");
+        let Some(polls) = open_by_title(&self, "Polls") else {
+            probe_fail("Polls fixture missing");
+            return false;
+        };
+        self.clone().open_chat(polls);
+        if !poll_until(
+            3_500,
+            || self.open_chat.get() == Some(polls) && !self.messages.is_loading(),
+        )
+        .await
+        {
+            probe_fail("cards open Polls");
+            return false;
+        }
+
+        probe_step("poll vote");
+        if let Some(check) = self.messages.poll_option_check(900, 0) {
+            check.set_active(true);
+        } else {
+            probe_fail("poll vote widget missing");
+            return false;
+        }
+        if !poll_until(
+            4_000,
+            || self.messages.card_text(900).map(|t| t.contains("13 votes")).unwrap_or(false),
+        )
+        .await
+        {
+            probe_fail("poll vote");
+            return false;
+        }
+        // Voting again (already voted) must surface the inline error, not crash.
+        self.clone()
+            .handle_message_action(MessageAction::Vote {
+                msg_id: 900,
+                options: vec![0],
+            });
+        if !poll_until(4_000, || self.messages.poll_error_visible(900)).await {
+            probe_fail("poll vote twice error");
+            return false;
+        }
+
+        probe_step("poll retract");
+        self.clone()
+            .handle_message_action(MessageAction::RetractVote(900));
+        if !poll_until(
+            4_000,
+            || self.messages.card_text(900).map(|t| t.contains("12 votes")).unwrap_or(false),
+        )
+        .await
+        {
+            probe_fail("poll retract");
+            return false;
+        }
+
+        probe_step("poll live update");
+        if let Some(check) = self.messages.poll_option_check(900, 0) {
+            check.set_active(true);
+        } else {
+            probe_fail("poll live update widget missing");
+            return false;
+        }
+        if !poll_until(
+            4_000,
+            || self.messages.card_text(900).map(|t| t.contains("13 votes")).unwrap_or(false),
+        )
+        .await
+        {
+            probe_fail("poll live update");
+            return false;
+        }
+
+        probe_step("poll multiple");
+        if !poll_until(
+            3_500,
+            || {
+                self.messages
+                    .card_text(901)
+                    .map(|t| t.contains("Multiple answers") && t.contains("Vote"))
+                    .unwrap_or(false)
+            },
+        )
+        .await
+        {
+            probe_fail("poll multiple");
+            return false;
+        }
+        // Exercise the real widgets: toggle two options, click the Vote button.
+        {
+            let _ = self.messages.poll_option_check(901, 0).map(|c| c.set_active(true));
+            let _ = self.messages.poll_option_check(901, 1).map(|c| c.set_active(true));
+            if let Some(vote) = self.messages.poll_vote_button(901) {
+                vote.emit_clicked();
+            }
+        }
+        if !poll_until(
+            4_000,
+            || self.messages.card_text(901).map(|t| t.contains("9 votes")).unwrap_or(false),
+        )
+        .await
+        {
+            probe_fail("poll multiple vote");
+            return false;
+        }
+
+        probe_step("poll quiz");
+        if let Some(check) = self.messages.poll_option_check(902, 1) {
+            check.set_active(true);
+        } else {
+            probe_fail("poll quiz widget missing");
+            return false;
+        }
+        if !poll_until(
+            4_000,
+            || {
+                self.messages
+                    .card_text(902)
+                    .map(|t| t.contains("It rotates through the installed themes"))
+                    .unwrap_or(false)
+            },
+        )
+        .await
+        {
+            probe_fail("poll quiz");
+            return false;
+        }
+
+        probe_step("poll closed");
+        if !poll_until(
+            3_500,
+            || {
+                self.messages
+                    .card_text(903)
+                    .map(|t| t.contains("Closed") && !t.contains("Vote"))
+                    .unwrap_or(false)
+            },
+        )
+        .await
+        {
+            probe_fail("poll closed");
+            return false;
+        }
+
+        // Leave Marta open for the subsequent sidebar/pagination probe steps,
+        // which assume the regular-use chat is still selected.
+        if let Some(marta) = open_by_title(&self, "Marta") {
+            self.clone().open_chat(marta);
+            poll_until(
+                3_500,
+                || self.open_chat.get() == Some(marta) && !self.messages.is_loading(),
+            )
+            .await;
+        }
+
         true
     }
 }

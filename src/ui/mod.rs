@@ -1,5 +1,6 @@
 pub mod anim;
 pub mod auth;
+pub mod cards;
 pub mod avatar;
 pub mod chatlist;
 pub mod contacts;
@@ -12,6 +13,7 @@ pub mod markup;
 pub mod menus;
 pub mod messages;
 pub mod newgroup;
+pub mod poll;
 pub mod recorder;
 pub mod settings_view;
 pub mod shell;

@@ -1441,3 +1441,111 @@ checkbutton.omg-message-check {
 .omg-sticker-popover spinner {
   color: var(--accent);
 }
+
+/* ---- wave 6B ---- */
+.omg-geo-card,
+.omg-contact-card,
+.omg-dice-card,
+.omg-poll {
+  background-color: var(--bg-dark);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 6px;
+  padding: 8px;
+  min-width: 240px;
+}
+
+.omg-geo-map {
+  border-radius: 4px;
+  background-color: var(--bg-darker);
+  margin-bottom: 4px;
+}
+
+.omg-geo-glyph {
+  font-size: 32px;
+  color: var(--muted);
+}
+
+.omg-geo-title {
+  font-weight: bold;
+  color: var(--fg);
+}
+
+.omg-live-line {
+  color: var(--accent);
+}
+
+.omg-contact-avatar {
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: 50%;
+  background-color: var(--bg-lighter);
+}
+
+.omg-contact-initials {
+  font-weight: bold;
+  color: var(--fg);
+}
+
+.omg-contact-name {
+  font-weight: bold;
+  color: var(--fg);
+}
+
+.omg-dice {
+  font-size: 48px;
+  color: var(--fg);
+}
+
+.omg-dice-value {
+  color: var(--fg);
+}
+
+.omg-poll-question {
+  font-weight: bold;
+  color: var(--fg);
+}
+
+.omg-poll-kind,
+.omg-poll-footer {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.omg-poll-option-text {
+  color: var(--fg);
+}
+
+.omg-poll-bar {
+  background-color: var(--bg-lighter);
+}
+
+.omg-poll-bar > trough > progress {
+  background-color: var(--accent);
+}
+
+.omg-poll-correct {
+  background-color: var(--accent);
+}
+
+.omg-poll-wrong {
+  background-color: var(--red);
+}
+
+.omg-poll-pct {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.omg-poll-solution {
+  color: var(--fg);
+  font-style: italic;
+  border-left: 2px solid var(--accent);
+  padding-left: 6px;
+}
+
+.omg-poll-error {
+  color: var(--red);
+}
+
+/* ---- end 6B ---- */
+
