@@ -5009,6 +5009,13 @@ impl ShellInner {
             self.messages.show_error("Blocked unsafe link");
             return;
         }
+        // The probe must never reach the user's browser: count the launch
+        // instead (same rule as launch_media / open_in_browser).
+        if self.probe {
+            self.probe_uri_launches
+                .set(self.probe_uri_launches.get().wrapping_add(1));
+            return;
+        }
         if let Some(window) = self.window() {
             let launcher = gtk::UriLauncher::new(url);
             let messages = self.messages.clone();
