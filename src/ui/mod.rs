@@ -11,6 +11,7 @@ pub mod keys_view;
 pub mod markup;
 pub mod menus;
 pub mod messages;
+pub mod player;
 pub mod newgroup;
 pub mod recorder;
 pub mod settings_view;

@@ -1441,3 +1441,120 @@ checkbutton.omg-message-check {
 .omg-sticker-popover spinner {
   color: var(--accent);
 }
+
+/* ---- wave 6A ---- */
+
+.omg-player {
+  padding: 2px 0;
+}
+
+.omg-player-title {
+  font-weight: bold;
+  color: var(--fg);
+}
+
+button.omg-player-btn {
+  background-image: none;
+  background-color: var(--accent);
+  color: var(--bg-darker);
+  border: none;
+  border-radius: 20px;
+  padding: 0;
+  min-width: 40px;
+  min-height: 40px;
+}
+
+button.omg-player-btn:hover,
+button.omg-player-btn:focus-visible {
+  background-color: var(--fg);
+}
+
+button.omg-player-speed {
+  background-image: none;
+  background-color: var(--bg-dark);
+  color: var(--muted);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 2px 8px;
+  min-height: 20px;
+}
+
+button.omg-player-speed:hover,
+button.omg-player-speed:focus-visible {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+.omg-player-bar {
+  min-height: 18px;
+  padding: 0;
+}
+
+.omg-player-bar trough {
+  background-image: none;
+  background-color: var(--muted);
+  border: none;
+  border-radius: 4px;
+  min-height: 8px;
+}
+
+/* `border: none` here (or leaving min-width unset) makes GTK measure the
+   highlight gizmo at -2px and warn on every draw. */
+.omg-player-bar highlight {
+  background-image: none;
+  background-color: var(--accent);
+  border-radius: 4px;
+  min-width: 8px;
+  min-height: 8px;
+}
+
+.omg-player-bar slider {
+  background-image: none;
+  background-color: var(--accent);
+  border: none;
+  border-radius: 4px;
+  min-height: 8px;
+  margin: 0;
+}
+
+.omg-player-stage {
+  background-color: var(--bg-dark);
+  border-radius: 4px;
+}
+
+.omg-player-controls {
+  background-color: alpha(var(--bg-darker), 0.9);
+  padding: 4px 8px;
+}
+
+button.omg-media-play {
+  background-image: none;
+  background-color: alpha(var(--bg-darker), 0.8);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 20px;
+  padding: 0;
+  min-width: 40px;
+  min-height: 40px;
+}
+
+button.omg-media-play:hover,
+button.omg-media-play:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.omg-round {
+  border-radius: 120px;
+}
+
+.omg-round-time {
+  background-color: alpha(var(--bg-darker), 0.8);
+  color: var(--fg);
+  font-size: 9pt;
+  padding: 1px 8px;
+  margin-bottom: 8px;
+  border-radius: 4px;
+}
+
+/* ---- end 6A ---- */
