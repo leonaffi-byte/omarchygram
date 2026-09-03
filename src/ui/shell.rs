@@ -5147,9 +5147,14 @@ impl ShellInner {
         let Some(widget) = self.messages.card_widget(msg_id) else {
             return;
         };
+        let epoch = self.epoch.get();
         crate::ui::poll::set_voting(&widget, true);
         glib::MainContext::default().spawn_local(async move {
-            match self.tg.send_vote(chat_id, msg_id, options).await {
+            let result = self.tg.send_vote(chat_id, msg_id, options).await;
+            if !self.is_current(chat_id, epoch) {
+                return;
+            }
+            match result {
                 Ok(()) => {
                     // The card is re-enabled by the incoming `Event::PollChanged`.
                     if let Some(widget) = self.messages.card_widget(msg_id) {
@@ -5169,6 +5174,10 @@ impl ShellInner {
 
     /// 6B: add a contact card's user to the address book.
     fn add_contact(self: Rc<Self>, msg_id: i32) {
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        let epoch = self.epoch.get();
         let Some(message) = self.messages.message(msg_id) else {
             return;
         };
@@ -5178,8 +5187,12 @@ impl ShellInner {
         let Some(user_id) = contact.user_id else {
             return;
         };
+        let Some(widget) = self.messages.card_widget(msg_id) else {
+            return;
+        };
+        crate::ui::cards::set_contact_pending(&widget, true);
         glib::MainContext::default().spawn_local(async move {
-            match self
+            let result = self
                 .tg
                 .add_contact(
                     user_id,
@@ -5187,13 +5200,26 @@ impl ShellInner {
                     &contact.last_name,
                     &contact.phone,
                 )
-                .await
+                .await;
+            if !self.is_current(chat_id, epoch)
+                || self
+                    .messages
+                    .message(msg_id)
+                    .and_then(|message| message.contact)
+                    .and_then(|contact| contact.user_id)
+                    != Some(user_id)
             {
+                return;
+            }
+            match result {
                 Ok(()) => {
                     self.messages.mark_contact_added(msg_id);
                 }
                 Err(error) => {
-                    self.messages.show_error(&error);
+                    if let Some(widget) = self.messages.card_widget(msg_id) {
+                        crate::ui::cards::set_contact_error(&widget, &error);
+                        crate::ui::cards::set_contact_pending(&widget, false);
+                    }
                 }
             }
         });
@@ -7763,7 +7789,7 @@ impl ShellInner {
             return;
         };
         let epoch = self.epoch.get();
-        let Some(kind) = self.messages.begin_media(msg_id) else {
+        let Some((kind, media_generation)) = self.messages.begin_media(msg_id) else {
             return;
         };
         glib::MainContext::default().spawn_local(async move {
@@ -7774,7 +7800,7 @@ impl ShellInner {
                     if !self.is_current(chat_id, epoch) || !self.messages.contains(msg_id) {
                         return;
                     }
-                    self.messages.finish_lottie(msg_id, path);
+                    self.messages.finish_lottie(msg_id, media_generation, path);
                 }
                 Ok(Some(path)) if matches!(kind, MediaKind::Photo | MediaKind::Sticker | MediaKind::Location | MediaKind::Venue) => {
                     let decode_path = path.clone();
@@ -7786,17 +7812,20 @@ impl ShellInner {
                     }
                     match decoded {
                         Ok(Ok(texture)) => {
-                            self.messages.finish_image(msg_id, path, &texture);
+                            self.messages
+                                .finish_image(msg_id, media_generation, path, &texture);
                         }
                         Ok(Err(error)) => {
                             shell_log!("decode media ({chat_id}, {msg_id}): {error}");
-                            self.messages.fail_media(msg_id, false);
-                            self.messages.show_error(error.message());
+                            if self.messages.fail_media(msg_id, media_generation, false) {
+                                self.messages.show_error(error.message());
+                            }
                         }
                         Err(_) => {
                             shell_log!("decode media ({chat_id}, {msg_id}): decoder failed");
-                            self.messages.fail_media(msg_id, false);
-                            self.messages.show_error("image unavailable");
+                            if self.messages.fail_media(msg_id, media_generation, false) {
+                                self.messages.show_error("image unavailable");
+                            }
                         }
                     }
                 }
@@ -7804,8 +7833,10 @@ impl ShellInner {
                     if !self.is_current(chat_id, epoch) || !self.messages.contains(msg_id) {
                         return;
                     }
-                    self.messages.finish_media_path(msg_id, path.clone());
-                    if launch_on_ready {
+                    let accepted = self
+                        .messages
+                        .finish_media_path(msg_id, media_generation, path.clone());
+                    if accepted && launch_on_ready {
                         self.launch_media(&path);
                     }
                 }
@@ -7816,14 +7847,15 @@ impl ShellInner {
                                 self.aux.borrow().transcripts.get(&(chat_id, msg_id)),
                                 Some(ReqState::InFlight)
                             );
-                        self.messages.fail_media(msg_id, false);
-                        if transcription_requested && self.tg.is_mock {
+                        let accepted =
+                            self.messages.fail_media(msg_id, media_generation, false);
+                        if accepted && transcription_requested && self.tg.is_mock {
                             self.clone().start_transcription_path(
                                 chat_id,
                                 msg_id,
                                 PathBuf::from(format!("mock-voice-{chat_id}-{msg_id}.ogg")),
                             );
-                        } else if transcription_requested {
+                        } else if accepted && transcription_requested {
                             self.fail_transcription(
                                 chat_id,
                                 msg_id,
@@ -7835,10 +7867,11 @@ impl ShellInner {
                 Err(error) => {
                     shell_log!("download_media({chat_id}, {msg_id}): {error}");
                     if self.is_current(chat_id, epoch) && self.messages.contains(msg_id) {
-                        self.messages.fail_media(msg_id, true);
-                        self.messages.show_error(&error);
-                        if kind == MediaKind::Voice {
-                            self.fail_transcription(chat_id, msg_id, error);
+                        if self.messages.fail_media(msg_id, media_generation, true) {
+                            self.messages.show_error(&error);
+                            if kind == MediaKind::Voice {
+                                self.fail_transcription(chat_id, msg_id, error);
+                            }
                         }
                     }
                 }
@@ -11833,6 +11866,17 @@ impl ShellInner {
         }
 
         probe_step("card location");
+        // The asciiload effect is opt-in (off by default in smoke), so the
+        // placeholder path is proven by the row having a media state at all;
+        // the effect source is only checked when the effect is enabled.
+        if self.messages.media_state(805).is_none()
+            || (self.settings.get().animation("asciiload")
+                && !matches!(self.messages.media_state(805), Some(MediaState::Done(_)))
+                && !self.messages.geo_loading_effect_active(805))
+        {
+            probe_fail("card location loading effect");
+            return false;
+        }
         if !poll_until(
             8_000,
             || {
@@ -11881,6 +11925,116 @@ impl ShellInner {
             probe_fail("card live location");
             return false;
         }
+        if !poll_until(3_500, || self.messages.geo_map_loaded(807)).await
+            || !self.messages.live_timer_active(807)
+        {
+            probe_fail("card live location map/timer");
+            return false;
+        }
+
+        // Move the live point through the backend, then offer the completed
+        // row its previous map generation again. It must reject that stale
+        // completion and retain the new point's map.
+        probe_step("card live location stale map");
+        let Some(old_generation) = self.messages.media_generation(807) else {
+            probe_fail("card live location old map generation");
+            return false;
+        };
+        let Some(MediaState::Done(old_path)) = self.messages.media_state(807) else {
+            probe_fail("card live location old map path");
+            return false;
+        };
+        if self
+            .tg
+            .update_live_location(
+                media_lab,
+                807,
+                crate::tg::GeoPoint {
+                    lat: 52.5185,
+                    lon: 13.3777,
+                },
+            )
+            .await
+            .is_err()
+        {
+            probe_fail("card live location backend move");
+            return false;
+        }
+        if !poll_until(4_000, || {
+            matches!(
+                self.messages.media_state(807),
+                Some(MediaState::Done(path))
+                    if path.file_name().is_some_and(|name| name.to_string_lossy().contains("52.5185_13.3777"))
+            )
+        })
+        .await
+        {
+            probe_fail("card live location latest map");
+            return false;
+        }
+        let Ok(old_texture) = gdk::Texture::from_filename(&old_path) else {
+            probe_fail("card live location old map decode");
+            return false;
+        };
+        if self
+            .messages
+            .finish_image(807, old_generation, old_path, &old_texture)
+            || !matches!(
+                self.messages.media_state(807),
+                Some(MediaState::Done(path))
+                    if path.file_name().is_some_and(|name| name.to_string_lossy().contains("52.5185_13.3777"))
+            )
+        {
+            probe_fail("card live location stale map completion");
+            return false;
+        }
+
+        // A point update while map tiles are disabled must rebuild the text
+        // card without resetting media or issuing a replacement download.
+        let map_generation = self.messages.media_generation(807);
+        self.messages.set_map_tiles(false);
+        if let Some(mut message) = self.messages.message(807) {
+            if let Some(location) = &mut message.location {
+                location.point.lat += 0.001;
+            }
+            self.messages.merge_event(message);
+        }
+        if self.messages.media_generation(807) != map_generation
+            || self.messages.geo_map_loaded(807)
+        {
+            probe_fail("card live location map disabled download");
+            return false;
+        }
+        self.messages.set_map_tiles(true);
+
+        // Stopping at the same point updates the metadata widgets in place,
+        // cancels their dedicated timer, and never leaves a loading map slot.
+        let live_card = self.messages.card_widget(807);
+        self.messages.expire_live_location(807);
+        if self.messages.card_widget(807) != live_card
+            || self.messages.live_timer_active(807)
+            || !self
+                .messages
+                .card_text(807)
+                .is_some_and(|text| text.contains("Sharing ended"))
+        {
+            probe_fail("card live location metadata update");
+            return false;
+        }
+        let expired_generation = self.messages.media_generation(807);
+        if let Some(mut message) = self.messages.message(807) {
+            if let Some(location) = &mut message.location {
+                location.point.lon += 0.001;
+            }
+            self.messages.merge_event(message);
+        }
+        if self.messages.media_generation(807) != expired_generation
+            || self.messages.geo_map_loaded(807)
+            || self.messages.live_timer_active(807)
+        {
+            probe_fail("card expired live location download");
+            return false;
+        }
 
         probe_step("card contact");
         if !poll_until(
@@ -11898,6 +12052,63 @@ impl ShellInner {
             return false;
         }
 
+        probe_step("card contact retry");
+        let old_fail_once = std::env::var_os("OMG_MOCK_FAIL_ONCE");
+        let restore_fail_once = || {
+            if let Some(value) = &old_fail_once {
+                unsafe { std::env::set_var("OMG_MOCK_FAIL_ONCE", value) };
+            } else {
+                unsafe { std::env::remove_var("OMG_MOCK_FAIL_ONCE") };
+            }
+        };
+        let mut fail_once = old_fail_once
+            .as_ref()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !fail_once.is_empty() {
+            fail_once.push(',');
+        }
+        fail_once.push_str("AddContact");
+        unsafe {
+            std::env::set_var("OMG_MOCK_FAIL_ONCE", fail_once);
+        }
+        let Some(add_contact) = self.messages.contact_add_button(808) else {
+            restore_fail_once();
+            probe_fail("card contact add button");
+            return false;
+        };
+        add_contact.emit_clicked();
+        if add_contact.is_sensitive() {
+            restore_fail_once();
+            probe_fail("card contact pending state");
+            return false;
+        }
+        if !poll_until(4_000, || {
+            self.messages.contact_error_visible(808)
+                && self
+                    .messages
+                    .contact_add_button(808)
+                    .is_some_and(|button| button.is_sensitive())
+        })
+        .await
+        {
+            restore_fail_once();
+            probe_fail("card contact inline retry state");
+            return false;
+        }
+        restore_fail_once();
+        self.messages.contact_add_button(808).unwrap().emit_clicked();
+        if !poll_until(4_000, || {
+            self.messages
+                .card_text(808)
+                .is_some_and(|text| text.contains("Added"))
+        })
+        .await
+        {
+            probe_fail("card contact retry completion");
+            return false;
+        }
+
         probe_step("card contact unknown");
         if !poll_until(
             3_500,
@@ -11911,6 +12122,18 @@ impl ShellInner {
         .await
         {
             probe_fail("card contact unknown");
+            return false;
+        }
+        if let Some(mut same_contact) = self.messages.message(808) {
+            same_contact.id = 814;
+            self.messages.merge_event(same_contact);
+        }
+        if !self
+            .messages
+            .card_text(814)
+            .is_some_and(|text| text.contains("Added"))
+        {
+            probe_fail("card contact user-scoped added state");
             return false;
         }
 
@@ -11952,7 +12175,77 @@ impl ShellInner {
             return false;
         }
 
+        // A delayed completion from Polls must not mutate a colliding message
+        // id in another chat.
+        probe_step("poll stale completion");
+        let Some(mut colliding_poll) = self.messages.message(904) else {
+            probe_fail("poll stale completion fixture");
+            return false;
+        };
+        let old_slow = std::env::var_os("OMG_MOCK_SLOW");
+        let restore_slow = || {
+            if let Some(value) = &old_slow {
+                unsafe { std::env::set_var("OMG_MOCK_SLOW", value) };
+            } else {
+                unsafe { std::env::remove_var("OMG_MOCK_SLOW") };
+            }
+        };
+        let mut slow = old_slow
+            .as_ref()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !slow.is_empty() {
+            slow.push(',');
+        }
+        slow.push_str("SendVote");
+        unsafe {
+            std::env::set_var("OMG_MOCK_SLOW", slow);
+        }
+        self.clone().handle_message_action(MessageAction::Vote {
+            msg_id: 904,
+            options: vec![0],
+        });
+        self.clone().open_chat(media_lab);
+        if !poll_until(3_500, || {
+            self.open_chat.get() == Some(media_lab) && !self.messages.is_loading()
+        })
+        .await
+        {
+            restore_slow();
+            probe_fail("poll stale completion target chat");
+            return false;
+        }
+        colliding_poll.chat_id = media_lab;
+        colliding_poll.chat_title = "Media Lab".into();
+        self.messages.merge_event(colliding_poll);
+        let Some(colliding_widget) = self.messages.card_widget(904) else {
+            restore_slow();
+            probe_fail("poll stale completion colliding row");
+            return false;
+        };
+        colliding_widget.set_sensitive(false);
+        glib::timeout_future(Duration::from_millis(150)).await;
+        restore_slow();
+        glib::timeout_future(Duration::from_millis(1_700)).await;
+        if colliding_widget.is_sensitive() || self.messages.poll_error_visible(904) {
+            probe_fail("poll stale completion changed colliding row");
+            return false;
+        }
+        self.clone().open_chat(polls);
+        if !poll_until(3_500, || {
+            self.open_chat.get() == Some(polls) && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("poll restore after stale completion");
+            return false;
+        }
+
         probe_step("poll vote");
+        if !self.messages.poll_option_label_in_check(900, 0) {
+            probe_fail("poll option label activation");
+            return false;
+        }
         if let Some(check) = self.messages.poll_option_check(900, 0) {
             check.set_active(true);
         } else {
@@ -11976,6 +12269,14 @@ impl ShellInner {
             });
         if !poll_until(4_000, || self.messages.poll_error_visible(900)).await {
             probe_fail("poll vote twice error");
+            return false;
+        }
+        if !self
+            .messages
+            .card_widget(900)
+            .is_some_and(|widget| widget.is_sensitive())
+        {
+            probe_fail("poll vote error re-enable");
             return false;
         }
 
