@@ -20,6 +20,8 @@ pub struct UiState {
     pub info_width: i32,
     /// Selected folder tab; 0 = All.
     pub folder_id: i32,
+    /// Last point chosen in the location dialog (wave 6C), for prefill.
+    pub last_location: Option<(f64, f64)>,
 }
 
 impl Default for UiState {
@@ -33,6 +35,7 @@ impl Default for UiState {
             info_panel_open: false,
             info_width: 320,
             folder_id: 0,
+            last_location: None,
         }
     }
 }

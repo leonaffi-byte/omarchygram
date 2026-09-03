@@ -1561,3 +1561,95 @@ button.omg-sticker-cell picture.omg-lottie {
 
 /* ---- end 6B ---- */
 
+/* ---- wave 6C ---- */
+.omg-accent {
+  color: var(--accent);
+}
+
+.omg-poll-dialog,
+.omg-location-dialog {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 6px;
+  padding: 16px;
+}
+
+popover.omg-attach-menu > contents {
+  min-width: 180px;
+}
+
+.omg-map-grid {
+  padding: 0;
+}
+
+button.omg-map-cell {
+  background-image: none;
+  background-color: var(--bg-darker);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 0;
+  min-width: 96px;
+  min-height: 96px;
+}
+
+button.omg-map-cell:hover,
+button.omg-map-cell:focus-visible {
+  border-color: var(--accent);
+}
+
+popover.omg-send-later > contents {
+  padding: 8px;
+  min-width: 280px;
+}
+
+button.omg-chip {
+  background-image: none;
+  background-color: var(--bg-darker);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 9.5pt;
+}
+
+button.omg-chip:hover,
+button.omg-chip:focus-visible {
+  background-color: var(--selection);
+  border-color: var(--accent);
+}
+
+button.omg-scheduled-bar {
+  background-image: none;
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  min-height: 40px;
+  padding: 4px 12px;
+  border: none;
+  border-left: 2px solid var(--accent);
+  border-bottom: 1px solid var(--bg-lighter);
+  border-radius: 0;
+}
+
+button.omg-scheduled-bar:hover,
+button.omg-scheduled-bar:focus-visible {
+  background-color: var(--bg-lighter);
+}
+
+.omg-scheduled-panel {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.omg-scheduled-row {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--bg-lighter);
+}
+
+.omg-scheduled-row button.omg-danger {
+  color: var(--red);
+}
+/* ---- end 6C ---- */

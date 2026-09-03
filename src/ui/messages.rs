@@ -21,6 +21,7 @@ use super::lottie;
 use super::markup;
 use super::menus::{self, ChatAction, PopoverSlot};
 use super::recorder::{RecorderBar, RecorderUiAction};
+use super::scheduled::{ScheduledAction, ScheduledPanel, SendLaterPopover};
 use super::virtual_chat::is_virtual;
 
 mod bubble_clamp_imp {
@@ -245,7 +246,12 @@ pub enum MessageAction {
     RecorderCancel,
     RecorderSend,
     RecorderRetry,
-    Attach,
+    AttachFile,
+    AttachPoll,
+    AttachLocation,
+    SendLater(DateTime<Local>),
+    SendScheduledNow(Vec<i32>),
+    DeleteScheduled(Vec<i32>),
     DraftChanged,
     DraftRetry,
     RetryReaction,
@@ -421,6 +427,7 @@ struct MessagesInner {
     pinned_message: RefCell<Option<Msg>>,
     pinned_more: gtk::Button,
     pinned_retry: gtk::Button,
+    scheduled: Rc<ScheduledPanel>,
     bottom_button: gtk::Button,
     bottom_badge: gtk::Label,
     bottom_unread: Cell<u32>,
@@ -490,6 +497,10 @@ struct MessagesInner {
     probe_reaction_chooser: RefCell<Option<gtk::EmojiChooser>>,
     header_popover: PopoverSlot,
     pinned_popover: PopoverSlot,
+    attach_popover: PopoverSlot,
+    attach_items: RefCell<Vec<gtk::Button>>,
+    send_popover: PopoverSlot,
+    send_later: RefCell<Option<Rc<SendLaterPopover>>>,
     composer_popover: PopoverSlot,
     initial_render_count: Cell<u64>,
     history_version_count: Cell<usize>,
@@ -671,6 +682,9 @@ impl MessagesView {
         pinned_bar.append(&pinned_retry);
         widget.append(&pinned_bar);
 
+        let scheduled = ScheduledPanel::new();
+        widget.append(&scheduled.bar);
+
         // Spacing comes from the rows themselves (4px same sender / 12px
         // otherwise), so the list adds none.
         let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -696,6 +710,7 @@ impl MessagesView {
         middle.set_child(Some(&empty_effects));
         middle.set_hexpand(true);
         middle.set_vexpand(true);
+        middle.add_overlay(scheduled.panel_widget());
         let loading = gtk::Label::new(Some("Select a chat"));
         loading.add_css_class("omg-empty-state");
         loading.set_halign(gtk::Align::Center);
@@ -797,7 +812,7 @@ impl MessagesView {
         composer_box.add_css_class("omg-composer");
         let attach = gtk::Button::with_label(icons::ATTACH);
         attach.add_css_class("omg-attach");
-        attach.set_tooltip_text(Some("Attach file"));
+        attach.set_tooltip_text(Some("Attach"));
         attach.set_valign(gtk::Align::End);
         // Inert until a chat is open (reset_chat enables both).
         attach.set_sensitive(false);
@@ -884,6 +899,23 @@ impl MessagesView {
         widget.append(&composer_box);
 
         let action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>> = Rc::new(RefCell::new(None));
+        {
+            let action_cb = action.clone();
+            let scheduled = scheduled.clone();
+            scheduled.set_action(Rc::new(move |event| {
+                let Some(callback) = action_cb.borrow().as_ref().cloned() else {
+                    return;
+                };
+                match event {
+                    ScheduledAction::SendNow(ids) => {
+                        callback(MessageAction::SendScheduledNow(ids.clone()))
+                    }
+                    ScheduledAction::Delete(ids) => {
+                        callback(MessageAction::DeleteScheduled(ids.clone()))
+                    }
+                }
+            }));
+        }
         let drop_target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
         composer_box.add_controller(drop_target.clone());
 
@@ -928,6 +960,7 @@ impl MessagesView {
             pinned_message: RefCell::new(None),
             pinned_more,
             pinned_retry,
+            scheduled: scheduled.clone(),
             bottom_button,
             bottom_badge,
             bottom_unread: Cell::new(0),
@@ -997,6 +1030,10 @@ impl MessagesView {
             probe_reaction_chooser: RefCell::new(None),
             header_popover: PopoverSlot::default(),
             pinned_popover: PopoverSlot::default(),
+            attach_popover: PopoverSlot::default(),
+            attach_items: RefCell::new(Vec::new()),
+            send_popover: PopoverSlot::default(),
+            send_later: RefCell::new(None),
             composer_popover: PopoverSlot::default(),
             initial_render_count: Cell::new(0),
             history_version_count: Cell::new(0),
@@ -1051,11 +1088,9 @@ impl MessagesView {
         selection_cancel: gtk::Button,
     ) {
         {
-            let action = self.inner.action.clone();
+            let this = self.clone();
             self.inner.attach.connect_clicked(move |_| {
-                if let Some(callback) = action.borrow().as_ref().cloned() {
-                    callback(MessageAction::Attach);
-                }
+                this.show_attach_menu();
             });
         }
         {
@@ -1133,6 +1168,41 @@ impl MessagesView {
                     });
                 }
             });
+        }
+
+        {
+            // Spec §4.4: secondary click or long press on SEND, and
+            // Ctrl+Shift+Enter in the composer, open the send-later picker.
+            let this = self.clone();
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(gdk::BUTTON_SECONDARY);
+            gesture.connect_released(move |gesture, _, _, _| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.show_send_later();
+            });
+            self.inner.send.add_controller(gesture);
+            let this = self.clone();
+            let long = gtk::GestureLongPress::new();
+            long.connect_pressed(move |gesture, _, _| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.show_send_later();
+            });
+            self.inner.send.add_controller(long);
+
+            let shortcuts = gtk::ShortcutController::new();
+            shortcuts.set_scope(gtk::ShortcutScope::Local);
+            for accel in ["<Control><Shift>Return", "<Control><Shift>KP_Enter"] {
+                let Some(trigger) = gtk::ShortcutTrigger::parse_string(accel) else {
+                    continue;
+                };
+                let this = self.clone();
+                let action = gtk::CallbackAction::new(move |_, _| {
+                    this.show_send_later();
+                    glib::Propagation::Stop
+                });
+                shortcuts.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+            }
+            self.inner.composer.add_controller(shortcuts);
         }
 
         {
@@ -1350,6 +1420,196 @@ impl MessagesView {
 
     pub fn set_action(&self, callback: Rc<dyn Fn(MessageAction)>) {
         *self.inner.action.borrow_mut() = Some(callback);
+    }
+
+    // ----- wave 6C: attach menu, send-later, scheduled (spec §4) -----
+
+    /// The ATTACH button's menu (spec §4.1). The old direct file chooser is
+    /// the first item, so nothing that worked before got further away.
+    pub fn show_attach_menu(&self) {
+        // Virtual chats (Assistant / Omarchy) have no Telegram peer: none of
+        // the three actions can run there, so the menu never opens.
+        if self.inner.virtual_mode.get() || !self.inner.attach.is_sensitive() {
+            return;
+        }
+        let (popover, contents) = menus::popover();
+        popover.add_css_class("omg-attach-menu");
+        let mut items = Vec::new();
+        for (glyph, label, action) in [
+            (icons::FILE, "File…", MessageAction::AttachFile),
+            (icons::POLL, "Poll…", MessageAction::AttachPoll),
+            (icons::LOCATION, "Location…", MessageAction::AttachLocation),
+        ] {
+            let button = menus::button(&format!("{glyph}  {label}"), false);
+            let callbacks = self.inner.action.clone();
+            let popover_weak = popover.downgrade();
+            button.connect_clicked(move |_| {
+                // Popdown first: the action opens a dialog, and an open
+                // popover over it steals every click.
+                if let Some(popover) = popover_weak.upgrade() {
+                    popover.popdown();
+                }
+                let callback = callbacks.borrow().as_ref().cloned();
+                if let Some(callback) = callback {
+                    callback(action.clone());
+                }
+            });
+            contents.append(&button);
+            items.push(button);
+        }
+        *self.inner.attach_items.borrow_mut() = items;
+        self.inner.attach_popover.show(&self.inner.attach, popover);
+    }
+
+    pub fn close_attach_menu(&self) {
+        self.inner.attach_popover.dismiss();
+        self.inner.attach_items.borrow_mut().clear();
+    }
+
+    pub fn attach_menu_open(&self) -> bool {
+        self.inner.attach_popover.is_open()
+    }
+
+    pub fn attach_menu_items(&self) -> Vec<String> {
+        self.inner
+            .attach_items
+            .borrow()
+            .iter()
+            .map(|button| button.label().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Click the attach-menu item whose label contains `needle`.
+    pub fn probe_attach_menu_click(&self, needle: &str) -> bool {
+        let button = self
+            .inner
+            .attach_items
+            .borrow()
+            .iter()
+            .find(|button| {
+                button
+                    .label()
+                    .is_some_and(|label| label.contains(needle))
+            })
+            .cloned();
+        match button {
+            Some(button) => {
+                button.emit_clicked();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The send-later picker (spec §4.4): secondary click or long press on
+    /// SEND, and Ctrl+Shift+Enter in the composer.
+    pub fn show_send_later(&self) {
+        // Nothing to schedule without a peer or without text — the send
+        // button is showing MIC in that case.
+        if self.inner.virtual_mode.get()
+            || !self.inner.send.is_sensitive()
+            || self.composer_text().trim().is_empty()
+        {
+            return;
+        }
+        let callbacks = self.inner.action.clone();
+        let picker = SendLaterPopover::new(Rc::new(move |at| {
+            let callback = callbacks.borrow().as_ref().cloned();
+            if let Some(callback) = callback {
+                callback(MessageAction::SendLater(at));
+            }
+        }));
+        *self.inner.send_later.borrow_mut() = Some(picker.clone());
+        self.inner
+            .send_popover
+            .show(&self.inner.send, picker.popover.clone());
+    }
+
+    pub fn close_send_later(&self) {
+        self.inner.send_popover.dismiss();
+        self.inner.send_later.borrow_mut().take();
+    }
+
+    pub fn send_later_open(&self) -> bool {
+        self.inner.send_popover.is_open()
+    }
+
+    /// Point the open picker at `at` (probe / caption dialog reuse).
+    pub fn probe_send_later_set(&self, at: DateTime<Local>) -> bool {
+        let picker = self.inner.send_later.borrow().clone();
+        match picker {
+            Some(picker) => {
+                picker.set_time(at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn probe_send_later_schedule(&self) -> bool {
+        let picker = self.inner.send_later.borrow().clone();
+        match picker {
+            Some(picker) => {
+                picker.probe_schedule();
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn probe_send_later_error(&self) -> String {
+        self.inner
+            .send_later
+            .borrow()
+            .as_ref()
+            .map(|picker| picker.probe_error())
+            .unwrap_or_default()
+    }
+
+    pub fn set_scheduled_msgs(&self, messages: Vec<Msg>) {
+        self.inner.scheduled.set_scheduled(messages);
+    }
+
+    pub fn scheduled_count(&self) -> usize {
+        self.inner.scheduled.count()
+    }
+
+    pub fn scheduled_ids(&self) -> Vec<i32> {
+        self.inner.scheduled.ids()
+    }
+
+    pub fn scheduled_panel_open(&self) -> bool {
+        self.inner.scheduled.is_panel_open()
+    }
+
+    pub fn close_scheduled_panel(&self) {
+        self.inner.scheduled.close_panel();
+    }
+
+    pub fn probe_scheduled_toggle(&self) {
+        self.inner.scheduled.probe_toggle();
+    }
+
+    pub fn probe_scheduled_rows(&self) -> usize {
+        self.inner.scheduled.probe_row_count()
+    }
+
+    pub fn probe_scheduled_bar_label(&self) -> String {
+        self.inner.scheduled.probe_bar_label()
+    }
+
+    pub fn probe_scheduled_send_now(&self, id: i32) -> bool {
+        self.inner.scheduled.probe_send_now(id)
+    }
+
+    pub fn probe_scheduled_delete(&self, id: i32) -> bool {
+        self.inner.scheduled.probe_delete(id)
+    }
+
+    pub fn has_media_kind(&self, kind: MediaKind) -> bool {
+        self.messages()
+            .iter()
+            .any(|message| message.media == Some(kind))
     }
 
     pub fn open_search(&self) {
@@ -1766,6 +2026,9 @@ impl MessagesView {
         self.inner.header_popover.dismiss();
         self.inner.composer_popover.dismiss();
         self.inner.reaction_popover.dismiss();
+        self.close_attach_menu();
+        self.close_send_later();
+        self.inner.scheduled.clear();
         self.set_pinned_message(None);
         self.inner.media_ready.borrow_mut().clear();
         self.inner.quote_cache.borrow_mut().clear();
@@ -6005,3 +6268,4 @@ mod wave5_tests {
         assert!(!selection.remove_deleted(&[20, 99]));
     }
 }
+
