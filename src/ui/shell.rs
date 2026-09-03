@@ -136,6 +136,31 @@ struct PendingVoice {
     duration: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoRecorderTarget {
+    chat_id: i64,
+    chat_epoch: u64,
+    session_epoch: u64,
+    token: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum VideoRecorderPhase {
+    #[default]
+    Idle,
+    Starting(VideoRecorderTarget),
+    Recording(VideoRecorderTarget),
+    Cancelling(VideoRecorderTarget),
+    Stopping(VideoRecorderTarget),
+}
+
+#[derive(Default)]
+struct VideoRecorderState {
+    token: u64,
+    phase: VideoRecorderPhase,
+    pending_start: Option<VideoRecorderTarget>,
+}
+
 #[derive(Clone, Copy)]
 struct RestoredUiState {
     sidebar_width: i32,
@@ -351,6 +376,10 @@ impl ShellInner {
                     }
                     Err(error) => {
                         shell_log!("update_live_location({chat_id}, {msg_id}): {error}");
+                        // The dialog remains the same update operation after a
+                        // retryable failure; Retry must not become an ordinary
+                        // new-location send.
+                        this.updating_live_msg.set(Some(msg_id));
                         this.location_dialog.show_error(&error);
                     }
                 }
@@ -581,14 +610,17 @@ struct ShellInner {
     stories_strip: Rc<StoriesStrip>,
     stories_viewer: Rc<StoryViewer>,
     stories_peers: RefCell<Vec<StoryPeer>>,
+    stories_generation: Cell<u64>,
     updating_live_msg: Cell<Option<i32>>,
     own_live_locations: RefCell<Vec<(i64, i32, DateTime<Local>)>>,
     live_expiry_timer: RefCell<Option<glib::SourceId>>,
-    video_recording_active: Cell<bool>,
-    /// A cancel/stop of the previous recording is still in flight in the
-    /// local service (its commands run concurrently): a new start must wait
-    /// for it, or the late teardown kills the new recording.
-    video_teardown_pending: Cell<bool>,
+    /// Tokenized by chat and session. Only one local video start/cancel/stop
+    /// command is dispatched at a time; a restart waits in `pending_start`.
+    video_recorder: RefCell<VideoRecorderState>,
+    /// Probe-only delay after `video_start` has created its process and before
+    /// the receiver is attached. This makes cancel/restart-during-start
+    /// deterministic. Always zero outside `--probe`.
+    probe_video_start_attach_delay: Cell<u64>,
     paned: gtk::Paned,
     content_paned: gtk::Paned,
     effects: Rc<Effects>,
@@ -833,11 +865,12 @@ impl Shell {
             stories_strip,
             stories_viewer,
             stories_peers: RefCell::new(Vec::new()),
+            stories_generation: Cell::new(0),
             updating_live_msg: Cell::new(None),
             own_live_locations: RefCell::new(Vec::new()),
             live_expiry_timer: RefCell::new(None),
-            video_recording_active: Cell::new(false),
-            video_teardown_pending: Cell::new(false),
+            video_recorder: RefCell::new(VideoRecorderState::default()),
+            probe_video_start_attach_delay: Cell::new(0),
             paned,
             content_paned,
             effects,
@@ -1414,6 +1447,13 @@ impl ShellInner {
         if !self.session_ready.replace(false) {
             return;
         }
+        // Story content is account-scoped and sits above the auth stack.
+        // Tear it down synchronously before any logout await can yield.
+        self.stories_generation
+            .set(self.stories_generation.get().wrapping_add(1));
+        self.stories_viewer.clear_session();
+        self.stories_peers.borrow_mut().clear();
+        self.stories_strip.update_peers(Vec::new());
         self.cancel_recording();
         self.close_forward();
         self.close_viewer();
@@ -1450,6 +1490,7 @@ impl ShellInner {
                     .borrow()
                     .values()
                     .any(|state| state.in_flight)
+                || self.video_recorder.borrow().phase != VideoRecorderPhase::Idle
             {
                 glib::timeout_future(Duration::from_millis(25)).await;
             }
@@ -1481,6 +1522,7 @@ impl ShellInner {
                 Err(error) => {
                     self.session_ready.set(true);
                     self.apply_settings(&self.settings.get());
+                    self.reload_stories();
                     self.settings_view.account_error(&error);
                     self.messages.show_error(&error);
                 }
@@ -3474,80 +3516,217 @@ impl ShellInner {
             return;
         }
         self.cancel_recording();
-        self.video_recording_active.set(true);
+        let target = {
+            let mut state = self.video_recorder.borrow_mut();
+            state.token = state.token.wrapping_add(1);
+            VideoRecorderTarget {
+                chat_id: self.open_chat.get().unwrap_or_default(),
+                chat_epoch: self.epoch.get(),
+                session_epoch: self.session_epoch.get(),
+                token: state.token,
+            }
+        };
+        let start_now = {
+            let mut state = self.video_recorder.borrow_mut();
+            if state.phase == VideoRecorderPhase::Idle {
+                state.phase = VideoRecorderPhase::Starting(target);
+                true
+            } else {
+                // Cancel/start/stop is serialized. The current command owns the
+                // local recorder until it resolves and performs any required
+                // cleanup; only then may this newest request start.
+                state.pending_start = Some(target);
+                false
+            }
+        };
         self.messages.show_video_note_starting();
+        if start_now {
+            self.spawn_video_note_start(target);
+        }
+    }
+
+    fn spawn_video_note_start(self: &Rc<Self>, target: VideoRecorderTarget) {
         let local = self.local.clone();
-        let this = self.clone();
+        let weak = Rc::downgrade(self);
+        let attach_delay = self.probe_video_start_attach_delay.get();
         glib::MainContext::default().spawn_local(async move {
-            let mut waited = 0;
-            while this.video_teardown_pending.get() && waited < 5_000 {
-                glib::timeout_future(Duration::from_millis(50)).await;
-                waited += 50;
+            let result = local.video_start(240).await;
+            if attach_delay > 0 {
+                glib::timeout_future(Duration::from_millis(attach_delay)).await;
             }
-            if !this.video_recording_active.get() {
-                return;
-            }
-            match local.video_start(240).await {
+            match result {
                 Ok(rx) => {
-                    if this.video_recording_active.get() {
+                    let Some(this) = weak.upgrade() else {
+                        // The process exists even if the window disappeared
+                        // while start was in flight.
+                        local.video_cancel().await;
+                        return;
+                    };
+                    let attach = {
+                        let mut state = this.video_recorder.borrow_mut();
+                        let current = state.phase == VideoRecorderPhase::Starting(target)
+                            && state.token == target.token
+                            && this.is_session_current(target.session_epoch)
+                            && this.is_current(target.chat_id, target.chat_epoch);
+                        if current {
+                            state.phase = VideoRecorderPhase::Recording(target);
+                            true
+                        } else {
+                            if state.phase == VideoRecorderPhase::Starting(target) {
+                                state.phase = VideoRecorderPhase::Cancelling(target);
+                            }
+                            false
+                        }
+                    };
+                    if attach {
                         this.messages.show_video_note_recording(rx);
+                    } else {
+                        // A cancel/restart/session switch made this start stale
+                        // after it had created a process. Release that exact
+                        // serialized recorder slot before launching a pending
+                        // request, so the receiver can never attach to it.
+                        local.video_cancel().await;
+                        this.finish_video_note_cancel(target);
                     }
                 }
                 Err(error) => {
-                    this.video_recording_active.set(false);
-                    this.messages.show_video_note_error(&error);
+                    let Some(this) = weak.upgrade() else { return };
+                    let show_error = {
+                        let mut state = this.video_recorder.borrow_mut();
+                        let current = state.phase == VideoRecorderPhase::Starting(target)
+                            && state.token == target.token
+                            && this.is_session_current(target.session_epoch)
+                            && this.is_current(target.chat_id, target.chat_epoch);
+                        if state.phase == VideoRecorderPhase::Starting(target) {
+                            state.phase = VideoRecorderPhase::Idle;
+                        }
+                        current
+                    };
+                    if show_error {
+                        this.messages.show_video_note_error(&error);
+                    }
+                    this.launch_pending_video_note_start();
                 }
             }
         });
     }
 
-    fn cancel_video_note(self: &Rc<Self>) {
-        if !self.video_recording_active.replace(false) {
-            self.messages.hide_video_note();
+    fn launch_pending_video_note_start(self: &Rc<Self>) {
+        let pending = {
+            let mut state = self.video_recorder.borrow_mut();
+            if state.phase != VideoRecorderPhase::Idle {
+                return;
+            }
+            state.pending_start.take()
+        };
+        let Some(target) = pending else { return };
+        let current = {
+            let state = self.video_recorder.borrow();
+            state.token == target.token
+                && self.is_session_current(target.session_epoch)
+                && self.is_current(target.chat_id, target.chat_epoch)
+        };
+        if !current {
             return;
         }
+        self.video_recorder.borrow_mut().phase = VideoRecorderPhase::Starting(target);
+        self.messages.show_video_note_starting();
+        self.spawn_video_note_start(target);
+    }
+
+    fn finish_video_note_cancel(self: &Rc<Self>, target: VideoRecorderTarget) {
+        {
+            let mut state = self.video_recorder.borrow_mut();
+            if state.phase != VideoRecorderPhase::Cancelling(target) {
+                return;
+            }
+            state.phase = VideoRecorderPhase::Idle;
+        }
+        self.launch_pending_video_note_start();
+    }
+
+    fn cancel_video_note(self: &Rc<Self>) {
+        let cancel_now = {
+            let mut state = self.video_recorder.borrow_mut();
+            state.token = state.token.wrapping_add(1);
+            state.pending_start = None;
+            match state.phase {
+                VideoRecorderPhase::Recording(target) => {
+                    state.phase = VideoRecorderPhase::Cancelling(target);
+                    Some(target)
+                }
+                // A Starting completion owns cleanup if it produced a process;
+                // Cancelling/Stopping already own their serialized command.
+                VideoRecorderPhase::Idle
+                | VideoRecorderPhase::Starting(_)
+                | VideoRecorderPhase::Cancelling(_)
+                | VideoRecorderPhase::Stopping(_) => None,
+            }
+        };
         self.messages.hide_video_note();
-        let local = self.local.clone();
-        let this = self.clone();
-        self.video_teardown_pending.set(true);
-        glib::MainContext::default().spawn_local(async move {
-            local.video_cancel().await;
-            this.video_teardown_pending.set(false);
-        });
+        if let Some(target) = cancel_now {
+            let local = self.local.clone();
+            let weak = Rc::downgrade(self);
+            glib::MainContext::default().spawn_local(async move {
+                local.video_cancel().await;
+                if let Some(this) = weak.upgrade() {
+                    this.finish_video_note_cancel(target);
+                }
+            });
+        }
     }
 
     fn send_video_note(self: &Rc<Self>) {
-        if !self.video_recording_active.replace(false) {
+        let target = {
+            let state = self.video_recorder.borrow();
+            match state.phase {
+                VideoRecorderPhase::Recording(target) if state.token == target.token => target,
+                _ => return,
+            }
+        };
+        if !self.is_session_current(target.session_epoch)
+            || !self.is_current(target.chat_id, target.chat_epoch)
+        {
+            self.cancel_video_note();
             return;
         }
-        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
-            self.messages.hide_video_note();
-            return;
-        };
         let Some(session_epoch) = self.begin_mutation() else {
-            self.messages.hide_video_note();
+            self.cancel_video_note();
             return;
         };
-        let epoch = self.epoch.get();
+        let chat_id = target.chat_id;
+        let epoch = target.chat_epoch;
         let title = self.title_for(chat_id);
+        self.video_recorder.borrow_mut().phase = VideoRecorderPhase::Stopping(target);
         self.messages.show_video_note_stopping();
         let local = self.local.clone();
         let tg = self.tg.clone();
         let this = self.clone();
-        self.video_teardown_pending.set(true);
         glib::MainContext::default().spawn_local(async move {
             let stop_res = local.video_stop().await;
-            this.video_teardown_pending.set(false);
-            this.messages.hide_video_note();
+            let owns_ui = {
+                let mut state = this.video_recorder.borrow_mut();
+                if state.phase == VideoRecorderPhase::Stopping(target) {
+                    state.phase = VideoRecorderPhase::Idle;
+                }
+                state.token == target.token && state.pending_start.is_none()
+            };
             let (path, duration) = match stop_res {
                 Ok(res) => res,
                 Err(error) => {
                     shell_log!("video note stop: {error}");
                     this.finish_mutation();
-                    this.messages.show_error(&error);
+                    if owns_ui && this.is_session_current(session_epoch) {
+                        this.messages.show_video_note_error(&error);
+                    }
+                    this.launch_pending_video_note_start();
                     return;
                 }
             };
+            if owns_ui {
+                this.messages.hide_video_note();
+            }
+            this.launch_pending_video_note_start();
             let result = tg.send_video_note(chat_id, path, duration, 240).await;
             this.finish_mutation();
             if !this.is_session_current(session_epoch) {
@@ -3638,10 +3817,21 @@ impl ShellInner {
     }
 
     fn reload_stories(self: &Rc<Self>) {
+        if !self.session_ready.get() {
+            return;
+        }
+        let generation = self.stories_generation.get().wrapping_add(1);
+        self.stories_generation.set(generation);
+        let session_epoch = self.session_epoch.get();
         let tg = self.tg.clone();
         let this = self.clone();
         glib::MainContext::default().spawn_local(async move {
             if let Ok(peers) = tg.get_story_peers().await {
+                if !this.is_session_current(session_epoch)
+                    || this.stories_generation.get() != generation
+                {
+                    return;
+                }
                 *this.stories_peers.borrow_mut() = peers.clone();
                 this.stories_strip.update_peers(peers);
             }
@@ -3649,6 +3839,9 @@ impl ShellInner {
     }
 
     fn open_stories_for_peer(self: &Rc<Self>, chat_id: i64) {
+        if !self.session_ready.get() {
+            return;
+        }
         let peers = self.stories_peers.borrow().clone();
         self.stories_viewer.open(peers, chat_id);
     }
@@ -4318,7 +4511,14 @@ impl ShellInner {
             Event::PollChanged { poll_id, poll } => {
                 self.messages.update_poll(poll_id, poll);
             }
-            Event::StoriesChanged => self.reload_stories(),
+            Event::StoriesChanged => {
+                self.reload_stories();
+                // Story rings are part of ChatSummary, so the same event must
+                // refresh dialogs even when the backend emits no separate
+                // DialogsChanged notification.
+                self.bump_dialogs_revision();
+                self.schedule_dialogs_reload();
+            }
             Event::ScheduledChanged { chat_id } => {
                 if self.open_chat.get() == Some(chat_id) {
                     self.clone().refresh_scheduled(chat_id);
@@ -10934,6 +11134,12 @@ impl ShellInner {
             return;
         }
 
+        probe_step("logout clears stories");
+        self.open_stories_for_peer(1);
+        if !poll_until(4_000, || self.stories_viewer.is_open()).await {
+            probe_fail("logout clears stories: viewer did not open");
+            return;
+        }
         if !self.settings_open() {
             self.toggle_settings();
         }
@@ -10943,6 +11149,13 @@ impl ShellInner {
             || !self.settings_view.probe_confirm_logout()
         {
             probe_fail("log out confirm dialog");
+            return;
+        }
+        if self.stories_viewer.is_open()
+            || !self.stories_viewer.probe_state_is_clear()
+            || self.stories_strip.peer_count() != 0
+        {
+            probe_fail("log out left account-scoped story state visible");
             return;
         }
         let fail_once = std::env::var("OMG_MOCK_FAIL_ONCE")
@@ -12361,6 +12574,36 @@ impl ShellInner {
             std::env::remove_var("OMG_MOCK_CAMERA");
         }
 
+        // A start that resolves after cancel/restart must clean up its own
+        // process before the replacement start attaches a receiver.
+        probe_step("video note stale start");
+        self.probe_video_start_attach_delay.set(500);
+        self.clone().start_video_note();
+        glib::timeout_future(Duration::from_millis(50)).await;
+        self.messages.probe_video_recorder_cancel();
+        self.probe_video_start_attach_delay.set(0);
+        self.clone().start_video_note();
+        if !poll_until(12_000, || {
+            self.messages.video_recorder_visible()
+                && self.messages.video_recorder_status().contains("Recording")
+                && self.messages.video_recorder_has_frame()
+        })
+        .await
+        {
+            probe_fail("video note stale start: replacement did not own the receiver");
+            return false;
+        }
+        self.messages.probe_video_recorder_cancel();
+        if !poll_until(4_000, || {
+            !self.messages.video_recorder_visible()
+                && self.video_recorder.borrow().phase == VideoRecorderPhase::Idle
+        })
+        .await
+        {
+            probe_fail("video note stale start: serialized cleanup did not finish");
+            return false;
+        }
+
         // 1. video note record
         probe_step("video note record");
         self.clone().start_video_note();
@@ -12483,9 +12726,47 @@ impl ShellInner {
             return false;
         }
         self.location_dialog.probe_set_point(52.53, 13.41);
+        let old_fail_once = std::env::var_os("OMG_MOCK_FAIL_ONCE");
+        let mut fail_once = old_fail_once
+            .as_ref()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !fail_once
+            .split(',')
+            .any(|name| name.trim() == "UpdateLiveLocation")
+        {
+            if !fail_once.is_empty() {
+                fail_once.push(',');
+            }
+            fail_once.push_str("UpdateLiveLocation");
+        }
+        unsafe {
+            std::env::set_var("OMG_MOCK_FAIL_ONCE", fail_once);
+        }
+        self.location_dialog.probe_send();
+        let retry_ready = poll_until(4_000, || {
+            self.location_dialog.is_open()
+                && self.location_dialog.probe_retry_visible()
+                && self
+                    .location_dialog
+                    .probe_error()
+                    .contains("mock: transient failure")
+        })
+        .await;
+        unsafe {
+            match old_fail_once {
+                Some(value) => std::env::set_var("OMG_MOCK_FAIL_ONCE", value),
+                None => std::env::remove_var("OMG_MOCK_FAIL_ONCE"),
+            }
+        }
+        if !retry_ready {
+            probe_fail("live location update: retry affordance missing after failure");
+            return false;
+        }
+        // Retrying the same dialog must retain the update message identity.
         self.location_dialog.probe_send();
         if !poll_until(4_000, || !self.location_dialog.is_open()).await {
-            probe_fail("live location update: dialog send failed");
+            probe_fail("live location update: retry failed");
             return false;
         }
         if !poll_until(4_000, || {
@@ -12497,6 +12778,10 @@ impl ShellInner {
         .await
         {
             probe_fail("live location update: point coordinates not updated");
+            return false;
+        }
+        if !self.messages.probe_live_timer_active(live_msg) {
+            probe_fail("live location update: rebuilt card lost its sole live timer");
             return false;
         }
 
@@ -12534,6 +12819,15 @@ impl ShellInner {
             probe_fail("stories strip: Marta unread ring not present");
             return false;
         }
+        if !self.stories_strip.probe_focus_peer(1) {
+            probe_fail("stories strip: could not focus Marta button");
+            return false;
+        }
+        self.reload_stories();
+        if !poll_until(4_000, || !self.stories_strip.probe_focus_within()).await {
+            probe_fail("stories strip: focused button removed without moving focus");
+            return false;
+        }
 
         // 8. stories viewer
         probe_step("stories viewer");
@@ -12552,6 +12846,28 @@ impl ShellInner {
             probe_fail("stories viewer: expected story index 0");
             return false;
         }
+        if !self.stories_viewer.probe_has_keyboard_focus() {
+            probe_fail("stories viewer: viewer did not take keyboard focus");
+            return false;
+        }
+        self.stories_viewer.probe_middle_click();
+        glib::timeout_future(Duration::from_millis(150)).await;
+        if self.stories_viewer.current_story_index() != 0 {
+            probe_fail("stories viewer: middle-third click navigated");
+            return false;
+        }
+        if !poll_until(3_000, || self.stories_viewer.probe_progress() > 0.0).await {
+            probe_fail("stories viewer: progress did not start");
+            return false;
+        }
+        self.stories_viewer.probe_toggle_pause();
+        let paused_progress = self.stories_viewer.probe_progress();
+        glib::timeout_future(Duration::from_millis(350)).await;
+        if (self.stories_viewer.probe_progress() - paused_progress).abs() > 0.001 {
+            probe_fail("stories viewer: progress advanced while paused");
+            return false;
+        }
+        self.stories_viewer.probe_toggle_pause();
 
         // 9. stories viewer advance
         probe_step("stories viewer advance");
@@ -12570,7 +12886,7 @@ impl ShellInner {
         }
         if !poll_until(4_000, || {
             self.chatlist.probe_chat_story_ring(1) == Some(StoryRing::Read)
-                || self.stories_strip.peer_unread(1) == Some(false)
+                && self.stories_strip.peer_unread(1) == Some(false)
         })
         .await
         {

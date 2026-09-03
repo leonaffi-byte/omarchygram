@@ -47,6 +47,7 @@ impl VideoRecorderBar {
         let preview_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         preview_box.add_css_class("omg-round");
         preview_box.set_size_request(240, 240);
+        preview_box.set_overflow(gtk::Overflow::Hidden);
 
         let preview_picture = gtk::Picture::new();
         preview_picture.set_content_fit(gtk::ContentFit::Cover);
