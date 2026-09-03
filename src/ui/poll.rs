@@ -81,7 +81,10 @@ fn render(
         row.add_css_class("omg-poll-option");
 
         if !show_results {
-            let check = gtk::CheckButton::new();
+            let check = gtk::CheckButton::with_label(&option.text);
+            check.set_hexpand(true);
+            check.set_halign(gtk::Align::Fill);
+            check.add_css_class("omg-poll-option-text");
             // Single choice (and quizzes) are one radio group; multiple
             // choice keeps independent check boxes.
             if !poll.multiple_choice {
@@ -120,12 +123,10 @@ fn render(
                 }
             });
             row.append(&check);
-        }
-
-        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        text.set_hexpand(true);
-        let mut line = option.text.clone();
-        if show_results {
+        } else {
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            text.set_hexpand(true);
+            let mut line = option.text.clone();
             if option.chosen {
                 line = format!("{} {}", icons::CHECK, line);
             }
@@ -136,9 +137,7 @@ fn render(
                     row.add_css_class("omg-poll-wrong");
                 }
             }
-        }
-        text.append(&label(&line, "omg-poll-option-text"));
-        if show_results {
+            text.append(&label(&line, "omg-poll-option-text"));
             let fraction = option.voters as f64 / total as f64;
             let bar = gtk::ProgressBar::new();
             bar.add_css_class("omg-poll-bar");
@@ -147,10 +146,8 @@ fn render(
             bar.set_hexpand(true);
             bar.set_valign(gtk::Align::Center);
             text.append(&bar);
-        }
-        row.append(&text);
+            row.append(&text);
 
-        if show_results {
             let pct = if poll.total_voters == 0 {
                 "0%".to_string()
             } else {

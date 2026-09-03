@@ -365,9 +365,9 @@ struct MessageRow {
     /// The asciiload placeholder timer only — drained when the media
     /// finishes, without touching receipt/cascade/particle timers.
     media_loading_source: Rc<RefCell<Option<glib::SourceId>>>,
-    /// The live-location minute timer only. Card rebuilds replace this source,
-    /// so it cannot share the append-only animation source list.
-    live_timer_source: Rc<RefCell<Option<glib::SourceId>>>,
+    /// The live-location minute refresh timer. Unlike one-shot animation
+    /// effects, this must be replaced when live metadata changes in place.
+    live_location_source: Rc<RefCell<Option<glib::SourceId>>>,
     /// Wave 6D: the animated (.tgs) sticker in this row, if any. Dropping the
     /// row stops its render-thread animation.
     lottie: Rc<RefCell<Option<lottie::Sticker>>>,
@@ -380,6 +380,7 @@ struct MessageEntry {
     msg: Msg,
     row: MessageRow,
     media_state: MediaState,
+    media_generation: u64,
     media_retryable: bool,
     autoplay_requested: Cell<bool>,
 }
@@ -555,8 +556,9 @@ struct MessagesInner {
     effects: Rc<Effects>,
     /// `settings.media.map_tiles` — gates the map download for 6B geo cards.
     map_tiles: Cell<bool>,
-    /// Message ids whose contact has been added to the address book (6B).
-    added_contacts: RefCell<HashSet<i32>>,
+    /// Telegram user ids added from contact cards (6B). Message ids collide
+    /// across chats, while contact membership is naturally user-scoped.
+    added_contact_users: RefCell<HashSet<i64>>,
     settings: RefCell<Option<Rc<SettingsStore>>>,
     probe: Cell<bool>,
     player_throttle: RefCell<Option<glib::SourceId>>,
@@ -1123,7 +1125,7 @@ impl MessagesView {
             command_popover: RefCell::new(None),
             effects,
             map_tiles: Cell::new(true),
-            added_contacts: RefCell::new(HashSet::new()),
+            added_contact_users: RefCell::new(HashSet::new()),
             settings: RefCell::new(None),
             probe: Cell::new(false),
             player_throttle: RefCell::new(None),
@@ -2066,7 +2068,7 @@ impl MessagesView {
             if let Some(source) = row.media_loading_source.borrow_mut().take() {
                 remove_source_if_present(source);
             }
-            if let Some(source) = row.live_timer_source.borrow_mut().take() {
+            if let Some(source) = row.live_location_source.borrow_mut().take() {
                 remove_source_if_present(source);
             }
         }
@@ -2503,6 +2505,7 @@ impl MessagesView {
                     msg: message,
                     row,
                     media_state,
+                    media_generation: 0,
                     media_retryable: false,
                     autoplay_requested: Cell::new(false),
                 },
@@ -2628,7 +2631,8 @@ impl MessagesView {
 
         let animation_sources = Rc::new(RefCell::new(Vec::new()));
         let media_loading_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        let live_timer_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let live_location_source: Rc<RefCell<Option<glib::SourceId>>> =
+            Rc::new(RefCell::new(None));
 
         let mut media_button = None;
         let mut transcribe_button = None;
@@ -2648,21 +2652,28 @@ impl MessagesView {
             }
             Some(MediaKind::Location | MediaKind::Venue) => {
                 use crate::ui::cards;
-                let (card, slot) = cards::build_geo(
+                let (card, slot, loading) = cards::build_geo(
                     message,
                     self.inner.action.clone(),
-                    live_timer_source.clone(),
+                    live_location_source.clone(),
                     self.inner.map_tiles.get(),
                 );
                 media_slot.append(&card);
                 *geo_map_slot.borrow_mut() = slot;
+                if let Some(placeholder) = loading
+                    && let Some(source) = self.inner.effects.image_loading(&placeholder)
+                {
+                    *media_loading_source.borrow_mut() = Some(source);
+                }
             }
             Some(MediaKind::Contact) => {
                 use crate::ui::cards;
                 let card = cards::build_contact(
                     message,
                     self.inner.action.clone(),
-                    self.inner.added_contacts.borrow().contains(&message.id),
+                    message.contact.as_ref().and_then(|contact| contact.user_id).is_some_and(
+                        |user_id| self.inner.added_contact_users.borrow().contains(&user_id),
+                    ),
                 );
                 media_slot.append(&card);
             }
@@ -2890,7 +2901,7 @@ impl MessagesView {
             keyboard_slot,
             animation_sources,
             media_loading_source,
-            live_timer_source,
+            live_location_source,
             lottie: Rc::new(RefCell::new(None)),
             geo_map_slot,
         };
@@ -3045,44 +3056,35 @@ impl MessagesView {
         if message.edited && (!was_edited || old_text != message.text) {
             self.inner.effects.message_edited(row.widget.upcast_ref());
         }
-        // 6B: live location point moves / dice value resolves / poll edits via
-        // `MessageChanged` — rebuild the inline card (live location point
-        // move / dice value resolves / poll closed or edited).
-        if matches!(
-            message.media,
-            Some(
-                MediaKind::Location
-                    | MediaKind::Venue
-                    | MediaKind::Contact
-                    | MediaKind::Dice
-                    | MediaKind::Poll
-            )
-        ) {
-            self.rebuild_card(&message);
-            if matches!(message.media, Some(MediaKind::Location | MediaKind::Venue))
-                && message.location.as_ref().and_then(|l| l.live.as_ref()).is_some()
-            {
-                let moved = message
-                    .location
-                    .as_ref()
-                    .map(|l| l.point)
-                    != old_point;
-                if moved {
-                    // Restart the map download with the new point.
-                    if let Some(entry) = self
-                        .inner
-                        .store
-                        .borrow_mut()
-                        .entries
-                        .get_mut(&message.id)
-                    {
-                        entry.media_state = MediaState::NotStarted;
-                    }
-                    if let Some(callback) = self.inner.action.borrow().as_ref().cloned() {
-                        callback(MessageAction::RedownloadMedia(message.id));
-                    }
+        // Live metadata changes every minute and must not discard an already
+        // loaded map. Only a changed point replaces the geo card/map slot.
+        if matches!(message.media, Some(MediaKind::Location | MediaKind::Venue)) {
+            let moved = message.location.as_ref().map(|location| location.point) != old_point;
+            let live = message.location.as_ref().and_then(|location| location.live.as_ref());
+            if moved || live.is_none() {
+                self.rebuild_card(&message);
+            } else if !row.media_slot.first_child().is_some_and(|card| {
+                crate::ui::cards::update_geo_live(
+                    &card,
+                    &message,
+                    row.live_location_source.clone(),
+                )
+            }) {
+                self.rebuild_card(&message);
+            }
+            if moved && self.inner.map_tiles.get() && self.geo_needs_map(message.id) {
+                // Invalidate the old point's in-flight completion before
+                // starting a download for the new coordinates.
+                self.reset_media(message.id);
+                if let Some(callback) = self.inner.action.borrow().as_ref().cloned() {
+                    callback(MessageAction::RedownloadMedia(message.id));
                 }
             }
+        } else if matches!(
+            message.media,
+            Some(MediaKind::Contact | MediaKind::Dice | MediaKind::Poll)
+        ) {
+            self.rebuild_card(&message);
         }
     }
 
@@ -4369,7 +4371,7 @@ impl MessagesView {
         if let Some(source) = entry.row.media_loading_source.borrow_mut().take() {
             remove_source_if_present(source);
         }
-        if let Some(source) = entry.row.live_timer_source.borrow_mut().take() {
+        if let Some(source) = entry.row.live_location_source.borrow_mut().take() {
             remove_source_if_present(source);
         }
         self.inner.list.remove(&entry.row.widget);
@@ -4652,8 +4654,8 @@ impl MessagesView {
             .map(|entry| entry.msg.id)
     }
 
-    pub fn begin_media(&self, msg_id: i32) -> Option<MediaKind> {
-        let (kind, button) = {
+    pub fn begin_media(&self, msg_id: i32) -> Option<(MediaKind, u64)> {
+        let (kind, generation, button) = {
             let mut store = self.inner.store.borrow_mut();
             let entry = store.entries.get_mut(&msg_id)?;
             let may_start = matches!(entry.media_state, MediaState::NotStarted)
@@ -4662,14 +4664,28 @@ impl MessagesView {
                 return None;
             }
             let kind = entry.msg.media?;
+            entry.media_generation = entry.media_generation.wrapping_add(1);
             entry.media_state = MediaState::InFlight;
             entry.media_retryable = false;
-            (kind, entry.row.media_button.clone())
+            (kind, entry.media_generation, entry.row.media_button.clone())
         };
         if let Some(button) = button {
             button.set_sensitive(false);
         }
-        Some(kind)
+        Some((kind, generation))
+    }
+
+    /// Invalidate any older completion and return this row to a downloadable
+    /// state (used when a live location moves).
+    fn reset_media(&self, msg_id: i32) -> bool {
+        let mut store = self.inner.store.borrow_mut();
+        let Some(entry) = store.entries.get_mut(&msg_id) else {
+            return false;
+        };
+        entry.media_generation = entry.media_generation.wrapping_add(1);
+        entry.media_state = MediaState::NotStarted;
+        entry.media_retryable = false;
+        true
     }
 
     pub fn media_state(&self, msg_id: i32) -> Option<MediaState> {
@@ -4968,7 +4984,13 @@ impl MessagesView {
             .map(|entry| entry.row.forwarded.label().to_string())
     }
 
-    pub fn finish_image(&self, msg_id: i32, path: PathBuf, texture: &gdk::Texture) -> bool {
+    pub fn finish_image(
+        &self,
+        msg_id: i32,
+        generation: u64,
+        path: PathBuf,
+        texture: &gdk::Texture,
+    ) -> bool {
         // A historical (detached) view must never be yanked to the tail by a
         // late image swap-in (C4 + detached semantics).
         let should_stick = self.inner.stick_to_bottom.get() && !self.inner.detached.get();
@@ -4985,6 +5007,12 @@ impl MessagesView {
                 }
                 return false;
             };
+            if entry.media_generation != generation {
+                if should_stick {
+                    self.inner.suppress_paging.set(false);
+                }
+                return false;
+            }
             entry.media_state = MediaState::Done(path.clone());
             (
                 entry.row.media_slot.clone(),
@@ -5057,12 +5085,15 @@ impl MessagesView {
         true
     }
 
-    pub fn finish_media_path(&self, msg_id: i32, path: PathBuf) -> bool {
+    pub fn finish_media_path(&self, msg_id: i32, generation: u64, path: PathBuf) -> bool {
         let (button, message) = {
             let mut store = self.inner.store.borrow_mut();
             let Some(entry) = store.entries.get_mut(&msg_id) else {
                 return false;
             };
+            if entry.media_generation != generation {
+                return false;
+            }
             entry.media_state = MediaState::Done(path.clone());
             (entry.row.media_button.clone(), entry.msg.clone())
         };
@@ -5092,12 +5123,15 @@ impl MessagesView {
     /// Wave 6D: an animated (.tgs) sticker file arrived. The row keeps its
     /// loading placeholder until the first frame is rasterized; a parse error
     /// falls back to the "image unavailable" label (§5.2).
-    pub fn finish_lottie(&self, msg_id: i32, path: PathBuf) -> bool {
+    pub fn finish_lottie(&self, msg_id: i32, generation: u64, path: PathBuf) -> bool {
         let (media_slot, outgoing, slot, loading) = {
             let mut store = self.inner.store.borrow_mut();
             let Some(entry) = store.entries.get_mut(&msg_id) else {
                 return false;
             };
+            if entry.media_generation != generation {
+                return false;
+            }
             entry.media_state = MediaState::Done(path.clone());
             (
                 entry.row.media_slot.clone(),
@@ -5223,13 +5257,15 @@ impl MessagesView {
         self.inner.media_ready.borrow_mut().remove(&msg_id);
     }
 
-    pub fn fail_media(&self, msg_id: i32, retryable: bool) -> bool {
-        self.inner.media_ready.borrow_mut().remove(&msg_id);
+    pub fn fail_media(&self, msg_id: i32, generation: u64, retryable: bool) -> bool {
         let (kind, media_slot, button, base, media_loading_source) = {
             let mut store = self.inner.store.borrow_mut();
             let Some(entry) = store.entries.get_mut(&msg_id) else {
                 return false;
             };
+            if entry.media_generation != generation {
+                return false;
+            }
             entry.media_state = MediaState::Failed;
             entry.media_retryable = retryable;
             let kind = entry.msg.media;
@@ -5242,6 +5278,7 @@ impl MessagesView {
                 entry.row.media_loading_source.clone(),
             )
         };
+        self.inner.media_ready.borrow_mut().remove(&msg_id);
         if let Some(source) = media_loading_source.borrow_mut().take() {
             remove_source_if_present(source);
         }
@@ -5394,6 +5431,13 @@ impl MessagesView {
         row.first_child()?.downcast::<gtk::CheckButton>().ok()
     }
 
+    /// Whether the option text is the check button's child, making the full
+    /// label an activation target rather than a separate sibling (§3.4).
+    pub fn poll_option_label_in_check(&self, msg_id: i32, index: usize) -> bool {
+        self.poll_option_check(msg_id, index)
+            .is_some_and(|check| check.label().is_some_and(|label| !label.is_empty()))
+    }
+
     /// The poll card's "Vote" button (multiple-choice), if present.
     pub fn poll_vote_button(&self, msg_id: i32) -> Option<gtk::Button> {
         let widget = self.card_widget(msg_id)?;
@@ -5433,10 +5477,51 @@ impl MessagesView {
         }
     }
 
+    pub fn geo_loading_effect_active(&self, msg_id: i32) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| entry.row.media_loading_source.borrow().is_some())
+    }
+
+    pub fn live_timer_active(&self, msg_id: i32) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| entry.row.live_location_source.borrow().is_some())
+    }
+
+    pub fn media_generation(&self, msg_id: i32) -> Option<u64> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .map(|entry| entry.media_generation)
+    }
+
+    pub fn contact_add_button(&self, msg_id: i32) -> Option<gtk::Button> {
+        let widget = self.card_widget(msg_id)?;
+        descendant_named(&widget, "omg-contact-add")?.downcast().ok()
+    }
+
+    pub fn contact_error_visible(&self, msg_id: i32) -> bool {
+        let Some(widget) = self.card_widget(msg_id) else {
+            return false;
+        };
+        descendant_named(&widget, "omg-contact-error")
+            .and_then(|widget| widget.downcast::<gtk::Label>().ok())
+            .is_some_and(|label| label.is_visible() && !label.text().is_empty())
+    }
+
     /// Rebuild the inline card for a message whose content changed (6B live
     /// location / dice / contact / poll updates via `MessageChanged`).
     fn rebuild_card(&self, message: &Msg) {
-        let (media_slot, geo_map_slot, live_timer_source) = {
+        let (media_slot, geo_map_slot, media_loading_source, live_location_source) = {
             let store = self.inner.store.borrow();
             let Some(entry) = store.entries.get(&message.id) else {
                 return;
@@ -5444,10 +5529,14 @@ impl MessagesView {
             (
                 entry.row.media_slot.clone(),
                 entry.row.geo_map_slot.clone(),
-                entry.row.live_timer_source.clone(),
+                entry.row.media_loading_source.clone(),
+                entry.row.live_location_source.clone(),
             )
         };
-        if let Some(source) = live_timer_source.borrow_mut().take() {
+        if let Some(source) = media_loading_source.borrow_mut().take() {
+            remove_source_if_present(source);
+        }
+        if let Some(source) = live_location_source.borrow_mut().take() {
             remove_source_if_present(source);
         }
         self.move_focus_before_removal(&media_slot);
@@ -5456,20 +5545,27 @@ impl MessagesView {
         }
         match message.media {
             Some(MediaKind::Location | MediaKind::Venue) => {
-                let (card, slot) = crate::ui::cards::build_geo(
+                let (card, slot, loading) = crate::ui::cards::build_geo(
                     message,
                     self.inner.action.clone(),
-                    live_timer_source,
+                    live_location_source,
                     self.inner.map_tiles.get(),
                 );
                 media_slot.append(&card);
                 *geo_map_slot.borrow_mut() = slot;
+                if let Some(placeholder) = loading
+                    && let Some(source) = self.inner.effects.image_loading(&placeholder)
+                {
+                    *media_loading_source.borrow_mut() = Some(source);
+                }
             }
             Some(MediaKind::Contact) => {
                 let card = crate::ui::cards::build_contact(
                     message,
                     self.inner.action.clone(),
-                    self.inner.added_contacts.borrow().contains(&message.id),
+                    message.contact.as_ref().and_then(|contact| contact.user_id).is_some_and(
+                        |user_id| self.inner.added_contact_users.borrow().contains(&user_id),
+                    ),
                 );
                 media_slot.append(&card);
             }
@@ -5501,7 +5597,7 @@ impl MessagesView {
             .is_some_and(|entry| {
                 entry
                     .row
-                    .live_timer_source
+                    .live_location_source
                     .borrow()
                     .as_ref()
                     .is_some_and(|source| {
@@ -5514,8 +5610,10 @@ impl MessagesView {
 
     /// Mark a contact as added and rebuild its card (6B `AddContact`).
     pub fn mark_contact_added(&self, msg_id: i32) {
-        self.inner.added_contacts.borrow_mut().insert(msg_id);
         if let Some(message) = self.message(msg_id) {
+            if let Some(user_id) = message.contact.as_ref().and_then(|contact| contact.user_id) {
+                self.inner.added_contact_users.borrow_mut().insert(user_id);
+            }
             self.rebuild_card(&message);
         }
     }
