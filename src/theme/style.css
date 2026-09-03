@@ -1410,6 +1410,30 @@ checkbutton.omg-message-check {
   padding: 6px;
 }
 
+/* Check/radio indicators everywhere: theme tokens, never GTK's default blue. */
+checkbutton check,
+checkbutton radio {
+  min-width: 14px;
+  min-height: 14px;
+  background-color: var(--bg-lighter);
+  border: 1px solid var(--muted);
+  color: var(--bg);
+  -gtk-icon-size: 12px;
+}
+checkbutton check { border-radius: 3px; }
+checkbutton radio { border-radius: 50%; }
+checkbutton check:checked,
+checkbutton radio:checked,
+checkbutton check:indeterminate {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+}
+checkbutton:disabled check,
+checkbutton:disabled radio {
+  opacity: 0.5;
+}
+
 .omg-recording-bar,
 .omg-message-selection-bar {
   min-height: 40px;

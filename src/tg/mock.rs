@@ -119,10 +119,10 @@ fn mock_tgs() -> Option<PathBuf> {
 
 /// A synthetic "map tile": neutral ground, a street grid offset by the
 /// coordinates (so neighbouring grid cells differ), a center marker.
-fn mock_map(point: GeoPoint, zoom: u8, width: u32, height: u32) -> Option<PathBuf> {
+fn mock_map(point: GeoPoint, zoom: u8, width: u32, height: u32, marker: bool) -> Option<PathBuf> {
     let dir = paths::media_dir();
     std::fs::create_dir_all(&dir).ok()?;
-    let key = format!("mock-map-{:.4}_{:.4}_{zoom}_{width}x{height}.png", point.lat, point.lon);
+    let key = format!("mock-map-{:.4}_{:.4}_{zoom}_{width}x{height}{}.png", point.lat, point.lon, if marker { "" } else { "-tile" });
     let path = dir.join(key);
     if path.exists() {
         return Some(path);
@@ -145,6 +145,9 @@ fn mock_map(point: GeoPoint, zoom: u8, width: u32, height: u32) -> Option<PathBu
     }
     let (cx, cy) = (width as i32 / 2, height as i32 / 2);
     for y in (cy - 8).max(0)..(cy + 8).min(height as i32) {
+        if !marker {
+            break;
+        }
         for x in (cx - 8).max(0)..(cx + 8).min(width as i32) {
             let d2 = (x - cx).pow(2) + (y - cy).pow(2);
             if d2 <= 36 {
@@ -1229,7 +1232,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                         Some(MediaKind::VideoNote) => mock_media("note.mp4").await,
                         Some(MediaKind::Gif) => mock_media("gif.mp4").await,
                         Some(MediaKind::Location | MediaKind::Venue) => {
-                            point.and_then(|p| mock_map(p, 15, 320, 180))
+                            point.and_then(|p| mock_map(p, 15, 320, 180, true))
                         }
                         // Contact, dice and polls have no file behind them.
                         _ => None,
@@ -2085,10 +2088,10 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             });
         }
         // ===================== wave 6 =====================
-        Command::DownloadMap { point, zoom, width, height, respond } => {
+        Command::DownloadMap { point, zoom, width, height, marker, respond } => {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                let _ = respond.send(Ok(mock_map(point, zoom, width, height)));
+                let _ = respond.send(Ok(mock_map(point, zoom, width, height, marker)));
             });
         }
         Command::SendVote { chat_id, msg_id, options, respond } => {

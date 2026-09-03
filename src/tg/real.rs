@@ -382,8 +382,8 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             let _ = respond.send(download_document_by_id(&client, &ctx, gif_id, false).await);
         }
         // ----- wave 6 -----
-        Command::DownloadMap { point, zoom, width, height, respond } => {
-            let _ = respond.send(download_map(&ctx, point, zoom, width, height).await);
+        Command::DownloadMap { point, zoom, width, height, marker, respond } => {
+            let _ = respond.send(download_map(&ctx, point, zoom, width, height, marker).await);
         }
         Command::SendVote { chat_id, msg_id, options, respond } => {
             let _ = respond.send(send_vote(&client, &ctx, chat_id, msg_id, &options).await);
@@ -1146,7 +1146,7 @@ async fn download_media(
         _ => None,
     };
     if let Some(point) = point {
-        return download_map(ctx, point, 15, 320, 180).await;
+        return download_map(ctx, point, 15, 320, 180, true).await;
     }
     if matches!(media, Media::Contact(_) | Media::Dice(_) | Media::Poll(_)) {
         return Ok(None);
@@ -3304,13 +3304,13 @@ async fn create_topic(client: &Client, ctx: &Arc<Ctx>, forum_id: i64, title: &st
 
 /// Stitches OpenStreetMap tiles into a `width`×`height` PNG centered on
 /// `point` (cached by rounded coordinates). Network trouble is `Ok(None)`.
-async fn download_map(ctx: &Arc<Ctx>, point: GeoPoint, zoom: u8, width: u32, height: u32) -> Result<Option<PathBuf>, TgError> {
+async fn download_map(ctx: &Arc<Ctx>, point: GeoPoint, zoom: u8, width: u32, height: u32, marker: bool) -> Result<Option<PathBuf>, TgError> {
     let zoom = zoom.clamp(1, 19);
     let width = width.clamp(16, 1024);
     let height = height.clamp(16, 1024);
     let dir = paths::media_dir().join("maps");
     private_dir(&dir)?;
-    let path = dir.join(format!("{:.5}_{:.5}_{zoom}_{width}x{height}.png", point.lat, point.lon));
+    let path = dir.join(format!("{:.5}_{:.5}_{zoom}_{width}x{height}{}.png", point.lat, point.lon, if marker { "" } else { "-tile" }));
     if path.exists() {
         return Ok(Some(path));
     }
@@ -3355,6 +3355,9 @@ async fn download_map(ctx: &Arc<Ctx>, point: GeoPoint, zoom: u8, width: u32, hei
     }
     let (mx, my) = (width as i32 / 2, height as i32 / 2);
     for y in (my - 9).max(0)..(my + 9).min(height as i32) {
+        if !marker {
+            break;
+        }
         for x in (mx - 9).max(0)..(mx + 9).min(width as i32) {
             let d2 = (x - mx).pow(2) + (y - my).pow(2);
             if d2 <= 36 {

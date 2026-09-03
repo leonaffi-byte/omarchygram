@@ -201,6 +201,9 @@ pub video: bool,                  // .webm video sticker (animated == true as we
 /// Mock: draws a synthetic tile. None when offline. Never errors for a bad
 /// network — that is `Ok(None)`.
 pub async fn download_map(&self, point: GeoPoint, zoom: u8, width: u32, height: u32) -> Result<Option<PathBuf>, TgError>;
+/// Same map WITHOUT the center marker — for tile grids (the location dialog
+/// draws one marker itself; added 2026-09-04 after the UI review found nine markers).
+pub async fn download_map_tile(&self, point: GeoPoint, zoom: u8, width: u32, height: u32) -> Result<Option<PathBuf>, TgError>;
 /// Empty `options` retracts. The new state arrives as Event::PollChanged.
 pub async fn send_vote(&self, chat_id: i64, msg_id: i32, options: Vec<usize>) -> Result<(), TgError>;
 pub async fn add_contact(&self, user_id: i64, first_name: &str, last_name: &str, phone: &str) -> Result<(), TgError>;

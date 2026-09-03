@@ -725,7 +725,7 @@ enum Command {
     GetSavedGifs(Reply<Vec<Gif>>),
     DownloadGif { gif_id: i64, respond: Reply<Option<PathBuf>> },
     // ----- wave 6 -----
-    DownloadMap { point: GeoPoint, zoom: u8, width: u32, height: u32, respond: Reply<Option<PathBuf>> },
+    DownloadMap { point: GeoPoint, zoom: u8, width: u32, height: u32, marker: bool, respond: Reply<Option<PathBuf>> },
     SendVote { chat_id: i64, msg_id: i32, options: Vec<usize>, respond: Reply<()> },
     AddContact { user_id: i64, first_name: String, last_name: String, phone: String, respond: Reply<()> },
     SendPoll { chat_id: i64, draft: PollDraft, respond: Reply<Msg> },
@@ -1230,7 +1230,13 @@ impl Tg {
     /// cached. Mock: a synthetic tile. `Ok(None)` when offline or the fetch
     /// fails — never an error for a bad network.
     pub async fn download_map(&self, point: GeoPoint, zoom: u8, width: u32, height: u32) -> Result<Option<PathBuf>, TgError> {
-        roundtrip!(self, |tx| Command::DownloadMap { point, zoom, width, height, respond: tx })
+        roundtrip!(self, |tx| Command::DownloadMap { point, zoom, width, height, marker: true, respond: tx })
+    }
+
+    /// Same map without the center marker — for grids of tiles (the location
+    /// dialog draws one marker itself).
+    pub async fn download_map_tile(&self, point: GeoPoint, zoom: u8, width: u32, height: u32) -> Result<Option<PathBuf>, TgError> {
+        roundtrip!(self, |tx| Command::DownloadMap { point, zoom, width, height, marker: false, respond: tx })
     }
 
     /// Empty `options` retracts. The new state arrives as `Event::PollChanged`.
