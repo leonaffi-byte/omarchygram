@@ -1469,13 +1469,8 @@ checkbutton:disabled radio {
 /* ---- wave 6D ---- */
 /* Animated (.tgs) stickers: flat, no chrome — the sticker is the content. */
 .omg-msg picture.omg-lottie {
-  background-color: transparent;
   border-radius: 0;
   margin-top: 4px;
-}
-
-button.omg-sticker-cell picture.omg-lottie {
-  background-color: transparent;
 }
 /* ---- end 6D ---- */
 /* ---- wave 6B ---- */

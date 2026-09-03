@@ -1590,7 +1590,8 @@ impl MessagesView {
 
         {
             // Rows resize as their media lands, so the viewport contents change
-            // without any scrolling: re-check which players are on screen.
+            // without any scrolling: re-check which players and Lottie
+            // stickers are on screen after the adjustment settles.
             let inner = self.inner.clone();
             self.inner
                 .scroll
@@ -2637,7 +2638,11 @@ impl MessagesView {
                 let placeholder = gtk::Label::new(Some("loading image…"));
                 placeholder.add_css_class("omg-media-placeholder");
                 media_slot.append(&placeholder);
-                if let Some(source) = self.inner.effects.image_loading(&placeholder) {
+                if let Some(source) = start_media_loading(
+                    &self.inner.effects,
+                    &placeholder,
+                    media_loading_source.clone(),
+                ) {
                     *media_loading_source.borrow_mut() = Some(source);
                 }
             }
@@ -5715,7 +5720,8 @@ impl MessagesView {
         }
     }
 
-    /// Throttled entry point for the scroll handler (§2.3).
+    /// Throttled entry point for adjustment/page-size and post-layout changes
+    /// (§2.3, §5.2).
     fn player_visibility_throttled(&self) {
         if let Some(source) = self.inner.player_throttle.borrow_mut().take() {
             remove_source_if_present(source);
@@ -5723,6 +5729,7 @@ impl MessagesView {
         let inner = self.inner.clone();
         let source = glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
             let _ = inner.player_throttle.borrow_mut().take();
+            sync_lottie_visibility(&inner);
             MessagesView::of(&inner).player_visibility();
         });
         *self.inner.player_throttle.borrow_mut() = Some(source);
@@ -6528,6 +6535,53 @@ fn remove_source_if_present(source_id: glib::SourceId) {
     if let Some(source) = glib::MainContext::default().find_source_by_id(&source_id) {
         source.destroy();
     }
+}
+
+/// The row owns this repeating source only while it is live. Every path that
+/// returns `Break` clears the stored id first, so later media completion can
+/// never destroy an unrelated source that reused the numeric GLib id.
+fn start_media_loading(
+    effects: &Effects,
+    placeholder: &gtk::Label,
+    owner: Rc<RefCell<Option<glib::SourceId>>>,
+) -> Option<glib::SourceId> {
+    if !effects.on("asciiload") {
+        return None;
+    }
+    let frames = [
+        "[▓░░░░░░░] photo",
+        "[▓▓░░░░░░] photo",
+        "[▓▓▓░░░░░] photo",
+        "[▓▓▓▓░░░░] photo",
+        "[▓▓▓▓▓░░░] photo",
+        "[▓▓▓▓▓▓░░] photo",
+        "[▓▓▓▓▓▓▓░] photo",
+        "[▓▓▓▓▓▓▓▓] photo",
+    ];
+    let label = placeholder.downgrade();
+    let effects = effects.clone();
+    let index = Cell::new(0usize);
+    Some(glib::timeout_add_local(
+        std::time::Duration::from_millis(110),
+        move || {
+            let Some(label) = label.upgrade() else {
+                owner.borrow_mut().take();
+                return glib::ControlFlow::Break;
+            };
+            if !label.is_mapped() {
+                owner.borrow_mut().take();
+                return glib::ControlFlow::Break;
+            }
+            if !effects.on("asciiload") {
+                label.set_label("loading image…");
+                owner.borrow_mut().take();
+                return glib::ControlFlow::Break;
+            }
+            label.set_label(frames[index.get() % frames.len()]);
+            index.set(index.get().wrapping_add(1));
+            glib::ControlFlow::Continue
+        },
+    ))
 }
 
 fn set_time_label(label: &gtk::Label, message: &Msg, format: &str) {
