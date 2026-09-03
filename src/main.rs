@@ -97,28 +97,29 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
             let delay = std::env::var("OMG_SMOKE_SHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000u64);
             let window = window.clone();
             let app = app.clone();
+            // A snapshot taken while a relayout is pending (a ticking label,
+            // a live preview) yields an empty node: retry on later main-loop
+            // iterations (real frames in between) before giving up.
+            fn attempt(window: gtk::ApplicationWindow, app: gtk::Application, path: std::ffi::OsString, left: u32) {
+                let ok = snapshot_window(&window, std::path::Path::new(&path));
+                if !ok && left > 0 {
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+                        attempt(window, app, path, left - 1);
+                    });
+                    return;
+                }
+                finish(&app, ok);
+            }
             glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
-                // A snapshot taken while a relayout is pending (a ticking
-                // label, a live preview) yields an empty node: retry on later
-                // frames before giving up.
-                let mut ok = false;
-                for _ in 0..20 {
-                    ok = snapshot_window(&window, std::path::Path::new(&path));
-                    if ok {
-                        break;
-                    }
-                    let ctx = glib::MainContext::default();
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
-                    while std::time::Instant::now() < deadline {
-                        ctx.iteration(false);
-                    }
-                }
-                if !ok {
-                    eprintln!("omarchygram: OMG_SMOKE_SHOT failed");
-                }
-                app.quit();
+                attempt(window, app, path, 30);
             });
         }
+    }
+    fn finish(app: &gtk::Application, ok: bool) {
+        if !ok {
+            eprintln!("omarchygram: OMG_SMOKE_SHOT failed");
+        }
+        app.quit();
     }
 
     if probe_traversal {
