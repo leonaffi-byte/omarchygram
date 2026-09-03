@@ -42,8 +42,8 @@ const CELL: u32 = 96;
 const LIVE_CHOICES: [(&str, Option<u32>); 4] = [
     ("Off", None),
     ("15 min", Some(900)),
-    ("1 hour", Some(3_600)),
-    ("8 hours", Some(28_800)),
+    ("1 h", Some(3_600)),
+    ("8 h", Some(28_800)),
 ];
 
 pub struct LocationDialog {
@@ -51,6 +51,7 @@ pub struct LocationDialog {
     lat: gtk::Entry,
     lon: gtk::Entry,
     error: gtk::Label,
+    map_error: gtk::Label,
     grid: gtk::Grid,
     cells: RefCell<Vec<gtk::Picture>>,
     zoom_label: gtk::Label,
@@ -68,6 +69,8 @@ pub struct LocationDialog {
     /// Bumped on every open/close and every re-centre: a tile that arrives
     /// for an older view is dropped instead of painted over the new one.
     generation: Cell<u64>,
+    map_pending: Cell<usize>,
+    map_failures: Cell<usize>,
     /// True while the entries are being written by the dialog itself, so the
     /// `changed` handler does not fight the caller.
     updating: Cell<bool>,
@@ -152,6 +155,13 @@ impl LocationDialog {
         grid.set_halign(gtk::Align::Center);
         card.append(&grid);
 
+        let map_error = gtk::Label::new(None);
+        map_error.add_css_class("omg-error");
+        map_error.set_halign(gtk::Align::Start);
+        map_error.set_wrap(true);
+        map_error.set_visible(false);
+        card.append(&map_error);
+
         let live_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let live_label = gtk::Label::new(Some("Share live for"));
         live_label.set_halign(gtk::Align::Start);
@@ -180,6 +190,7 @@ impl LocationDialog {
             lat,
             lon,
             error,
+            map_error,
             grid,
             cells: RefCell::new(Vec::new()),
             zoom_label,
@@ -195,6 +206,8 @@ impl LocationDialog {
             map_tiles: Cell::new(true),
             is_update: Cell::new(false),
             generation: Cell::new(0),
+            map_pending: Cell::new(0),
+            map_failures: Cell::new(0),
             updating: Cell::new(false),
             busy: Cell::new(false),
             action: RefCell::new(None),
@@ -315,6 +328,8 @@ impl LocationDialog {
         self.send.set_label("Send");
         self.error.set_label("");
         self.error.set_visible(false);
+        self.map_error.set_label("");
+        self.map_error.set_visible(false);
         self.live.set_selected(0);
         self.zoom.set(DEFAULT_ZOOM);
         let point = last
@@ -336,6 +351,8 @@ impl LocationDialog {
         self.send.set_label("Update");
         self.error.set_label("");
         self.error.set_visible(false);
+        self.map_error.set_label("");
+        self.map_error.set_visible(false);
         self.zoom.set(DEFAULT_ZOOM);
         self.set_point(point);
         self.widget.set_visible(true);
@@ -473,12 +490,18 @@ impl LocationDialog {
     fn refresh_grid(&self) {
         self.update_zoom_controls();
         self.grid.set_visible(self.map_tiles.get());
+        self.map_error.set_label("");
+        self.map_error.set_visible(false);
         if !self.map_tiles.get() {
+            self.map_pending.set(0);
+            self.map_failures.set(0);
             return;
         }
         self.bump();
         let generation = self.generation.get();
         let zoom = self.zoom.get();
+        self.map_pending.set(self.cells.borrow().len());
+        self.map_failures.set(0);
         for (index, picture) in self.cells.borrow().iter().enumerate() {
             let center = self.cell_center(index);
             picture.set_paintable(None::<&gdk::Paintable>);
@@ -486,19 +509,44 @@ impl LocationDialog {
             let tg = self.tg.clone();
             let weak = self.self_weak.borrow().clone();
             glib::MainContext::default().spawn_local(async move {
-                let path = match tg.download_map(center, zoom, CELL, CELL).await {
-                    Ok(Some(path)) => path,
-                    // A missing tile is a blank cell, never an error dialog.
-                    _ => return,
+                let texture = match tg.download_map(center, zoom, CELL, CELL).await {
+                    Ok(Some(path)) => {
+                        gdk::Texture::from_file(&gio::File::for_path(&path)).ok()
+                    }
+                    Ok(None) | Err(_) => None,
                 };
                 let Some(this) = weak.upgrade() else { return };
                 if this.generation.get() != generation {
                     return;
                 }
-                if let Ok(texture) = gdk::Texture::from_file(&gio::File::for_path(&path)) {
+                let loaded = texture.is_some();
+                if let Some(texture) = texture {
                     picture.set_paintable(Some(&texture));
                 }
+                this.complete_tile(generation, loaded);
             });
+        }
+    }
+
+    fn complete_tile(&self, generation: u64, loaded: bool) {
+        if self.generation.get() != generation || self.map_pending.get() == 0 {
+            return;
+        }
+        if !loaded {
+            self.map_failures
+                .set(self.map_failures.get().saturating_add(1));
+        }
+        self.map_pending
+            .set(self.map_pending.get().saturating_sub(1));
+        if self.map_pending.get() != 0 {
+            return;
+        }
+        let failures = self.map_failures.get();
+        if failures > 0 {
+            self.map_error.set_label(&format!(
+                "Map unavailable ({failures} of 9 tiles failed). You can still send or change the point to retry."
+            ));
+            self.map_error.set_visible(true);
         }
     }
 
@@ -558,6 +606,22 @@ impl LocationDialog {
             .iter()
             .filter(|picture| picture.paintable().is_some())
             .count()
+    }
+
+    pub fn probe_fail_map_fetch(&self) {
+        self.bump();
+        let generation = self.generation.get();
+        self.map_pending.set(1);
+        self.map_failures.set(0);
+        self.complete_tile(generation, false);
+    }
+
+    pub fn probe_map_error(&self) -> String {
+        self.map_error.label().to_string()
+    }
+
+    pub fn probe_retry_map(&self) {
+        self.refresh_grid();
     }
 }
 

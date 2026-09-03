@@ -192,12 +192,16 @@ impl ShellInner {
         self.close_location_dialog();
         self.switcher.close();
         self.close_settings();
+        self.poll_dialog_generation
+            .set(self.poll_dialog_generation.get().wrapping_add(1));
         self.poll_dialog.begin();
         self.apply_info_layout(self.current_window_width());
     }
 
     fn close_poll_dialog(&self) {
         if self.poll_dialog.is_open() {
+            self.poll_dialog_generation
+                .set(self.poll_dialog_generation.get().wrapping_add(1));
             self.poll_dialog.close();
             self.messages.focus_composer();
             self.apply_info_layout(self.current_window_width());
@@ -221,6 +225,8 @@ impl ShellInner {
         self.updating_live_msg.set(None);
         let last = self.ui_state.borrow().last_location;
         let map_tiles = self.settings.get().media.map_tiles;
+        self.location_dialog_generation
+            .set(self.location_dialog_generation.get().wrapping_add(1));
         self.location_dialog.begin(last, map_tiles);
         self.apply_info_layout(self.current_window_width());
     }
@@ -247,12 +253,16 @@ impl ShellInner {
         self.close_settings();
         self.updating_live_msg.set(Some(msg_id));
         let map_tiles = self.settings.get().media.map_tiles;
+        self.location_dialog_generation
+            .set(self.location_dialog_generation.get().wrapping_add(1));
         self.location_dialog.begin_update(point, map_tiles);
         self.apply_info_layout(self.current_window_width());
     }
 
     fn close_location_dialog(&self) {
         if self.location_dialog.is_open() {
+            self.location_dialog_generation
+                .set(self.location_dialog_generation.get().wrapping_add(1));
             self.updating_live_msg.set(None);
             self.location_dialog.close();
             self.messages.focus_composer();
@@ -284,6 +294,7 @@ impl ShellInner {
             return;
         };
         let epoch = self.epoch.get();
+        let dialog_generation = self.poll_dialog_generation.get();
         let title = self.title_for(chat_id);
         self.poll_dialog.set_busy(true);
         glib::MainContext::default().spawn_local(async move {
@@ -294,7 +305,9 @@ impl ShellInner {
             }
             match result {
                 Ok(message) => {
-                    self.close_poll_dialog();
+                    if self.poll_dialog_operation_is_current(chat_id, epoch, dialog_generation) {
+                        self.close_poll_dialog();
+                    }
                     let message = self.apply_tombstone(message);
                     if !message.deleted {
                         self.remember_last(&message);
@@ -313,7 +326,9 @@ impl ShellInner {
                 }
                 Err(error) => {
                     shell_log!("send_poll({chat_id}): {error}");
-                    self.poll_dialog.show_error(&error);
+                    if self.poll_dialog_operation_is_current(chat_id, epoch, dialog_generation) {
+                        self.poll_dialog.show_error(&error);
+                    }
                 }
             }
         });
@@ -334,6 +349,8 @@ impl ShellInner {
         let Some(session_epoch) = self.begin_mutation() else {
             return;
         };
+        let epoch = self.epoch.get();
+        let dialog_generation = self.location_dialog_generation.get();
         let updating_msg = self.updating_live_msg.take();
         if let Some(msg_id) = updating_msg {
             self.location_dialog.set_busy(true);
@@ -347,11 +364,23 @@ impl ShellInner {
                 }
                 match result {
                     Ok(()) => {
-                        this.close_location_dialog();
+                        if this.location_dialog_operation_is_current(
+                            chat_id,
+                            epoch,
+                            dialog_generation,
+                        ) {
+                            this.close_location_dialog();
+                        }
                     }
                     Err(error) => {
                         shell_log!("update_live_location({chat_id}, {msg_id}): {error}");
-                        this.location_dialog.show_error(&error);
+                        if this.location_dialog_operation_is_current(
+                            chat_id,
+                            epoch,
+                            dialog_generation,
+                        ) {
+                            this.location_dialog.show_error(&error);
+                        }
                     }
                 }
             });
@@ -359,7 +388,6 @@ impl ShellInner {
         }
         self.ui_state.borrow_mut().last_location = Some((point.lat, point.lon));
         self.schedule_ui_save();
-        let epoch = self.epoch.get();
         let title = self.title_for(chat_id);
         self.location_dialog.set_busy(true);
         let this = self.clone();
@@ -374,7 +402,13 @@ impl ShellInner {
             }
             match result {
                 Ok(message) => {
-                    this.close_location_dialog();
+                    if this.location_dialog_operation_is_current(
+                        chat_id,
+                        epoch,
+                        dialog_generation,
+                    ) {
+                        this.close_location_dialog();
+                    }
                     let message = this.apply_tombstone(message);
                     if !message.deleted {
                         this.remember_last(&message);
@@ -398,7 +432,13 @@ impl ShellInner {
                 }
                 Err(error) => {
                     shell_log!("send_location({chat_id}): {error}");
-                    this.location_dialog.show_error(&error);
+                    if this.location_dialog_operation_is_current(
+                        chat_id,
+                        epoch,
+                        dialog_generation,
+                    ) {
+                        this.location_dialog.show_error(&error);
+                    }
                 }
             }
         });
@@ -478,6 +518,7 @@ impl ShellInner {
                     let epoch_is_current = self.is_current(chat_id, epoch);
                     self.messages
                         .complete_text_operation(&composer_snapshot, epoch_is_current);
+                    self.clear_sent_draft(chat_id);
                 }
                 Err(error) => {
                     shell_log!("send_file_at({chat_id}): {error}");
@@ -542,16 +583,82 @@ impl ShellInner {
         }
         let session_epoch = self.session_epoch.get();
         let epoch = self.epoch.get();
+        let generation = self.scheduled_refresh_generation.get().wrapping_add(1);
+        self.scheduled_refresh_generation.set(generation);
         glib::MainContext::default().spawn_local(async move {
             let result = self.tg.get_scheduled(chat_id).await;
-            if !self.is_session_current(session_epoch) || !self.is_current(chat_id, epoch) {
-                return;
-            }
             match result {
-                Ok(messages) => self.messages.set_scheduled_msgs(messages),
-                Err(error) => shell_log!("get_scheduled({chat_id}): {error}"),
+                Ok(messages) => {
+                    self.apply_scheduled_refresh(
+                        chat_id,
+                        epoch,
+                        session_epoch,
+                        generation,
+                        messages,
+                    );
+                }
+                Err(error)
+                    if self.scheduled_refresh_is_current(
+                        chat_id,
+                        epoch,
+                        session_epoch,
+                        generation,
+                    ) =>
+                {
+                    shell_log!("get_scheduled({chat_id}): {error}");
+                }
+                Err(_) => {}
             }
         });
+    }
+
+    fn poll_dialog_operation_is_current(
+        &self,
+        chat_id: i64,
+        epoch: u64,
+        generation: u64,
+    ) -> bool {
+        self.is_current(chat_id, epoch)
+            && self.poll_dialog.is_open()
+            && self.poll_dialog_generation.get() == generation
+    }
+
+    fn location_dialog_operation_is_current(
+        &self,
+        chat_id: i64,
+        epoch: u64,
+        generation: u64,
+    ) -> bool {
+        self.is_current(chat_id, epoch)
+            && self.location_dialog.is_open()
+            && self.location_dialog_generation.get() == generation
+    }
+
+    fn scheduled_refresh_is_current(
+        &self,
+        chat_id: i64,
+        epoch: u64,
+        session_epoch: u64,
+        generation: u64,
+    ) -> bool {
+        self.is_session_current(session_epoch)
+            && self.is_current(chat_id, epoch)
+            && self.scheduled_refresh_generation.get() == generation
+    }
+
+    fn apply_scheduled_refresh(
+        &self,
+        chat_id: i64,
+        epoch: u64,
+        session_epoch: u64,
+        generation: u64,
+        messages: Vec<Msg>,
+    ) -> bool {
+        if !self.scheduled_refresh_is_current(chat_id, epoch, session_epoch, generation) {
+            return false;
+        }
+        self.messages.set_scheduled_msgs(messages);
+        true
     }
 }
 
@@ -578,6 +685,12 @@ struct ShellInner {
     viewer: Viewer,
     poll_dialog: Rc<PollDialog>,
     location_dialog: Rc<LocationDialog>,
+    /// Per-open tokens. Late completions must not close, unlock, or put an
+    /// error into a dialog that was cancelled and opened again.
+    poll_dialog_generation: Cell<u64>,
+    location_dialog_generation: Cell<u64>,
+    /// Orders concurrent `get_scheduled` calls; only the newest may paint.
+    scheduled_refresh_generation: Cell<u64>,
     stories_strip: Rc<StoriesStrip>,
     stories_viewer: Rc<StoryViewer>,
     stories_peers: RefCell<Vec<StoryPeer>>,
@@ -830,6 +943,9 @@ impl Shell {
             viewer,
             poll_dialog,
             location_dialog,
+            poll_dialog_generation: Cell::new(0),
+            location_dialog_generation: Cell::new(0),
+            scheduled_refresh_generation: Cell::new(0),
             stories_strip,
             stories_viewer,
             stories_peers: RefCell::new(Vec::new()),
@@ -4060,7 +4176,14 @@ impl ShellInner {
                 match which.as_str() {
                     "poll" => this.open_poll_dialog(),
                     "location" => this.open_location_dialog(),
-                    "later" => this.messages.show_send_later(),
+                    "later" => {
+                        // The normal empty composer shows MIC, so seed benign
+                        // text before exercising the actual send-later path.
+                        if this.messages.composer_text().trim().is_empty() {
+                            this.messages.set_composer_text("Scheduled message");
+                        }
+                        this.messages.show_send_later();
+                    }
                     "menu" => this.messages.show_attach_menu(),
                     other => eprintln!("OMG_SMOKE_ATTACH: unknown value {other}"),
                 }
@@ -4320,8 +4443,10 @@ impl ShellInner {
             }
             Event::StoriesChanged => self.reload_stories(),
             Event::ScheduledChanged { chat_id } => {
-                if self.open_chat.get() == Some(chat_id) {
-                    self.clone().refresh_scheduled(chat_id);
+                if self.open_chat_is(chat_id) {
+                    if let Some(open_chat_id) = self.open_chat.get() {
+                        self.clone().refresh_scheduled(open_chat_id);
+                    }
                 }
             }
             Event::TopicsChanged { forum_id } => {
@@ -10309,6 +10434,41 @@ impl ShellInner {
             return;
         }
 
+        // A completion from an earlier open must not close or unlock the
+        // replacement dialog. Submit, cancel, and reopen before the spawned
+        // future gets a chance to poll.
+        probe_step("poll dialog generation guard");
+        self.poll_dialog
+            .probe_fill("Old dialog poll", &["First", "Second"]);
+        let stale_polls_before = self
+            .messages
+            .messages()
+            .iter()
+            .filter(|message| message.media == Some(MediaKind::Poll))
+            .count();
+        let poll_mutations_before = self.mutations_in_flight.get();
+        self.poll_dialog.probe_submit();
+        self.close_poll_dialog();
+        self.clone().open_poll_dialog();
+        self.poll_dialog
+            .probe_fill("Replacement dialog", &["Keep", "Open"]);
+        if !poll_until(4_000, || {
+            self.messages
+                .messages()
+                .iter()
+                .filter(|message| message.media == Some(MediaKind::Poll))
+                .count()
+                > stale_polls_before
+                && self.mutations_in_flight.get() <= poll_mutations_before
+        })
+        .await
+            || !self.poll_dialog.is_open()
+            || !self.poll_dialog.probe_can_create()
+        {
+            probe_fail("poll dialog generation guard");
+            return;
+        }
+
         // One option is not a poll: Create must stay disabled until a second
         // one is filled in (spec §4.5).
         probe_step("poll dialog validate");
@@ -10379,6 +10539,34 @@ impl ShellInner {
             probe_fail("location dialog open");
             return;
         }
+        probe_step("location dialog generation guard");
+        self.location_dialog.probe_set_point(52.51, 13.40);
+        let stale_locations_before = self
+            .messages
+            .messages()
+            .iter()
+            .filter(|message| message.media == Some(MediaKind::Location))
+            .count();
+        let location_mutations_before = self.mutations_in_flight.get();
+        self.location_dialog.probe_send();
+        self.close_location_dialog();
+        self.clone().open_location_dialog();
+        if !poll_until(4_000, || {
+            self.messages
+                .messages()
+                .iter()
+                .filter(|message| message.media == Some(MediaKind::Location))
+                .count()
+                > stale_locations_before
+                && self.mutations_in_flight.get() <= location_mutations_before
+        })
+        .await
+            || !self.location_dialog.is_open()
+            || !self.location_dialog.probe_can_send()
+        {
+            probe_fail("location dialog generation guard");
+            return;
+        }
         probe_step("location dialog send");
         self.location_dialog.probe_type_coords("120.0", "13.405");
         if self.location_dialog.probe_can_send() || self.location_dialog.probe_error().is_empty() {
@@ -10430,6 +10618,24 @@ impl ShellInner {
         }
         if !poll_until(4000, || self.location_dialog.probe_tiles_loaded() == 9).await {
             probe_fail("location dialog pick: tiles never arrived");
+            return;
+        }
+        probe_step("location map unavailable");
+        self.location_dialog.probe_fail_map_fetch();
+        if !self.location_dialog.probe_map_error().contains("Map unavailable")
+            || !self.location_dialog.probe_can_send()
+        {
+            probe_fail("location map unavailable: no usable inline error");
+            return;
+        }
+        self.location_dialog.probe_retry_map();
+        if !poll_until(4000, || {
+            self.location_dialog.probe_map_error().is_empty()
+                && self.location_dialog.probe_tiles_loaded() == 9
+        })
+        .await
+        {
+            probe_fail("location map unavailable: retry");
             return;
         }
         let before = self.location_dialog.point();
@@ -10495,6 +10701,21 @@ impl ShellInner {
             probe_fail("scheduled strip: label");
             return;
         }
+        probe_step("scheduled refresh generation guard");
+        let scheduled_count = self.messages.scheduled_count();
+        let stale_generation = self.scheduled_refresh_generation.get();
+        self.clone().refresh_scheduled(marta);
+        if self.apply_scheduled_refresh(
+            marta,
+            self.epoch.get(),
+            self.session_epoch.get(),
+            stale_generation,
+            Vec::new(),
+        ) || self.messages.scheduled_count() != scheduled_count
+        {
+            probe_fail("scheduled refresh generation guard");
+            return;
+        }
         self.messages.probe_scheduled_toggle();
         if !self.messages.scheduled_panel_open() || self.messages.probe_scheduled_rows() != 3 {
             probe_fail("scheduled strip: panel");
@@ -10536,6 +10757,52 @@ impl ShellInner {
         }
         if self.messages.scheduled_count() != 0 || self.messages.scheduled_panel_open() {
             probe_fail("scheduled delete: the strip survived");
+            return;
+        }
+
+        // A successful scheduled attachment must clear the persisted draft as
+        // well as the visible, signal-blocked composer text.
+        probe_step("scheduled file clears draft");
+        let file_caption = "scheduled attachment caption";
+        self.messages.set_composer_text(file_caption);
+        self.capture_current_draft(marta);
+        let file_token = self.acquire_composer();
+        self.messages.set_busy(true);
+        self.clone().send_file_later(
+            PathBuf::from("/tmp/omarchygram-probe-attachment.txt"),
+            marta,
+            self.epoch.get(),
+            self.session_epoch.get(),
+            file_token,
+            file_caption.to_string(),
+            file_caption.to_string(),
+            Local::now() + chrono::Duration::hours(3),
+        );
+        if !poll_until(4_000, || {
+            self.messages.scheduled_count() == 1 && self.messages.composer_text().is_empty()
+        })
+        .await
+        {
+            probe_fail("scheduled file clears draft: send");
+            return;
+        }
+        self.clone().open_chat(deni);
+        self.clone().open_chat(marta);
+        if !poll_until(4_000, || {
+            self.open_chat.get() == Some(marta)
+                && !self.messages.is_loading()
+                && self.messages.composer_text().is_empty()
+                && self.messages.scheduled_count() == 1
+        })
+        .await
+        {
+            probe_fail("scheduled file clears draft: reopened caption");
+            return;
+        }
+        let scheduled_file_ids = self.messages.scheduled_ids();
+        self.clone().delete_scheduled(marta, scheduled_file_ids);
+        if !poll_until(4_000, || self.messages.scheduled_count() == 0).await {
+            probe_fail("scheduled file clears draft: cleanup");
             return;
         }
 
@@ -10792,6 +11059,16 @@ impl ShellInner {
         .await
         {
             probe_fail("forum open topic");
+            return;
+        }
+
+        probe_step("scheduled topic refresh");
+        let refresh_generation = self.scheduled_refresh_generation.get();
+        self.handle_event(Event::ScheduledChanged { chat_id: forum_id });
+        if self.open_chat.get() != Some(themes_chat)
+            || self.scheduled_refresh_generation.get() == refresh_generation
+        {
+            probe_fail("scheduled topic refresh");
             return;
         }
 
