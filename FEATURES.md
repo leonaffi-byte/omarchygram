@@ -7,7 +7,7 @@ transcription, AI draft/translate/summarize, ticketed shell gate). Wave 4
 (animations: all 54 Motion Lab effects as toggles + presets + previews) is
 MERGED. Wave 5 (Telegram parity: layout/chrome, in-app configuration, daily-use and regular-use functions — specs/spec-wave5.md) is IN PROGRESS: backend contract + real implementation merged 2026-09-02; all four UI packages (5A layout/chrome, 5B in-app configuration, 5C daily-use functions, 5D regular-use functions) MERGED 2026-09-02. Wave 5 is complete. Wave 6 (Telegram media parity: playback,
 location, polls, remaining media kinds, scheduling, bots, topics, stories, calls) is
-IN PROGRESS (2026-09-03): backend contract + real implementation + video-note recorder merged; 6A (in-app playback), 6B (cards, polls), 6C (poll/location dialogs, send later, scheduled), 6D (animated stickers) MERGED; 6E (bots, forums) in verification; 6F (video notes, live location, stories) in progress; 6G calls: spike done, deferred (see the Wave 6 section at the end). Secret chats are
+IN PROGRESS (2026-09-03): backend contract + real implementation + video-note recorder merged; 6A (in-app playback), 6B (cards, polls), 6C (poll/location dialogs, send later, scheduled), 6D (animated stickers), 6E (bots, forums) MERGED; 6F (video notes, live location, stories) in progress; 6G calls: spike done, deferred (see the Wave 6 section at the end). Secret chats are
 deliberately left out.
 
 ## Design decisions (orchestrator-owned)
