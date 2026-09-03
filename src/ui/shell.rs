@@ -8225,7 +8225,7 @@ impl ShellInner {
                     if !self.is_current(chat_id, epoch) || !self.messages.contains(msg_id) {
                         return;
                     }
-                    self.messages.finish_media_path(msg_id, path);
+                    self.messages.finish_media_path(msg_id, media_generation, path);
                 }
                 Ok(Some(path)) if matches!(kind, MediaKind::Photo | MediaKind::Sticker | MediaKind::Location | MediaKind::Venue) => {
                     let decode_path = path.clone();
@@ -9599,7 +9599,9 @@ impl ShellInner {
         let _ = self.scroll_into_view(800).await;
         // A transient download error on an inline player must leave a usable
         // retry action, not a disabled/hidden play button.
-        if !self.messages.fail_media(800, true)
+        if !self
+            .messages
+            .fail_media(800, self.messages.media_generation(800).unwrap_or(0), true)
             || !self.messages.media_retryable(800)
             || !self.messages.player_retry_available(800)
             || !self.messages.trigger_media(800)
