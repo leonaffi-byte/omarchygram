@@ -4,7 +4,7 @@
 //! Glyphs from `icons.rs` only (topic icon emoji are content, not chrome);
 //! colors via `omg-*` CSS classes.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use chrono::{DateTime, Local};
@@ -33,11 +33,16 @@ pub struct TopicListView {
     pub dialog: gtk::Box,
     header_title: gtk::Label,
     header_count: gtk::Label,
+    new_topic: gtk::Button,
     list: gtk::ListBox,
     topics: Rc<RefCell<Vec<Topic>>>,
     action: Rc<RefCell<Option<Callback>>>,
+    dialog_card: gtk::Box,
     entry: gtk::Entry,
+    dialog_error: gtk::Label,
+    cancel: gtk::Button,
     create: gtk::Button,
+    create_pending: Rc<Cell<bool>>,
 }
 
 impl TopicListView {
@@ -109,22 +114,40 @@ impl TopicListView {
         entry.set_placeholder_text(Some("Topic title"));
         card.append(&entry);
 
+        let dialog_error = gtk::Label::new(None);
+        dialog_error.add_css_class("omg-error");
+        dialog_error.set_halign(gtk::Align::Start);
+        dialog_error.set_wrap(true);
+        dialog_error.set_visible(false);
+        card.append(&dialog_error);
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Cancel");
+        actions.append(&cancel);
         let create = gtk::Button::with_label("Create");
         create.add_css_class("omg-primary");
-        create.set_halign(gtk::Align::End);
         create.set_sensitive(false);
-        card.append(&create);
+        actions.append(&create);
+        card.append(&actions);
+
+        let create_pending = Rc::new(Cell::new(false));
 
         let view = Self {
             widget,
             dialog,
             header_title,
             header_count,
+            new_topic,
             list,
             topics,
             action,
+            dialog_card: card,
             entry,
+            dialog_error,
+            cancel,
             create,
+            create_pending,
         };
 
         {
@@ -136,11 +159,17 @@ impl TopicListView {
         }
         {
             let view = view.clone();
+            let new_topic = view.new_topic.clone();
             new_topic.connect_clicked(move |_| view.open_dialog());
         }
         {
             let view = view.clone();
             close.connect_clicked(move |_| view.close_dialog());
+        }
+        {
+            let view = view.clone();
+            let cancel = view.cancel.clone();
+            cancel.connect_clicked(move |_| view.close_dialog());
         }
         {
             let create = view.create.clone();
@@ -175,6 +204,7 @@ impl TopicListView {
     /// (no "0 topics" flash).
     pub fn clear(&self) {
         self.header_count.set_label("");
+        self.move_focus_before_row_removal();
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
@@ -191,6 +221,7 @@ impl TopicListView {
             1 => "1 topic".to_string(),
             count => format!("{count} topics"),
         });
+        self.move_focus_before_row_removal();
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
@@ -201,15 +232,25 @@ impl TopicListView {
     }
 
     pub fn open_dialog(&self) {
+        self.create_pending.set(false);
+        self.dialog_card.set_sensitive(true);
         self.entry.set_text("");
+        self.dialog_error.set_label("");
+        self.dialog_error.set_visible(false);
+        self.create.set_label("Create");
         self.create.set_sensitive(false);
         self.dialog.set_visible(true);
         self.entry.grab_focus();
     }
 
     pub fn close_dialog(&self) {
+        if self.create_pending.get() {
+            return;
+        }
         self.dialog.set_visible(false);
         self.entry.set_text("");
+        self.dialog_error.set_label("");
+        self.dialog_error.set_visible(false);
     }
 
     pub fn dialog_is_open(&self) -> bool {
@@ -218,14 +259,58 @@ impl TopicListView {
 
     /// Create the topic the dialog holds (Create button, or Enter in the entry).
     pub fn submit_dialog(&self) {
+        if self.create_pending.get() {
+            return;
+        }
         let title = self.entry.text().trim().to_string();
         if title.is_empty() {
             return;
         }
-        self.close_dialog();
+        self.create_pending.set(true);
+        self.dialog_error.set_label("");
+        self.dialog_error.set_visible(false);
+        self.create.set_label("Creating…");
+        self.dialog_card.set_sensitive(false);
         let callback = self.action.borrow().clone();
         if let Some(callback) = callback {
             callback(TopicAction::CreateTopic(title));
+        }
+    }
+
+    /// Complete a successful create. The dialog remains visible and locked
+    /// until the backend has confirmed the topic exists.
+    pub fn finish_create(&self) {
+        self.create_pending.set(false);
+        self.dialog_card.set_sensitive(true);
+        self.create.set_label("Create");
+        self.close_dialog();
+    }
+
+    /// Keep the title available for a retry and surface the backend failure
+    /// in the dialog the user is still looking at.
+    pub fn show_create_error(&self, message: &str) {
+        self.create_pending.set(false);
+        self.dialog_card.set_sensitive(true);
+        self.create.set_label("Create");
+        self.create
+            .set_sensitive(!self.entry.text().trim().is_empty());
+        self.dialog_error.set_label(message);
+        self.dialog_error.set_visible(true);
+        self.entry.grab_focus();
+    }
+
+    fn move_focus_before_row_removal(&self) {
+        let Some(root) = self.widget.root() else {
+            return;
+        };
+        let Some(focus) = root.focus() else {
+            return;
+        };
+        if focus != self.list.clone().upcast::<gtk::Widget>() && !focus.is_ancestor(&self.list) {
+            return;
+        }
+        if !self.new_topic.grab_focus() {
+            root.set_focus(None::<&gtk::Widget>);
         }
     }
 
@@ -258,6 +343,36 @@ impl TopicListView {
     /// Probe hook: type a title into the open dialog.
     pub fn set_dialog_title(&self, title: &str) {
         self.entry.set_text(title);
+    }
+
+    /// Probe hooks for the focus-safe refresh and retryable create state.
+    pub fn focus_index(&self, index: i32) -> bool {
+        self.list
+            .row_at_index(index)
+            .is_some_and(|row| row.grab_focus())
+    }
+
+    pub fn header_control_has_focus(&self) -> bool {
+        self.new_topic.is_focus()
+    }
+
+    pub fn create_is_pending(&self) -> bool {
+        self.create_pending.get() && !self.dialog_card.is_sensitive()
+    }
+
+    pub fn create_retry_visible(&self) -> bool {
+        self.dialog.is_visible()
+            && self.dialog_card.is_sensitive()
+            && self.create.is_sensitive()
+            && self.dialog_error.is_visible()
+    }
+
+    pub fn create_error_text(&self) -> String {
+        self.dialog_error.label().to_string()
+    }
+
+    pub fn cancel_visible(&self) -> bool {
+        self.cancel.is_visible()
     }
 }
 

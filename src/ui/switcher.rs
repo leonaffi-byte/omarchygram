@@ -13,6 +13,7 @@ pub struct Switcher {
     chats: Rc<RefCell<Vec<(i64, String)>>>,
     visible_ids: Rc<RefCell<Vec<i64>>>,
     on_open: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
+    on_cancel: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 }
 
 impl Switcher {
@@ -37,6 +38,7 @@ impl Switcher {
         let chats = Rc::new(RefCell::new(Vec::<(i64, String)>::new()));
         let visible_ids = Rc::new(RefCell::new(Vec::<i64>::new()));
         let on_open: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>> = Rc::new(RefCell::new(None));
+        let on_cancel: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
         {
             let list = list.clone();
@@ -71,9 +73,13 @@ impl Switcher {
             let list = list.clone();
             let visible_ids = visible_ids.clone();
             let on_open = on_open.clone();
+            let on_cancel = on_cancel.clone();
             controller.connect_key_pressed(move |_, key, _, _| match key {
                 gdk::Key::Escape => {
                     widget.set_visible(false);
+                    if let Some(callback) = on_cancel.borrow().as_ref().cloned() {
+                        callback();
+                    }
                     glib::Propagation::Stop
                 }
                 gdk::Key::Return | gdk::Key::KP_Enter => {
@@ -108,11 +114,25 @@ impl Switcher {
             chats,
             visible_ids,
             on_open,
+            on_cancel,
         }
     }
 
     pub fn set_on_open(&self, callback: Rc<dyn Fn(i64)>) {
         *self.on_open.borrow_mut() = Some(callback);
+    }
+
+    pub fn set_on_cancel(&self, callback: Rc<dyn Fn()>) {
+        *self.on_cancel.borrow_mut() = Some(callback);
+    }
+
+    /// Cancel through the same path as Escape. Used by the probe without
+    /// synthesizing desktop input.
+    pub fn cancel(&self) {
+        self.widget.set_visible(false);
+        if let Some(callback) = self.on_cancel.borrow().as_ref().cloned() {
+            callback();
+        }
     }
 
     pub fn open(&self, chats: Vec<(i64, String)>) {
