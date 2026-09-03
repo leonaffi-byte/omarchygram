@@ -548,6 +548,10 @@ impl LocationDialog {
         self.error.label().to_string()
     }
 
+    pub fn probe_retry_visible(&self) -> bool {
+        self.send.label().as_deref() == Some("Retry") && self.send.is_sensitive()
+    }
+
     pub fn probe_grid_visible(&self) -> bool {
         self.grid.is_visible()
     }

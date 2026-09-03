@@ -365,6 +365,9 @@ struct MessageRow {
     /// The asciiload placeholder timer only — drained when the media
     /// finishes, without touching receipt/cascade/particle timers.
     media_loading_source: Rc<RefCell<Option<glib::SourceId>>>,
+    /// The live-location minute timer only. Card rebuilds replace this source,
+    /// so it cannot share the append-only animation source list.
+    live_timer_source: Rc<RefCell<Option<glib::SourceId>>>,
     /// Wave 6D: the animated (.tgs) sticker in this row, if any. Dropping the
     /// row stops its render-thread animation.
     lottie: Rc<RefCell<Option<lottie::Sticker>>>,
@@ -2061,6 +2064,9 @@ impl MessagesView {
             if let Some(source) = row.media_loading_source.borrow_mut().take() {
                 remove_source_if_present(source);
             }
+            if let Some(source) = row.live_timer_source.borrow_mut().take() {
+                remove_source_if_present(source);
+            }
         }
         while let Some(child) = self.inner.list.first_child() {
             self.inner.list.remove(&child);
@@ -2616,6 +2622,7 @@ impl MessagesView {
 
         let animation_sources = Rc::new(RefCell::new(Vec::new()));
         let media_loading_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let live_timer_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
 
         let mut media_button = None;
         let mut transcribe_button = None;
@@ -2634,7 +2641,7 @@ impl MessagesView {
                 let (card, slot) = cards::build_geo(
                     message,
                     self.inner.action.clone(),
-                    animation_sources.clone(),
+                    live_timer_source.clone(),
                     self.inner.map_tiles.get(),
                 );
                 media_slot.append(&card);
@@ -2873,6 +2880,7 @@ impl MessagesView {
             keyboard_slot,
             animation_sources,
             media_loading_source,
+            live_timer_source,
             lottie: Rc::new(RefCell::new(None)),
             geo_map_slot,
         };
@@ -4336,6 +4344,9 @@ impl MessagesView {
         if let Some(source) = entry.row.media_loading_source.borrow_mut().take() {
             remove_source_if_present(source);
         }
+        if let Some(source) = entry.row.live_timer_source.borrow_mut().take() {
+            remove_source_if_present(source);
+        }
         self.inner.list.remove(&entry.row.widget);
         self.reorder_rows();
         self.refresh_quotes();
@@ -5380,7 +5391,7 @@ impl MessagesView {
     /// Rebuild the inline card for a message whose content changed (6B live
     /// location / dice / contact / poll updates via `MessageChanged`).
     fn rebuild_card(&self, message: &Msg) {
-        let (media_slot, geo_map_slot, animation_sources) = {
+        let (media_slot, geo_map_slot, live_timer_source) = {
             let store = self.inner.store.borrow();
             let Some(entry) = store.entries.get(&message.id) else {
                 return;
@@ -5388,9 +5399,12 @@ impl MessagesView {
             (
                 entry.row.media_slot.clone(),
                 entry.row.geo_map_slot.clone(),
-                entry.row.animation_sources.clone(),
+                entry.row.live_timer_source.clone(),
             )
         };
+        if let Some(source) = live_timer_source.borrow_mut().take() {
+            remove_source_if_present(source);
+        }
         self.move_focus_before_removal(&media_slot);
         while let Some(child) = media_slot.first_child() {
             media_slot.remove(&child);
@@ -5400,7 +5414,7 @@ impl MessagesView {
                 let (card, slot) = crate::ui::cards::build_geo(
                     message,
                     self.inner.action.clone(),
-                    animation_sources,
+                    live_timer_source,
                     self.inner.map_tiles.get(),
                 );
                 media_slot.append(&card);
@@ -5431,6 +5445,26 @@ impl MessagesView {
             }
             _ => {}
         }
+    }
+
+    pub fn probe_live_timer_active(&self, msg_id: i32) -> bool {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .is_some_and(|entry| {
+                entry
+                    .row
+                    .live_timer_source
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|source| {
+                        glib::MainContext::default()
+                            .find_source_by_id(source)
+                            .is_some()
+                    })
+            })
     }
 
     /// Mark a contact as added and rebuild its card (6B `AddContact`).
@@ -7073,4 +7107,3 @@ mod wave5_tests {
         assert!(!selection.remove_deleted(&[20, 99]));
     }
 }
-

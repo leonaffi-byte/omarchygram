@@ -3,7 +3,7 @@
 //! Docs/spec-wave6.md §3.1–§3.3. These render inline in the message bubble's
 //! media slot. The geo card's map slot is exposed so `MessagesView::finish_image`
 //! can drop the downloaded OpenStreetMap texture into it, and the live-location
-//! "updated N min ago" timer is registered in the row's `animation_sources`.
+//! "updated N min ago" timer is stored in a dedicated row-owned slot.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -50,11 +50,12 @@ fn coords_text(lat: f64, lon: f64) -> String {
 /// Build the geo/location/venue/live card. Returns the card widget and, when a
 /// map will be downloaded, the map-slot box (so the caller can store it for
 /// `finish_image`). The live "updated N min ago" timer is registered into
-/// `animation_sources` and drained with the row.
+/// `live_timer_source` and destroyed before the card is replaced or its row is
+/// removed.
 pub fn build_geo(
     message: &Msg,
     action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
-    animation_sources: Rc<RefCell<Vec<glib::SourceId>>>,
+    live_timer_source: Rc<RefCell<Option<glib::SourceId>>>,
     map_tiles: bool,
 ) -> (gtk::Widget, Option<gtk::Box>) {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -169,6 +170,7 @@ pub fn build_geo(
             let tick = render.clone();
             let buttons = own_buttons;
             let live_exp = live.expires;
+            let source_holder = live_timer_source.clone();
             let source = glib::timeout_add_seconds_local(60, move || {
                 tick();
                 if Local::now() > live_exp {
@@ -176,12 +178,13 @@ pub fn build_geo(
                         u.set_visible(false);
                         s.set_visible(false);
                     }
+                    source_holder.borrow_mut().take();
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
                 }
             });
-            animation_sources.borrow_mut().push(source);
+            *live_timer_source.borrow_mut() = Some(source);
         }
     }
 

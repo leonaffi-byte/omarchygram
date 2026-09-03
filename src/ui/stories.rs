@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use chrono::Local;
+use gstreamer as gst;
 use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
@@ -13,6 +14,47 @@ use crate::tg::{Story, StoryPeer, Tg};
 
 use super::avatar::Avatar;
 use super::icons;
+
+const DECODE_ERROR: &str = "can't play this: install gst-plugins-good gst-libav";
+
+/// Keep story-video errors consistent with the wave-6A inline player. GTK's
+/// media backend reports missing decoders through several error domains (and,
+/// on older plugin versions, only through the message text).
+fn media_error_text(error: &glib::Error) -> String {
+    let decoder = error.kind::<gst::CoreError>() == Some(gst::CoreError::MissingPlugin)
+        || matches!(
+            error.kind::<gst::StreamError>(),
+            Some(
+                gst::StreamError::CodecNotFound
+                    | gst::StreamError::Decode
+                    | gst::StreamError::TypeNotFound
+                    | gst::StreamError::WrongType
+                    | gst::StreamError::Format
+            )
+        )
+        || error.kind::<gio::IOErrorEnum>() == Some(gio::IOErrorEnum::NotSupported);
+    if decoder {
+        return DECODE_ERROR.to_string();
+    }
+    let message = error.message();
+    let lowered = message.to_lowercase();
+    if ["plugin", "decod", "codec", "media module", "media backend"]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+    {
+        DECODE_ERROR.to_string()
+    } else {
+        format!("can't play this: {message}")
+    }
+}
+
+fn move_focus_outside(subtree: &gtk::Widget) {
+    let Some(root) = subtree.root() else { return };
+    let Some(focus) = root.focus() else { return };
+    if focus == *subtree || focus.is_ancestor(subtree) {
+        root.set_focus(None::<&gtk::Widget>);
+    }
+}
 
 // ======================== Stories Strip ========================
 
@@ -57,6 +99,10 @@ impl StoriesStrip {
 
     pub fn update_peers(&self, peers: Vec<StoryPeer>) {
         *self.peers.borrow_mut() = peers.clone();
+        // A StoriesChanged event may arrive while keyboard focus is on one of
+        // these buttons. Never unparent the focused widget (GTK focus-removal
+        // rule); move focus out before rebuilding the strip.
+        move_focus_outside(self.items_box.upcast_ref());
         while let Some(child) = self.items_box.first_child() {
             self.items_box.remove(&child);
         }
@@ -131,6 +177,34 @@ impl StoriesStrip {
             cb(chat_id);
         }
     }
+
+    pub fn probe_focus_peer(&self, chat_id: i64) -> bool {
+        let Some(index) = self
+            .peers
+            .borrow()
+            .iter()
+            .position(|peer| peer.chat_id == chat_id)
+        else {
+            return false;
+        };
+        let mut child = self.items_box.first_child();
+        for _ in 0..index {
+            child = child.and_then(|widget| widget.next_sibling());
+        }
+        child
+            .and_then(|widget| widget.downcast::<gtk::Button>().ok())
+            .is_some_and(|button| button.grab_focus())
+    }
+
+    pub fn probe_focus_within(&self) -> bool {
+        let Some(root) = self.widget.root() else {
+            return false;
+        };
+        root.focus().is_some_and(|focus| {
+            focus == self.items_box.clone().upcast::<gtk::Widget>()
+                || focus.is_ancestor(&self.items_box)
+        })
+    }
 }
 
 // ======================== Story Viewer ========================
@@ -156,6 +230,8 @@ pub struct StoryViewer {
     visible: Rc<Cell<bool>>,
     epoch: Rc<Cell<u64>>,
     story_started: Rc<RefCell<Option<Instant>>>,
+    story_elapsed: Rc<Cell<Duration>>,
+    progress: Rc<Cell<f64>>,
     on_seen: Rc<RefCell<Option<Rc<dyn Fn(i64, i32)>>>>,
     on_closed: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 }
@@ -175,6 +251,7 @@ impl StoryViewer {
         widget.set_vexpand(true);
         widget.set_halign(gtk::Align::Fill);
         widget.set_valign(gtk::Align::Fill);
+        widget.set_focusable(true);
         widget.set_visible(false);
 
         // 9:16 stage, max 720 px tall (405x720)
@@ -276,21 +353,21 @@ impl StoryViewer {
             visible: Rc::new(Cell::new(false)),
             epoch: Rc::new(Cell::new(0)),
             story_started: Rc::new(RefCell::new(None)),
+            story_elapsed: Rc::new(Cell::new(Duration::ZERO)),
+            progress: Rc::new(Cell::new(0.0)),
             on_seen: Rc::new(RefCell::new(None)),
             on_closed: Rc::new(RefCell::new(None)),
         });
 
-        // Click on stage: left 1/3 -> prev, right 2/3 -> next
+        // Click navigation exists only in the left and right thirds (§7.3).
         let click_gesture = gtk::GestureClick::new();
         let weak = Rc::downgrade(&this);
-        click_gesture.connect_released(move |_, _, x, _| {
+        click_gesture.connect_released(move |gesture, _, x, _| {
             let Some(this) = weak.upgrade() else { return };
-            // Stage width is 405
-            if x < 135.0 {
-                this.previous();
-            } else {
-                this.next();
-            }
+            let width = gesture
+                .widget()
+                .map_or(1.0, |widget| f64::from(widget.width().max(1)));
+            this.navigate_for_click(x, width);
         });
         content_overlay.add_controller(click_gesture);
 
@@ -360,7 +437,16 @@ impl StoryViewer {
         self.current_peer_idx.set(peer_idx);
         self.visible.set(true);
         self.widget.set_visible(true);
+        self.widget.grab_focus();
         self.load_current_peer(0);
+    }
+
+    fn navigate_for_click(self: &Rc<Self>, x: f64, width: f64) {
+        if x < width / 3.0 {
+            self.previous();
+        } else if x >= 2.0 * width / 3.0 {
+            self.next();
+        }
     }
 
     fn load_current_peer(self: &Rc<Self>, story_index: usize) {
@@ -455,6 +541,7 @@ impl StoryViewer {
         drop(stories);
 
         self.current_story_idx.set(story_index);
+        self.progress.set(0.0);
         self.rebuild_segments(count, story_index);
 
         // Header relative time
@@ -507,17 +594,30 @@ impl StoryViewer {
                     if is_video {
                         let file = gio::File::for_path(&path);
                         let media = gtk::MediaFile::for_file(&file);
+                        // Match wave 6A's GTK/GStreamer lifetime workaround:
+                        // finalizing the last MediaFile reference can deadlock
+                        // in libgstplay, so retain one leaked reference and only
+                        // pause/detach the stream during navigation or teardown.
+                        std::mem::forget(media.clone());
+                        let weak = Rc::downgrade(&this);
+                        media.connect_error_notify(move |m| {
+                            let Some(this) = weak.upgrade().filter(|viewer| {
+                                viewer.visible.get() && viewer.epoch.get() == epoch
+                            }) else {
+                                return;
+                            };
+                            if let Some(error) = m.error() {
+                                this.error_label.set_label(&media_error_text(&error));
+                                this.error_label.set_visible(true);
+                            }
+                        });
                         media.set_playing(true);
                         this.picture.set_paintable(Some(&media));
                         *this.media_file.borrow_mut() = Some(media.clone());
-
-                        let err_lbl = this.error_label.clone();
-                        media.connect_error_notify(move |m| {
-                            if let Some(err) = m.error() {
-                                err_lbl.set_label(&format!("can't play this: {}", err.message()));
-                                err_lbl.set_visible(true);
-                            }
-                        });
+                        if let Some(error) = media.error() {
+                            this.error_label.set_label(&media_error_text(&error));
+                            this.error_label.set_visible(true);
+                        }
                     } else if let Ok(texture) = gdk::Texture::from_file(&gio::File::for_path(&path)) {
                         this.picture.set_paintable(Some(&texture));
                     }
@@ -541,6 +641,8 @@ impl StoryViewer {
     fn start_timer(self: &Rc<Self>, duration_secs: f64, epoch: u64) {
         let started = Instant::now();
         *self.story_started.borrow_mut() = Some(started);
+        self.story_elapsed.set(Duration::ZERO);
+        self.progress.set(0.0);
         self.paused.set(false);
 
         let this_weak = Rc::downgrade(self);
@@ -561,8 +663,9 @@ impl StoryViewer {
                 this.progress_source.borrow_mut().take();
                 return glib::ControlFlow::Break;
             };
-            let elapsed_ms = started.elapsed().as_millis() as f64;
+            let elapsed_ms = (this.story_elapsed.get() + started.elapsed()).as_millis() as f64;
             let fraction = (elapsed_ms / duration_ms).clamp(0.0, 1.0);
+            this.progress.set(fraction);
             this.update_active_segment_progress(fraction);
 
             if fraction >= 1.0 {
@@ -621,6 +724,14 @@ impl StoryViewer {
     pub fn toggle_pause(&self) {
         let new_state = !self.paused.get();
         self.paused.set(new_state);
+        if new_state {
+            if let Some(started) = self.story_started.borrow_mut().take() {
+                self.story_elapsed
+                    .set(self.story_elapsed.get() + started.elapsed());
+            }
+        } else if self.visible.get() {
+            *self.story_started.borrow_mut() = Some(Instant::now());
+        }
         if let Some(media) = self.media_file.borrow().as_ref() {
             media.set_playing(!new_state);
         }
@@ -633,11 +744,37 @@ impl StoryViewer {
         self.epoch.set(self.epoch.get().wrapping_add(1));
         self.stop_playback();
         self.visible.set(false);
+        move_focus_outside(self.widget.upcast_ref());
         self.widget.set_visible(false);
-        self.picture.set_paintable(None::<&gdk::Paintable>);
         if let Some(cb) = self.on_closed.borrow().as_ref().cloned() {
             cb();
         }
+    }
+
+    /// Account/session teardown: invalidate every in-flight fetch and remove
+    /// all peer/media state without invoking the normal close callback (which
+    /// would focus the now-hidden main composer during logout).
+    pub fn clear_session(&self) {
+        self.epoch.set(self.epoch.get().wrapping_add(1));
+        self.stop_playback();
+        self.visible.set(false);
+        move_focus_outside(self.widget.upcast_ref());
+        self.widget.set_visible(false);
+        self.peers.borrow_mut().clear();
+        self.current_stories.borrow_mut().clear();
+        self.current_peer_idx.set(0);
+        self.current_story_idx.set(0);
+        self.progress.set(0.0);
+        while let Some(child) = self.segments_bar.first_child() {
+            self.segments_bar.remove(&child);
+        }
+        self.header_avatar.bind(&self.tg, 0, "", false);
+        self.header_name.set_label("");
+        self.header_time.set_label("");
+        self.caption.set_label("");
+        self.caption.set_visible(false);
+        self.error_label.set_label("");
+        self.error_label.set_visible(false);
     }
 
     fn stop_playback(&self) {
@@ -645,9 +782,12 @@ impl StoryViewer {
             remove_source_if_present(source);
         }
         *self.story_started.borrow_mut() = None;
+        self.story_elapsed.set(Duration::ZERO);
+        self.paused.set(false);
         if let Some(media) = self.media_file.borrow_mut().take() {
             media.set_playing(false);
         }
+        self.picture.set_paintable(None::<&gdk::Paintable>);
     }
 
     // ----- probe helpers -----
@@ -670,6 +810,32 @@ impl StoryViewer {
 
     pub fn probe_advance(self: &Rc<Self>) {
         self.next();
+    }
+
+    pub fn probe_middle_click(self: &Rc<Self>) {
+        self.navigate_for_click(150.0, 300.0);
+    }
+
+    pub fn probe_toggle_pause(&self) {
+        self.toggle_pause();
+    }
+
+    pub fn probe_progress(&self) -> f64 {
+        self.progress.get()
+    }
+
+    pub fn probe_has_keyboard_focus(&self) -> bool {
+        let Some(root) = self.widget.root() else {
+            return false;
+        };
+        root.focus().is_some_and(|focus| {
+            focus == self.widget.clone().upcast::<gtk::Widget>()
+                || focus.is_ancestor(&self.widget)
+        })
+    }
+
+    pub fn probe_state_is_clear(&self) -> bool {
+        !self.is_open() && self.peers.borrow().is_empty() && self.current_stories.borrow().is_empty()
     }
 
     pub fn probe_close(&self) {
