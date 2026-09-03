@@ -1441,3 +1441,129 @@ checkbutton.omg-message-check {
 .omg-sticker-popover spinner {
   color: var(--accent);
 }
+
+/* ---- wave 6E ---- */
+
+/* Bot inline keyboards (§6.1) */
+.omg-keyboard {
+  margin-top: 4px;
+}
+
+/* Darker than both bubble fills, so the buttons read as buttons. */
+button.omg-keyboard-btn {
+  background-image: none;
+  background-color: var(--bg-darker);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  min-height: 32px;
+  padding: 0 8px;
+}
+
+button.omg-keyboard-btn:hover,
+button.omg-keyboard-btn:focus-visible {
+  background-color: var(--selection);
+}
+
+button.omg-keyboard-btn:disabled {
+  background-image: none;
+  background-color: var(--bg-darker);
+  color: var(--muted);
+  opacity: 1;
+}
+
+/* A bot's answer to a callback button: the info sibling of .omg-error */
+.omg-info {
+  color: var(--accent);
+}
+
+/* Start, in place of the composer of an empty bot chat (§6.2) */
+button.omg-start-btn {
+  background-image: none;
+  background-color: var(--accent);
+  color: var(--bg-darker);
+  border: none;
+  border-radius: 4px;
+  font-weight: bold;
+  min-height: 40px;
+  margin: 8px;
+}
+
+button.omg-start-btn:hover,
+button.omg-start-btn:focus-visible {
+  background-color: var(--accent);
+  opacity: 0.9;
+}
+
+/* "/" command autocomplete (§6.2) */
+.omg-command-popover {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 6px;
+  padding: 4px;
+}
+
+.omg-command-list {
+  background-color: transparent;
+}
+
+row.omg-command-row {
+  padding: 4px 8px;
+  background-color: transparent;
+}
+
+row.omg-command-row:hover,
+row.omg-command-row:selected {
+  background-color: var(--bg-lighter);
+}
+
+.omg-command-name {
+  color: var(--accent);
+  font-weight: bold;
+}
+
+/* Forum topics (§6.3) */
+.omg-topic-pane {
+  background-color: var(--bg);
+}
+
+.omg-topic-list {
+  background-color: transparent;
+}
+
+row.omg-topic-row {
+  min-height: 56px;
+  padding: 8px 16px;
+  background-color: transparent;
+  border-left: 2px solid transparent;
+}
+
+row.omg-topic-row:hover,
+row.omg-topic-row:focus-visible {
+  background-color: var(--bg-lighter);
+}
+
+.omg-topic-icon {
+  font-size: 13pt;
+  min-width: 28px;
+}
+
+.omg-topic-name {
+  color: var(--fg);
+  font-weight: bold;
+}
+
+.omg-topic-closed {
+  color: var(--muted);
+  font-size: 8.5pt;
+}
+
+.omg-new-topic-dialog {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 6px;
+  padding: 16px;
+}
+/* ---- end 6E ---- */
