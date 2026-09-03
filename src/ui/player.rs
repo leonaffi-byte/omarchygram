@@ -11,7 +11,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -40,12 +40,28 @@ pub enum PlayerState {
     Error,
 }
 
+/// Why a downloaded video stream is being opened. Keeping these cases
+/// separate prevents a user click from being mistaken for silent autoplay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenIntent {
+    /// A user asked to play: videos and circles start with sound.
+    Manual,
+    /// A visible GIF/video sticker/circle may start silently.
+    AutoplayMuted,
+    /// Decode the first frame, then remain paused behind the play button.
+    Poster,
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
 thread_local! {
     static REGISTRY: RefCell<HashMap<i32, PlayerHandle>> = RefCell::new(HashMap::new());
+    // GTK 4.22 can deadlock while finalizing its GStreamer MediaFile backend.
+    // Keep one deliberately leaked stream per stable row/media identity, and
+    // reuse that stream when history rebuilds the same message row.
+    static MEDIA_POOL: RefCell<HashMap<(i64, i32, PathBuf), gtk::MediaFile>> = RefCell::new(HashMap::new());
     static FULLSCREEN: RefCell<Option<Rc<Fullscreen>>> = const { RefCell::new(None) };
 }
 
@@ -82,6 +98,13 @@ pub fn get_handle(msg_id: i32) -> Option<PlayerHandle> {
     with_registry(None, |r| r.get(&msg_id).cloned())
 }
 
+/// Remove and stop one row's player before its widget is detached.
+pub fn remove(msg_id: i32) {
+    if let Some(handle) = with_registry(None, |r| r.remove(&msg_id)) {
+        handle.teardown();
+    }
+}
+
 /// Tear every player down (chat switch, `reset_chat`, window close).
 pub fn stop_all() {
     close_fullscreen();
@@ -103,6 +126,13 @@ pub fn activate(msg_id: i32) {
 }
 
 /// Called from the throttled scroll handler and after a history page lands.
+/// A player that started this recently is not paused by the viewport pass.
+const START_GRACE: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+fn within_start_grace(started: Option<std::time::Instant>) -> bool {
+    started.is_some_and(|t| t.elapsed() < START_GRACE)
+}
+
 pub fn visibility_tick(is_visible: &dyn Fn(i32) -> bool) {
     for (id, handle) in handles() {
         if is_visible(id) {
@@ -139,6 +169,21 @@ pub fn animations_on() -> bool {
     Effects::animations_enabled()
 }
 
+/// Reconcile already-open autoplay streams immediately after settings or the
+/// GTK animations master changes.
+pub fn reconcile_autoplay(
+    animations: bool,
+    autoplay_gifs: bool,
+    autoplay_notes: bool,
+    is_visible: &dyn Fn(i32) -> bool,
+) {
+    for (id, handle) in handles() {
+        if let PlayerInner::Video(video) = &handle.inner {
+            video.reconcile_autoplay(animations, autoplay_gifs, autoplay_notes, is_visible(id));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -152,6 +197,29 @@ fn drop_source(slot: &RefCell<Option<glib::SourceId>>) {
             source.destroy();
         }
     }
+}
+
+/// Fetch the retained GTK stream for a stable chat/message/path identity.
+/// The extra forgotten reference is intentional: it prevents GTK's known
+/// finalize deadlock, while the map makes the leak bounded to one per path.
+fn pooled_media(chat_id: i64, msg_id: i32, path: &Path) -> (gtk::MediaFile, bool) {
+    MEDIA_POOL
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            let identity = (chat_id, msg_id, path.to_path_buf());
+            if let Some(media) = pool.get(&identity) {
+                return (media.clone(), true);
+            }
+            let media = gtk::MediaFile::for_filename(path);
+            std::mem::forget(media.clone());
+            pool.insert(identity, media.clone());
+            (media, false)
+        })
+        .unwrap_or_else(|_| {
+            let media = gtk::MediaFile::for_filename(path);
+            std::mem::forget(media.clone());
+            (media, false)
+        })
 }
 
 fn fmt_time(seconds: f64) -> String {
@@ -231,6 +299,13 @@ struct AudioPlayer {
     speed_idx: Cell<usize>,
     duration: Cell<f64>,
     position: Cell<f64>,
+    /// A speed to apply once the pipeline has prerolled: a flushing seek
+    /// before preroll can end the stream immediately (seen as an instant
+    /// EOS on ogg/opus under the gate).
+    pending_rate: Cell<Option<f64>>,
+    /// When playback last started: the viewport pass leaves a just-started
+    /// player alone for a moment (its row may still be settling into view).
+    started: Cell<Option<std::time::Instant>>,
 }
 
 impl AudioPlayer {
@@ -340,6 +415,8 @@ impl AudioPlayer {
             speed_idx: Cell::new(speed_idx),
             duration: Cell::new(duration),
             position: Cell::new(0.0),
+            pending_rate: Cell::new(None),
+            started: Cell::new(None),
         })
     }
 
@@ -356,6 +433,16 @@ impl AudioPlayer {
     }
 
     fn set_playing(&self, playing: bool) {
+        if self.probe && !playing && self.playing.get() {
+            // Gate diagnostics: who paused a sound player (kept under --probe only).
+            let trace = std::backtrace::Backtrace::force_capture().to_string();
+            let frames: Vec<&str> = trace
+                .lines()
+                .filter(|l| l.contains("omarchygram::"))
+                .take(6)
+                .collect();
+            eprintln!("[player] {} paused via {}", self.msg_id, frames.join(" <- "));
+        }
         self.playing.set(playing);
         self.play
             .set_label(if playing { icons::PAUSE } else { icons::PLAY });
@@ -365,17 +452,27 @@ impl AudioPlayer {
 
     /// Show the inline error and retire the pipeline — the teardown is
     /// deferred so it never runs inside the bus watch that reported the error.
-    fn show_error(self: &Rc<Self>, text: &str) {
+    fn show_error(self: &Rc<Self>, text: &str, retryable: bool) {
         self.failed.set(true);
         self.error.set_text(text);
         self.error.set_visible(true);
         self.set_playing(false);
+        self.render_error_action(retryable);
         let weak = Rc::downgrade(self);
         glib::idle_add_local_once(move || {
             if let Some(this) = weak.upgrade() {
                 this.teardown();
+                this.render_error_action(retryable);
             }
         });
+    }
+
+    fn render_error_action(&self, retryable: bool) {
+        self.play.set_sensitive(retryable);
+        if retryable {
+            self.play.set_label("Retry");
+            self.play.set_tooltip_text(Some("Retry download"));
+        }
     }
 
     /// The real sink outside the probe, a synced `fakesink` under it so a gate
@@ -397,6 +494,11 @@ impl AudioPlayer {
     }
 
     fn open_path(self: &Rc<Self>, path: &Path) {
+        if self.probe {
+            let trace = std::backtrace::Backtrace::force_capture().to_string();
+            let frames: Vec<&str> = trace.lines().filter(|l| l.contains("omarchygram::")).skip(1).take(7).collect();
+            eprintln!("[player] {} open_path {} via {}", self.msg_id, path.display(), frames.join(" <- "));
+        }
         self.teardown();
         self.failed.set(false);
         self.error.set_visible(false);
@@ -404,11 +506,11 @@ impl AudioPlayer {
 
         let pipeline = gst::Pipeline::with_name("omg-audio");
         let Ok(playbin) = gst::ElementFactory::make("playbin3").build() else {
-            self.show_error(DECODE_ERROR);
+            self.show_error(DECODE_ERROR, false);
             return;
         };
         if pipeline.add(&playbin).is_err() {
-            self.show_error(DECODE_ERROR);
+            self.show_error(DECODE_ERROR, false);
             return;
         }
         playbin.set_property("uri", gtk::gio::File::for_path(path).uri().to_string());
@@ -426,11 +528,19 @@ impl AudioPlayer {
                     return glib::ControlFlow::Break;
                 };
                 match message.view() {
-                    gst::MessageView::Error(error) => this.show_error(&error_text(&error.error())),
+                    gst::MessageView::Error(error) => {
+                        this.show_error(&error_text(&error.error()), false)
+                    }
                     gst::MessageView::Eos(_) => this.rewind(),
-                    gst::MessageView::DurationChanged(_) | gst::MessageView::StateChanged(_) => {
+                    gst::MessageView::StateChanged(changed) => {
+                        if changed.current() == gst::State::Playing {
+                            if let Some(rate) = this.pending_rate.take() {
+                                this.set_rate(rate);
+                            }
+                        }
                         this.refresh();
                     }
+                    gst::MessageView::DurationChanged(_) => this.refresh(),
                     _ => {}
                 }
                 glib::ControlFlow::Continue
@@ -440,12 +550,15 @@ impl AudioPlayer {
 
         if pipeline.set_state(gst::State::Playing).is_err() {
             let _ = pipeline.set_state(gst::State::Null);
-            self.show_error(DECODE_ERROR);
+            self.show_error(DECODE_ERROR, false);
             return;
         }
         *self.pipeline.borrow_mut() = Some(pipeline);
+        self.play.set_sensitive(true);
         self.set_playing(true);
-        self.set_rate(SPEEDS[self.speed_idx.get()]);
+        self.started.set(Some(std::time::Instant::now()));
+        let rate = SPEEDS[self.speed_idx.get()];
+        self.pending_rate.set((rate != 1.0).then_some(rate));
         self.start_tick();
         activate(self.msg_id);
     }
@@ -503,6 +616,7 @@ impl AudioPlayer {
 
     /// End of stream: back to the start, paused (§2.1).
     fn rewind(&self) {
+        drop_source(&self.tick);
         self.position.set(0.0);
         if let Some(pipeline) = self.pipeline.borrow().as_ref() {
             let _ = pipeline.set_state(gst::State::Paused);
@@ -572,6 +686,7 @@ impl AudioPlayer {
     }
 
     fn pause(&self) {
+        drop_source(&self.tick);
         if let Some(pipeline) = self.pipeline.borrow().as_ref() {
             let _ = pipeline.set_state(gst::State::Paused);
         }
@@ -610,8 +725,11 @@ impl AudioPlayer {
     }
 
     fn on_hidden(&self) {
-        // Voice/music never auto-resumes when its row scrolls back in (§2.3).
-        if self.playing.get() {
+        // Voice/music never auto-resumes when its row scrolls back in (§2.3),
+        // so never pause one that started under START_GRACE ago: swapping the
+        // player into the row changes its height and the row may sit just
+        // outside the viewport for a frame.
+        if self.playing.get() && !within_start_grace(self.started.get()) {
             self.pause();
         }
     }
@@ -643,15 +761,24 @@ struct VideoPlayer {
     pill: gtk::Label,
     error: gtk::Label,
     msg_id: i32,
+    chat_id: i64,
     kind: MediaKind,
     probe: bool,
+    action: Rc<dyn Fn(MessageAction)>,
     media: RefCell<Option<gtk::MediaFile>>,
-    path: RefCell<Option<std::path::PathBuf>>,
+    path: RefCell<Option<PathBuf>>,
+    error_handler: RefCell<Option<glib::SignalHandlerId>>,
+    playing_handler: RefCell<Option<glib::SignalHandlerId>>,
     tick: RefCell<Option<glib::SourceId>>,
+    click_delay: RefCell<Option<glib::SourceId>>,
     playing: Cell<bool>,
     failed: Cell<bool>,
     muted: Cell<bool>,
+    intent: Cell<OpenIntent>,
+    policy_paused: Cell<bool>,
+    reused_stream: Cell<bool>,
     resume_on_visible: Cell<bool>,
+    started: Cell<Option<std::time::Instant>>,
     duration: Cell<f64>,
 }
 
@@ -764,15 +891,24 @@ impl VideoPlayer {
             pill,
             error,
             msg_id,
+            chat_id: message.chat_id,
             kind,
             probe,
+            action: action.clone(),
             media: RefCell::new(None),
             path: RefCell::new(None),
+            error_handler: RefCell::new(None),
+            playing_handler: RefCell::new(None),
             tick: RefCell::new(None),
+            click_delay: RefCell::new(None),
             playing: Cell::new(false),
             failed: Cell::new(false),
             muted: Cell::new(true),
+            intent: Cell::new(OpenIntent::Poster),
+            policy_paused: Cell::new(false),
+            reused_stream: Cell::new(false),
             resume_on_visible: Cell::new(false),
+            started: Cell::new(None),
             duration: Cell::new(message.duration.map(f64::from).unwrap_or(0.0)),
         });
 
@@ -796,16 +932,43 @@ impl VideoPlayer {
         }
 
         // Click plays/pauses (the centred button is hidden while playing);
-        // a double click on a video goes fullscreen.
+        // delay a video's single click briefly so a double click can cancel it
+        // before opening fullscreen.
         let click = gtk::GestureClick::new();
-        let is_video = kind == MediaKind::Video;
-        click.connect_pressed(move |_, count, _, _| match count {
-            1 => action(MessageAction::Media(msg_id)),
-            2 if is_video => action(MessageAction::MediaFullscreen(msg_id)),
-            _ => {}
+        let weak = Rc::downgrade(&this);
+        click.connect_pressed(move |_, count, _, _| {
+            if let Some(this) = weak.upgrade() {
+                this.picture_pressed(count);
+            }
         });
         this.picture.add_controller(click);
         this
+    }
+
+    fn picture_pressed(self: &Rc<Self>, count: i32) {
+        if self.kind != MediaKind::Video {
+            if count == 1 {
+                (self.action)(MessageAction::Media(self.msg_id));
+            }
+            return;
+        }
+        match count {
+            1 => {
+                drop_source(&self.click_delay);
+                let weak = Rc::downgrade(self);
+                let source = glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                    let Some(this) = weak.upgrade() else { return };
+                    let _ = this.click_delay.borrow_mut().take();
+                    (this.action)(MessageAction::Media(this.msg_id));
+                });
+                *self.click_delay.borrow_mut() = Some(source);
+            }
+            2 => {
+                drop_source(&self.click_delay);
+                (self.action)(MessageAction::MediaFullscreen(self.msg_id));
+            }
+            _ => {}
+        }
     }
 
     fn state(&self) -> PlayerState {
@@ -820,73 +983,100 @@ impl VideoPlayer {
         }
     }
 
-    fn show_error(&self, text: &str) {
+    fn show_error(&self, text: &str, retryable: bool) {
         self.stop();
         self.failed.set(true);
         self.error.set_text(text);
         self.error.set_visible(true);
         // The stream stays where it is (see `stream_for`); only its frame goes.
         self.picture.set_visible(false);
-        self.play_overlay.set_visible(false);
+        self.play_overlay.set_sensitive(retryable);
+        self.play_overlay
+            .set_label(if retryable { "Retry" } else { icons::PLAY });
+        self.play_overlay
+            .set_tooltip_text(Some(if retryable { "Retry download" } else { "Play" }));
+        self.play_overlay.set_visible(retryable);
         self.controls.set_visible(false);
         self.pill.set_visible(false);
     }
 
-    /// The row's `gtk::MediaFile`, created on first use and then kept.
+    /// The row's `gtk::MediaFile`, fetched from the retained per-path pool.
     ///
     /// GTK's GStreamer media backend joins its worker thread when a stream is
     /// finalized, and when that last unref lands inside a GStreamer dispatch
     /// the join never returns (verified on this machine: `g_thread_join` under
     /// `libgstplay` from `g_main_context_iteration`, plus a stale-paintable
     /// abort inside `gtk_picture_set_paintable`). So a stream, once created, is
-    /// stopped but never destroyed: one leaked reference per media row that was
-    /// actually opened.
+    /// stopped but never destroyed: one leaked reference per distinct media
+    /// identity that was actually opened, reused across row rebuilds.
     fn stream_for(self: &Rc<Self>, path: &Path) -> gtk::MediaFile {
         if let Some(existing) = self.media.borrow().clone() {
             if self.path.borrow().as_deref() == Some(path) {
                 return existing;
             }
         }
-        let media = gtk::MediaFile::for_filename(path);
-        std::mem::forget(media.clone());
+        self.disconnect_media_handlers();
+        self.picture.set_paintable(gtk::gdk::Paintable::NONE);
+        let (media, reused) = pooled_media(self.chat_id, self.msg_id, path);
+        self.reused_stream.set(reused);
         let weak = Rc::downgrade(self);
-        media.connect_error_notify(move |stream| {
+        let error_handler = media.connect_error_notify(move |stream| {
             if let (Some(this), Some(error)) = (weak.upgrade(), stream.error()) {
-                this.show_error(&error_text(&error));
+                this.show_error(&error_text(&error), false);
             }
         });
         let weak = Rc::downgrade(self);
-        media.connect_playing_notify(move |stream| {
+        let playing_handler = media.connect_playing_notify(move |stream| {
             if let Some(this) = weak.upgrade() {
                 if !this.failed.get() {
                     this.playing.set(stream.is_playing());
+                    if !stream.is_playing() {
+                        drop_source(&this.tick);
+                    }
                     this.update_glyphs();
                 }
             }
         });
+        *self.error_handler.borrow_mut() = Some(error_handler);
+        *self.playing_handler.borrow_mut() = Some(playing_handler);
         self.picture.set_paintable(Some(&media));
         *self.media.borrow_mut() = Some(media.clone());
         *self.path.borrow_mut() = Some(path.to_path_buf());
         media
     }
 
-    fn open_path(self: &Rc<Self>, path: &Path, autoplay: bool) {
+    fn disconnect_media_handlers(&self) {
+        let media = self.media.borrow().clone();
+        let Some(media) = media else { return };
+        if let Some(handler) = self.error_handler.borrow_mut().take() {
+            media.disconnect(handler);
+        }
+        if let Some(handler) = self.playing_handler.borrow_mut().take() {
+            media.disconnect(handler);
+        }
+    }
+
+    fn open_path(self: &Rc<Self>, path: &Path, intent: OpenIntent) {
         self.stop();
         self.resume_on_visible.set(false);
+        self.policy_paused.set(false);
+        self.intent.set(intent);
         let media = self.stream_for(path);
         if let Some(error) = media.error() {
-            self.show_error(&error_text(&error));
+            self.show_error(&error_text(&error), false);
             return;
         }
         self.failed.set(false);
         self.error.set_visible(false);
         self.picture.set_visible(true);
+        self.play_overlay.set_sensitive(true);
+        self.play_overlay.set_tooltip_text(Some("Play"));
 
         let is_loop = self.kind == MediaKind::Gif || self.kind == MediaKind::Sticker;
         media.set_loop(is_loop);
-        // Loops and autoplaying circles are silent, and the probe never makes
-        // a sound at all (§1.11).
-        let muted = self.probe || is_loop || autoplay;
+        // Loops and viewport autoplay are silent. The probe never emits sound,
+        // while still recording the Manual intent for assertions.
+        let muted = self.probe || is_loop || intent != OpenIntent::Manual;
         media.set_muted(muted);
         self.muted.set(muted);
         self.mute.set_label(if muted {
@@ -899,21 +1089,27 @@ impl VideoPlayer {
             media.seek(0);
         }
 
-        media.play();
-        if autoplay {
-            self.playing.set(true);
-        } else {
-            // Poster: paint the first frame, then hold at 0 (§2.2).
-            media.set_playing(false);
-            self.playing.set(false);
+        match intent {
+            OpenIntent::Manual | OpenIntent::AutoplayMuted => {
+                media.play();
+                self.playing.set(true);
+                self.started.set(Some(std::time::Instant::now()));
+                self.start_tick();
+            }
+            OpenIntent::Poster => {
+                // Paint the first frame, then hold at 0 (§2.2).
+                media.play();
+                media.set_playing(false);
+                self.playing.set(false);
+                drop_source(&self.tick);
+            }
         }
         self.update_glyphs();
-        self.start_tick();
         if self.has_sound() {
             activate(self.msg_id);
         }
         if let Some(error) = media.error() {
-            self.show_error(&error_text(&error));
+            self.show_error(&error_text(&error), false);
         }
     }
 
@@ -986,6 +1182,7 @@ impl VideoPlayer {
     }
 
     fn set_muted(&self, muted: bool) {
+        let muted = self.probe || muted;
         if let Some(media) = self.media.borrow().as_ref() {
             media.set_muted(muted);
         }
@@ -1000,6 +1197,7 @@ impl VideoPlayer {
     }
 
     fn pause(&self) {
+        drop_source(&self.tick);
         if let Some(media) = self.media.borrow().as_ref() {
             media.pause();
         }
@@ -1015,6 +1213,7 @@ impl VideoPlayer {
         }
         media.play();
         self.playing.set(true);
+        self.started.set(Some(std::time::Instant::now()));
         self.update_glyphs();
         self.start_tick();
         if self.has_sound() {
@@ -1027,22 +1226,29 @@ impl VideoPlayer {
         // the next one pauses (§2.2).
         if self.kind == MediaKind::VideoNote
             && self.playing.get()
-            && self.muted.get()
-            && !self.probe
+            && self.intent.get() == OpenIntent::AutoplayMuted
         {
+            self.intent.set(OpenIntent::Manual);
+            self.policy_paused.set(false);
             self.set_muted(false);
             if let Some(media) = self.media.borrow().as_ref() {
                 media.seek(0);
                 media.play();
             }
             self.playing.set(true);
+            self.started.set(Some(std::time::Instant::now()));
             self.update_glyphs();
             activate(self.msg_id);
             return;
         }
         if self.playing.get() {
+            self.intent.set(OpenIntent::Manual);
+            self.policy_paused.set(false);
+            self.resume_on_visible.set(false);
             self.pause();
         } else {
+            self.intent.set(OpenIntent::Manual);
+            self.policy_paused.set(false);
             self.resume();
         }
     }
@@ -1058,9 +1264,12 @@ impl VideoPlayer {
     }
 
     fn on_hidden(&self) {
-        if self.playing.get() {
+        if self.playing.get() && !within_start_grace(self.started.get()) {
             // Muted loops come back when the row does; sound does not (§2.3).
-            self.resume_on_visible.set(self.muted.get());
+            self.resume_on_visible.set(
+                matches!(self.kind, MediaKind::Gif | MediaKind::Sticker)
+                    || self.intent.get() == OpenIntent::AutoplayMuted,
+            );
             self.pause();
         }
     }
@@ -1072,9 +1281,41 @@ impl VideoPlayer {
         }
     }
 
+    fn reconcile_autoplay(
+        self: &Rc<Self>,
+        animations: bool,
+        autoplay_gifs: bool,
+        autoplay_notes: bool,
+        visible: bool,
+    ) {
+        let is_loop = matches!(self.kind, MediaKind::Gif | MediaKind::Sticker);
+        let is_auto = self.intent.get() == OpenIntent::AutoplayMuted;
+        let allowed = match self.kind {
+            MediaKind::Gif | MediaKind::Sticker if is_auto => animations && autoplay_gifs,
+            MediaKind::Gif | MediaKind::Sticker => animations,
+            MediaKind::VideoNote if is_auto => autoplay_notes,
+            _ => true,
+        };
+        if !is_loop && !(self.kind == MediaKind::VideoNote && is_auto) {
+            return;
+        }
+        if !allowed {
+            let should_resume = self.playing.get() || self.resume_on_visible.replace(false);
+            if self.playing.get() {
+                self.pause();
+            }
+            if should_resume {
+                self.policy_paused.set(true);
+            }
+        } else if visible && self.policy_paused.replace(false) && !self.failed.get() {
+            self.resume();
+        }
+    }
+
     /// Stop playing. The stream itself stays alive (see `stream_for`).
     fn stop(&self) {
         drop_source(&self.tick);
+        drop_source(&self.click_delay);
         if let Some(media) = self.media.borrow().as_ref() {
             media.pause();
         }
@@ -1084,14 +1325,25 @@ impl VideoPlayer {
         self.playing.set(false);
         self.resume_on_visible.set(false);
     }
+
+    fn teardown(&self) {
+        self.stop();
+        self.disconnect_media_handlers();
+        self.picture.set_paintable(gtk::gdk::Paintable::NONE);
+        self.media.borrow_mut().take();
+        self.path.borrow_mut().take();
+    }
 }
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
         drop_source(&self.tick);
+        drop_source(&self.click_delay);
         if let Some(media) = self.media.borrow().as_ref() {
             media.pause();
         }
+        self.disconnect_media_handlers();
+        self.picture.set_paintable(gtk::gdk::Paintable::NONE);
     }
 }
 
@@ -1104,9 +1356,10 @@ fn frame_size(message: &Msg, is_note: bool, is_loop: bool) -> (i32, i32) {
     let max_width = if is_loop { 280 } else { 360 };
     let (width, height) = message.photo_size.unwrap_or((320, 240));
     let (width, height) = (width.max(1), height.max(1));
-    let scale = f64::from(max_width) / f64::from(width);
-    let scaled = (f64::from(height) * scale).round() as i32;
-    (max_width, scaled.clamp(80, 360))
+    let scale = (f64::from(max_width) / f64::from(width)).min(360.0 / f64::from(height));
+    let scaled_width = (f64::from(width) * scale).round().max(1.0) as i32;
+    let scaled_height = (f64::from(height) * scale).round().max(1.0) as i32;
+    (scaled_width, scaled_height)
 }
 
 // ---------------------------------------------------------------------------
@@ -1265,7 +1518,7 @@ impl PlayerHandle {
     fn teardown(&self) {
         match &self.inner {
             PlayerInner::Audio(audio) => audio.teardown(),
-            PlayerInner::Video(video) => video.stop(),
+            PlayerInner::Video(video) => video.teardown(),
         }
     }
 
@@ -1282,10 +1535,10 @@ impl PlayerHandle {
         }
     }
 
-    fn open_path(&self, path: &Path, autoplay: bool) {
+    fn open_path(&self, path: &Path, intent: OpenIntent) {
         match &self.inner {
             PlayerInner::Audio(audio) => audio.open_path(path),
-            PlayerInner::Video(video) => video.open_path(path, autoplay),
+            PlayerInner::Video(video) => video.open_path(path, intent),
         }
     }
 
@@ -1340,9 +1593,9 @@ pub fn create(
     }
 }
 
-pub fn open_path(msg_id: i32, path: &Path, autoplay: bool) {
+pub fn open_path(msg_id: i32, path: &Path, intent: OpenIntent) {
     if let Some(handle) = get_handle(msg_id) {
-        handle.open_path(path, autoplay);
+        handle.open_path(path, intent);
     }
 }
 
@@ -1380,9 +1633,77 @@ pub fn toggle_muted(msg_id: i32) {
 
 pub fn set_error(msg_id: i32, text: &str) {
     match get_handle(msg_id).map(|h| h.inner) {
-        Some(PlayerInner::Audio(audio)) => audio.show_error(text),
-
-        Some(PlayerInner::Video(video)) => video.show_error(text),
+        Some(PlayerInner::Audio(audio)) => audio.show_error(text, false),
+        Some(PlayerInner::Video(video)) => video.show_error(text, false),
         None => {}
+    }
+}
+
+pub fn set_download_error(msg_id: i32, text: &str, retryable: bool) {
+    match get_handle(msg_id).map(|h| h.inner) {
+        Some(PlayerInner::Audio(audio)) => audio.show_error(text, retryable),
+        Some(PlayerInner::Video(video)) => video.show_error(text, retryable),
+        None => {}
+    }
+}
+
+/// Probe observability for the review fixes. These expose semantic state only;
+/// they never synthesize desktop input or launch anything.
+pub fn retry_available(msg_id: i32) -> bool {
+    match get_handle(msg_id).map(|h| h.inner) {
+        Some(PlayerInner::Audio(audio)) => {
+            audio.failed.get() && audio.play.is_visible() && audio.play.is_sensitive()
+        }
+        Some(PlayerInner::Video(video)) => {
+            video.failed.get()
+                && video.play_overlay.is_visible()
+                && video.play_overlay.is_sensitive()
+        }
+        None => false,
+    }
+}
+
+pub fn tick_active(msg_id: i32) -> bool {
+    match get_handle(msg_id).map(|h| h.inner) {
+        Some(PlayerInner::Audio(audio)) => audio.tick.borrow().is_some(),
+        Some(PlayerInner::Video(video)) => video.tick.borrow().is_some(),
+        None => false,
+    }
+}
+
+pub fn manual_sound_requested(msg_id: i32) -> bool {
+    matches!(
+        get_handle(msg_id).map(|h| h.inner),
+        Some(PlayerInner::Video(video))
+            if matches!(video.kind, MediaKind::Video | MediaKind::VideoNote)
+                && video.intent.get() == OpenIntent::Manual
+    )
+}
+
+pub fn reused_retained_stream(msg_id: i32) -> bool {
+    matches!(
+        get_handle(msg_id).map(|h| h.inner),
+        Some(PlayerInner::Video(video)) if video.reused_stream.get()
+    )
+}
+
+pub fn probe_picture_press(msg_id: i32, count: i32) {
+    if let Some(PlayerInner::Video(video)) = get_handle(msg_id).map(|h| h.inner) {
+        video.picture_pressed(count);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frame_size;
+    use crate::tg::Msg;
+
+    #[test]
+    fn tall_video_frame_keeps_its_aspect_ratio() {
+        let tall = Msg {
+            photo_size: Some((100, 1000)),
+            ..Msg::default()
+        };
+        assert_eq!(frame_size(&tall, false, false), (36, 360));
     }
 }

@@ -314,6 +314,7 @@ pub enum MessageAction {
     RetryPinned,
     Delete(i32),
     Media(i32),
+    MediaAutoplay(i32),
     MediaSeek(i32, f64),
     MediaSpeed(i32),
     MediaMute(i32),
@@ -2294,6 +2295,7 @@ impl MessagesView {
     /// preserves the composer draft, reply/edit mode, and busy sensitivity
     /// (C5/C13). `detached` is left to the caller.
     pub fn reset_history(&self, chat_id: i64, epoch: u64) {
+        self.reset_players();
         self.move_focus_before_removal(&self.widget);
         self.cancel_pending_scroll();
         self.inner.scroll_epoch.set(epoch);
@@ -4330,6 +4332,7 @@ impl MessagesView {
             entry
         };
         self.move_focus_before_removal(&entry.row.widget);
+        player::remove(msg_id);
         for source in entry.row.animation_sources.borrow_mut().drain(..) {
             remove_source_if_present(source);
         }
@@ -5238,7 +5241,7 @@ impl MessagesView {
             ) => {
                 // Inline players render their own inline error label.
                 if self.player_exists(msg_id) {
-                    self.player_set_error(msg_id, "unavailable");
+                    player::set_download_error(msg_id, "unavailable", retryable);
                 } else if let (Some(button), Some(base)) = (button, base) {
                     button.set_child(None::<&gtk::Widget>);
                     let label = if retryable {
@@ -5467,15 +5470,20 @@ impl MessagesView {
         }
         // A .webm sticker is a muted loop: autoplay only under the same gates
         // as GIFs (§2.2) — otherwise poster + PLAY.
-        let autoplay = self
+        let intent = if self
             .inner
             .settings
             .borrow()
             .clone()
             .is_some_and(|settings| settings.get().media.autoplay_gifs)
             && player::animations_on()
-            && self.row_visible(message.id);
-        player::open_path(message.id, path, autoplay);
+            && self.row_visible(message.id)
+        {
+            player::OpenIntent::AutoplayMuted
+        } else {
+            player::OpenIntent::Poster
+        };
+        player::open_path(message.id, path, intent);
     }
 
     /// The inline player for one media row (§2.1/§2.2).
@@ -5507,8 +5515,8 @@ impl MessagesView {
     }
 
     /// Hand a downloaded file to the row's inline player and start it.
-    pub fn play_media(&self, msg_id: i32, path: PathBuf, autoplay: bool) {
-        player::open_path(msg_id, &path, autoplay);
+    pub fn play_media(&self, msg_id: i32, path: PathBuf, intent: player::OpenIntent) {
+        player::open_path(msg_id, &path, intent);
     }
 
     pub fn toggle_media(&self, msg_id: i32) {
@@ -5533,6 +5541,26 @@ impl MessagesView {
 
     pub fn player_set_error(&self, msg_id: i32, text: &str) {
         player::set_error(msg_id, text);
+    }
+
+    pub fn player_retry_available(&self, msg_id: i32) -> bool {
+        player::retry_available(msg_id)
+    }
+
+    pub fn player_tick_active(&self, msg_id: i32) -> bool {
+        player::tick_active(msg_id)
+    }
+
+    pub fn player_manual_sound_requested(&self, msg_id: i32) -> bool {
+        player::manual_sound_requested(msg_id)
+    }
+
+    pub fn player_reused_retained_stream(&self, msg_id: i32) -> bool {
+        player::reused_retained_stream(msg_id)
+    }
+
+    pub fn probe_player_picture_press(&self, msg_id: i32, count: i32) {
+        player::probe_picture_press(msg_id, count);
     }
 
     pub fn player_state(&self, msg_id: i32) -> player::PlayerState {
@@ -5587,9 +5615,8 @@ impl MessagesView {
             return;
         };
         let media = settings.get().media;
-        let animations = player::animations_on();
-        let autoplay_gifs = media.autoplay_gifs && animations;
-        let autoplay_notes = media.autoplay_video_notes && animations;
+        let autoplay_gifs = media.autoplay_gifs && player::animations_on();
+        let autoplay_notes = media.autoplay_video_notes;
         if !autoplay_gifs && !autoplay_notes {
             return;
         }
@@ -5628,7 +5655,7 @@ impl MessagesView {
                 continue;
             }
             if let Some(callback) = self.inner.action.borrow().as_ref().cloned() {
-                callback(MessageAction::Media(id));
+                callback(MessageAction::MediaAutoplay(id));
             }
         }
     }
@@ -6065,6 +6092,18 @@ impl MessagesView {
                 .effects
                 .empty_state(&self.inner.empty_effects, true);
         }
+        if let Some(settings) = self.inner.settings.borrow().clone() {
+            let media = settings.get().media;
+            player::reconcile_autoplay(
+                player::animations_on(),
+                media.autoplay_gifs,
+                media.autoplay_video_notes,
+                &|id| self.row_visible(id),
+            );
+        }
+        // Enabling either autoplay setting should also arm any visible row
+        // that has not downloaded yet.
+        self.player_visibility();
     }
 
     pub fn send_button(&self) -> gtk::Button {
@@ -7073,4 +7112,3 @@ mod wave5_tests {
         assert!(!selection.remove_deleted(&[20, 99]));
     }
 }
-
