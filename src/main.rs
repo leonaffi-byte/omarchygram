@@ -111,7 +111,12 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
         // The traversal grows with every wave (100+ steps, delete/edit demos
         // wait 2.5s each, latency variants add 0.4s per command); 90s is the
         // hard ceiling before a run counts as hung.
-        glib::timeout_add_seconds_local_once(90, || std::process::exit(1));
+        // 150 s: the wave-6 traversal is 187 steps; under OMG_MOCK_LATENCY_MS=400
+        // the wave-5 90 s budget silently ran out.
+        glib::timeout_add_seconds_local_once(150, || {
+            eprintln!("omarchygram: probe failsafe: traversal did not finish in 150 s");
+            std::process::exit(1)
+        });
     } else if probe {
         let app = app.clone();
         glib::timeout_add_seconds_local_once(2, move || app.quit());

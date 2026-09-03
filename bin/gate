@@ -14,7 +14,7 @@ fail=0
 run() {
   local name=$1; shift
   local log="$logs/$name.log"
-  bin/headless env G_DEBUG=fatal-criticals OMG_PROBE_TRACE=1 "$@" timeout 110 "$bin" --smoke --probe >"$log" 2>&1
+  bin/headless env G_DEBUG=fatal-criticals OMG_PROBE_TRACE=1 "$@" timeout 170 "$bin" --smoke --probe >"$log" 2>&1
   local code=$?
   local steps
   steps=$(grep -c '^\[probe\]' "$log" || true)

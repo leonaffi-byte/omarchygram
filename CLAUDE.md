@@ -7,7 +7,7 @@
 - Run: `cargo run` (real Telegram) / `cargo run -- --smoke` (offline mock data, no login)
 - Test: `cargo test`
 - Real-backend smoke (read-only, needs a logged-in session, prints counts only): `cargo run --example backend_probe`
-- Smoke check: `cargo run -- --smoke --probe` (scripted traversal of every feature on mock data — auth, chats, media, settings, anti-delete, virtual chats, animations — quits on success; exit 0 = pass, 90s failsafe)
+- Smoke check: `cargo run -- --smoke --probe` (scripted traversal of every feature on mock data — auth, chats, media, settings, anti-delete, virtual chats, animations — quits on success; exit 0 = pass, 150s failsafe — raised from 90s for the 187-step wave-6 traversal)
 - `OMG_MOCK_AUTH=1 cargo run -- --smoke` walks the login screens offline (code `2fa` routes via the password screen)
 - Mock test hooks (wave 5): `OMG_MOCK_NEED_CREDS=1` starts at the credentials form; `OMG_MOCK_SLOW=GetDialogs,SearchGlobal` delays those backend commands 1.5s; `OMG_MOCK_FAIL_ONCE=SaveDraft,ForwardMessages` fails the first call of each (names = `Command` variants in `src/tg/mod.rs`); `OMG_UISTATE_PATH` points window/pane state at a throwaway file (smoke sets it automatically).
 - Worker launches: ALWAYS `systemd-run --user --scope --quiet --collect -p TasksMax=infinity -- <codex|kimi …>` plus `setsid nohup … &` and a marker file (see global CLAUDE.md; unwrapped parallel builds killed the orchestrator session twice on 2026-09-02).
