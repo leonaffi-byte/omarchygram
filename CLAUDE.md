@@ -42,10 +42,12 @@
 
 # Known accepted limitations (decided 2026-09-01)
 - Backend command/event channels are unbounded and data commands spawn freely — accepted at personal-client scale; revisit only if memory growth is ever observed.
-- Animated (.tgs) stickers render as "image unavailable"; voice messages and video circles open in the default external player. Both are no longer "accepted": they are scheduled as wave 6A/6D in FEATURES.md (2026-09-03).
+- (Resolved by wave 6A/6D, 2026-09-03: animated stickers render through ThorVG; voice, music, video and circles play inline.)
 - A non-"wrong password" error during 2FA (e.g. network drop) requires an app restart — the server-side password token is consumed and the error message says so.
 - Missing HOME/XDG dirs panic the backend with a clear message rather than degrade — never writable-relative-path session files.
 - Downloaded document extensions are normalized to plain ascii, not whitelisted — opening is always an explicit user click; a whitelist would block legitimate files from contacts.
+- Wave 6A (2026-09-03): one `gtk::MediaFile` reference per opened video/circle/gif row is deliberately leaked (`mem::forget` in `src/ui/player.rs::stream_for`) — GTK 4.22's GStreamer media backend deadlocks in finalize (`g_thread_join` from a GStreamer dispatch) when the last unref lands during playback teardown (5/12 gate runs hung, one aborted in `gtk_picture_set_paintable`). Cost: an idle GstPlay pipeline + thread per distinct media row opened in a session; bounded per row. Revisit with a player pool or when GTK fixes the finalize path.
+- The `.tgs`/`.webm` sticker, GIF and video-note players decode through system GStreamer plugins: without `gst-plugins-good` + `gst-libav` mp4/mp3 cards show "can't play this: install gst-plugins-good gst-libav" inline (voice notes are ogg/opus and play with the base plugins).
 
 # Delegation notes
 - Areas external agents must NOT touch: `src/tg/`, `src/ai/`, `src/os/`, `src/local/`, `src/settings.rs` (backend/auth/session/keys/process execution — orchestrator only), `src/theme/mod.rs`, `src/main.rs`, `src/lib.rs`, `Cargo.toml`, any file containing credentials. `src/theme/style.css`: UI workers may ADD rules using existing var(--) tokens only.
