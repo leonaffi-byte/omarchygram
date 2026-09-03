@@ -17,6 +17,7 @@ use crate::tg::{
 use super::anim::Effects;
 use super::avatar::Avatar;
 use super::icons;
+use super::lottie;
 use super::markup;
 use super::menus::{self, ChatAction, PopoverSlot};
 use super::recorder::{RecorderBar, RecorderUiAction};
@@ -327,6 +328,9 @@ struct MessageRow {
     /// The asciiload placeholder timer only — drained when the media
     /// finishes, without touching receipt/cascade/particle timers.
     media_loading_source: Rc<RefCell<Option<glib::SourceId>>>,
+    /// Wave 6D: the animated (.tgs) sticker in this row, if any. Dropping the
+    /// row stops its render-thread animation.
+    lottie: Rc<RefCell<Option<lottie::Sticker>>>,
 }
 
 struct MessageEntry {
@@ -1285,6 +1289,8 @@ impl MessagesView {
             let inner = self.inner.clone();
             let adjustment = self.inner.scroll.vadjustment();
             adjustment.connect_value_changed(move |adjustment| {
+                // Wave 6D: scrolling a sticker out of view pauses it.
+                sync_lottie_visibility(&inner);
                 if inner.suppress_paging.get() {
                     return;
                 }
@@ -2343,6 +2349,7 @@ impl MessagesView {
             aux_slot,
             animation_sources,
             media_loading_source,
+            lottie: Rc::new(RefCell::new(None)),
         };
         set_deleted_rendering(&row, message.deleted);
         row.selection.set_sensitive(!message.deleted);
@@ -4102,6 +4109,112 @@ impl MessagesView {
         true
     }
 
+    /// Wave 6D: an animated (.tgs) sticker file arrived. The row keeps its
+    /// loading placeholder until the first frame is rasterized; a parse error
+    /// falls back to the "image unavailable" label (§5.2).
+    pub fn finish_lottie(&self, msg_id: i32, path: PathBuf) -> bool {
+        let (media_slot, outgoing, slot, loading) = {
+            let mut store = self.inner.store.borrow_mut();
+            let Some(entry) = store.entries.get_mut(&msg_id) else {
+                return false;
+            };
+            entry.media_state = MediaState::Done(path.clone());
+            (
+                entry.row.media_slot.clone(),
+                entry.msg.outgoing,
+                entry.row.lottie.clone(),
+                entry.row.media_loading_source.clone(),
+            )
+        };
+        let picture = gtk::Picture::new();
+        picture.add_css_class("omg-lottie");
+        picture.set_can_shrink(true);
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        picture.set_size_request(lottie::BUBBLE_SIZE, lottie::BUBBLE_SIZE);
+        picture.set_halign(if outgoing {
+            gtk::Align::End
+        } else {
+            gtk::Align::Start
+        });
+        picture.set_visible(false);
+        media_slot.append(&picture);
+        let sticker = lottie::Sticker::new(&picture, &path, lottie::BUBBLE_SIZE);
+        {
+            // Weak: the callbacks live inside the sticker, which the row owns
+            // — a strong reference here would be a cycle.
+            let weak = Rc::downgrade(&self.inner);
+            let media_slot = media_slot.clone();
+            let animated = picture.clone();
+            let loading = loading.clone();
+            sticker.connect_ready(move || {
+                if let Some(source) = loading.borrow_mut().take() {
+                    remove_source_if_present(source);
+                }
+                // Only the (unfocusable) loading label is dropped here.
+                let mut child = media_slot.first_child();
+                while let Some(widget) = child {
+                    child = widget.next_sibling();
+                    if widget != animated.clone().upcast::<gtk::Widget>() {
+                        media_slot.remove(&widget);
+                    }
+                }
+                animated.set_visible(true);
+                if let Some(inner) = weak.upgrade() {
+                    // A sticker only gets its height at the next layout pass:
+                    // a view pinned to the newest message stays pinned (the
+                    // photo path does the same in `finish_image`).
+                    if inner.stick_to_bottom.get() && !inner.detached.get() {
+                        pin_to_bottom_after_layout(&inner);
+                    }
+                    sync_lottie_visibility(&inner);
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&self.inner);
+            let media_slot = media_slot.clone();
+            let loading = loading.clone();
+            sticker.connect_error(move |_| {
+                if let Some(source) = loading.borrow_mut().take() {
+                    remove_source_if_present(source);
+                }
+                while let Some(child) = media_slot.first_child() {
+                    media_slot.remove(&child);
+                }
+                let label = gtk::Label::new(Some("image unavailable"));
+                label.add_css_class("omg-media-placeholder");
+                media_slot.append(&label);
+                let Some(inner) = weak.upgrade() else { return };
+                let mut store = inner.store.borrow_mut();
+                if let Some(entry) = store.entries.get_mut(&msg_id) {
+                    entry.media_state = MediaState::Failed;
+                    entry.media_retryable = false;
+                    entry.row.lottie.borrow_mut().take();
+                }
+            });
+        }
+        *slot.borrow_mut() = Some(sticker);
+        // An off-screen row must not start animating.
+        sync_lottie_visibility(&self.inner);
+        true
+    }
+
+    /// The animated sticker of a row, if it has one (6D probe helper).
+    pub fn lottie(&self, msg_id: i32) -> Option<lottie::Sticker> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .and_then(|entry| entry.row.lottie.borrow().clone())
+    }
+
+    /// Is the row for `msg_id` inside the message pane's visible rectangle?
+    /// Off-screen media (animated stickers, players) pauses.
+    pub fn row_visible(&self, msg_id: i32) -> bool {
+        row_visible_in(&self.inner, msg_id)
+    }
+
     pub fn on_media_ready(&self, msg_id: i32, callback: impl FnOnce(PathBuf) + 'static) -> bool {
         let state = self.media_state(msg_id);
         match state {
@@ -4900,6 +5013,66 @@ fn apply_pane_width(inner: &MessagesInner, width: i32) {
         for entry in inner.store.borrow().entries.values() {
             entry.row.widget.queue_resize();
         }
+    }
+}
+
+fn row_visible_in(inner: &Rc<MessagesInner>, msg_id: i32) -> bool {
+    let row = inner
+        .store
+        .borrow()
+        .entries
+        .get(&msg_id)
+        .map(|entry| entry.row.widget.clone());
+    let Some(row) = row else { return false };
+    // Row bounds are in the list's (unscrolled) coordinates, so the visible
+    // rectangle is the vertical adjustment's window (like the date chip).
+    let Some(bounds) = row.compute_bounds(&inner.list) else {
+        return false;
+    };
+    let adjustment = inner.scroll.vadjustment();
+    let page = adjustment.page_size();
+    let top = adjustment.value();
+    page > 0.0
+        && f64::from(bounds.y() + bounds.height()) > top
+        && f64::from(bounds.y()) < top + page
+}
+
+/// Re-pins a stuck-to-bottom view once the grown row has been allocated.
+fn pin_to_bottom_after_layout(inner: &Rc<MessagesInner>) {
+    let inner = inner.clone();
+    let epoch = inner.scroll_epoch.get();
+    let scroll = inner.scroll.clone();
+    scroll.add_tick_callback(move |_, _| {
+        if inner.scroll_epoch.get() == epoch
+            && inner.stick_to_bottom.get()
+            && !inner.detached.get()
+        {
+            let adjustment = inner.scroll.vadjustment();
+            adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
+            sync_lottie_visibility(&inner);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// Wave 6D: animated stickers play only while their row is on screen.
+fn sync_lottie_visibility(inner: &Rc<MessagesInner>) {
+    let stickers = inner
+        .store
+        .borrow()
+        .entries
+        .iter()
+        .filter_map(|(msg_id, entry)| {
+            entry
+                .row
+                .lottie
+                .borrow()
+                .clone()
+                .map(|sticker| (*msg_id, sticker))
+        })
+        .collect::<Vec<_>>();
+    for (msg_id, sticker) in stickers {
+        sticker.set_playing(row_visible_in(inner, msg_id));
     }
 }
 

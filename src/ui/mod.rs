@@ -8,6 +8,8 @@ pub mod icons;
 pub mod info_panel;
 pub mod keys;
 pub mod keys_view;
+/// Wave 6D animated (.tgs) stickers (see specs/spec-wave6.md §5.2).
+pub mod lottie;
 pub mod markup;
 pub mod menus;
 pub mod messages;

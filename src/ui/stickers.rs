@@ -11,6 +11,7 @@ use gtk4 as gtk;
 use crate::tg::{Gif, Sticker, StickerPack};
 
 use super::icons;
+use super::lottie;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StickerSend {
@@ -37,6 +38,12 @@ struct StickerCell {
     button: glib::WeakRef<gtk::Button>,
     placeholder: glib::WeakRef<gtk::Label>,
     animated: bool,
+    video: bool,
+    /// Wave 6D: the animated (.tgs) sticker of this cell; a rebuilt grid drops
+    /// it, which stops its render-thread animation.
+    lottie: Rc<RefCell<Option<lottie::Sticker>>>,
+    /// The pointer is inside this cell — animated cells play while hovered.
+    hovered: Rc<Cell<bool>>,
 }
 
 #[derive(Clone)]
@@ -345,6 +352,7 @@ impl StickerPicker {
         let Some(cell) = self.cells.borrow().get(&sticker_id).cloned() else {
             return false;
         };
+        // Animated cells are painted by the Lottie thread, not by a texture.
         if cell.animated {
             return false;
         }
@@ -355,6 +363,75 @@ impl StickerPicker {
         picture.set_visible(true);
         self.paths.borrow_mut().insert(sticker_id, path);
         true
+    }
+
+    /// Wave 6D: an animated (.tgs) cell. It shows frame 0 and animates only
+    /// while the pointer is inside it (§5.2).
+    pub fn set_lottie_cell(
+        &self,
+        generation: u64,
+        content_generation: u64,
+        pack_id: &str,
+        sticker_id: i64,
+        path: PathBuf,
+    ) -> bool {
+        if !self.matches(generation, content_generation, pack_id) {
+            return false;
+        }
+        let Some(cell) = self.cells.borrow().get(&sticker_id).cloned() else {
+            return false;
+        };
+        if !cell.animated || cell.video {
+            return false;
+        }
+        let Some(picture) = cell.picture.upgrade() else {
+            return false;
+        };
+        picture.add_css_class("omg-lottie");
+        let sticker = lottie::Sticker::new(&picture, &path, lottie::CELL_SIZE);
+        {
+            let picture = picture.clone();
+            sticker.connect_ready(move || picture.set_visible(true));
+        }
+        {
+            let unavailable = self.unavailable.clone();
+            let button = cell.button.clone();
+            let picture = picture.clone();
+            sticker.connect_error(move |_| {
+                picture.set_visible(false);
+                if let Some(button) = button.upgrade() {
+                    button.add_css_class("omg-unavailable");
+                    button.set_tooltip_text(Some("image unavailable"));
+                }
+                unavailable.borrow_mut().insert(sticker_id);
+            });
+        }
+        sticker.set_playing(cell.hovered.get());
+        *cell.lottie.borrow_mut() = Some(sticker);
+        self.paths.borrow_mut().insert(sticker_id, path);
+        true
+    }
+
+    /// Probe helper: the same play/pause path the hover controller drives (no
+    /// synthetic input anywhere).
+    pub fn probe_hover_sticker(&self, sticker_id: i64, hovered: bool) -> bool {
+        let Some(cell) = self.cells.borrow().get(&sticker_id).cloned() else {
+            return false;
+        };
+        cell.hovered.set(hovered);
+        let Some(sticker) = cell.lottie.borrow().clone() else {
+            return false;
+        };
+        sticker.set_playing(hovered);
+        true
+    }
+
+    /// The animated sticker of a cell, if it has one (6D probe helper).
+    pub fn lottie(&self, sticker_id: i64) -> Option<lottie::Sticker> {
+        self.cells
+            .borrow()
+            .get(&sticker_id)
+            .and_then(|cell| cell.lottie.borrow().clone())
     }
 
     /// A GIF whose mp4 arrived (wave 6: the mock renders one with ffmpeg;
@@ -473,12 +550,14 @@ impl StickerPicker {
         !self.stickers.borrow().is_empty()
     }
 
+    /// Wave 6D: animated .tgs stickers are sendable; only .webm video
+    /// stickers still are not.
     pub fn sticker_sendable(&self, sticker_id: i64) -> bool {
         self.stickers
             .borrow()
             .iter()
             .find(|sticker| sticker.id == sticker_id)
-            .is_some_and(|sticker| !sticker.animated)
+            .is_some_and(|sticker| !sticker.video)
     }
 
     pub fn downloaded_ids(&self) -> Vec<i64> {
@@ -567,8 +646,9 @@ impl StickerPicker {
             button.add_css_class("omg-sticker-cell");
             button.set_size_request(64, 64);
             let overlay = gtk::Overlay::new();
-            let placeholder = gtk::Label::new(Some(if sticker.animated {
-                "tgs"
+            // .webm video stickers have no preview surface yet.
+            let placeholder = gtk::Label::new(Some(if sticker.video {
+                "webm"
             } else {
                 &sticker.emoji
             }));
@@ -581,13 +661,41 @@ impl StickerPicker {
             picture.set_visible(false);
             overlay.add_overlay(&picture);
             button.set_child(Some(&overlay));
-            button.set_sensitive(!sticker.animated);
-            if !sticker.animated {
+            // Wave 6D: animated .tgs stickers are sendable and rendered.
+            button.set_sensitive(!sticker.video);
+            if !sticker.video {
                 let action = self.action.clone();
                 let id = sticker.id;
                 button.connect_clicked(move |_| {
                     emit(&action, StickerAction::Send(StickerSend::Sticker(id)));
                 });
+            }
+            let lottie: Rc<RefCell<Option<lottie::Sticker>>> = Rc::new(RefCell::new(None));
+            let hovered = Rc::new(Cell::new(false));
+            if sticker.animated && !sticker.video {
+                // Animated cells show frame 0 and play while hovered (§5.2).
+                let motion = gtk::EventControllerMotion::new();
+                {
+                    let lottie = lottie.clone();
+                    let hovered = hovered.clone();
+                    motion.connect_enter(move |_, _, _| {
+                        hovered.set(true);
+                        if let Some(sticker) = lottie.borrow().as_ref() {
+                            sticker.set_playing(true);
+                        }
+                    });
+                }
+                {
+                    let lottie = lottie.clone();
+                    let hovered = hovered.clone();
+                    motion.connect_leave(move |_| {
+                        hovered.set(false);
+                        if let Some(sticker) = lottie.borrow().as_ref() {
+                            sticker.set_playing(false);
+                        }
+                    });
+                }
+                button.add_controller(motion);
             }
             self.grid
                 .attach(&button, (index % 4) as i32, (index / 4) as i32, 1, 1);
@@ -598,6 +706,9 @@ impl StickerPicker {
                     button: button.downgrade(),
                     placeholder: placeholder.downgrade(),
                     animated: sticker.animated,
+                    video: sticker.video,
+                    lottie,
+                    hovered,
                 },
             );
         }
@@ -633,6 +744,9 @@ impl StickerPicker {
                     button: button.downgrade(),
                     placeholder: placeholder.downgrade(),
                     animated: false,
+                    video: false,
+                    lottie: Rc::new(RefCell::new(None)),
+                    hovered: Rc::new(Cell::new(false)),
                 },
             );
         }

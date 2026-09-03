@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
@@ -32,6 +32,7 @@ use super::forward::{ForwardAction, ForwardDialog, ForwardRequest};
 use super::icons;
 use super::info_panel::{InfoAction, InfoLayout, InfoPanel};
 use super::keys;
+use super::lottie;
 use super::menus::{self, ChatAction, MainMenuAction, PopoverSlot};
 use super::messages::{MediaState, MessageAction, MessagesView};
 use super::newgroup::{NewGroupAction, NewGroupDialog};
@@ -1008,6 +1009,8 @@ impl ShellInner {
             self.bind_info_panel();
         }
         self.update_clock(settings.header_clock || settings.animation("liveclock"));
+        // Wave 6D: false → animated stickers freeze on their first frame.
+        lottie::set_animated_stickers_enabled(settings.media.animated_stickers);
         self.effects.sync();
         self.messages.refresh_animations();
         self.chatlist.refresh_animations();
@@ -2488,9 +2491,11 @@ impl ShellInner {
             };
             match result {
                 Ok(stickers) => {
-                    let static_ids = stickers
+                    // Wave 6D: animated .tgs cells load too (Lottie); only
+                    // .webm video stickers still have no preview surface.
+                    let cell_ids = stickers
                         .iter()
-                        .filter_map(|sticker| (!sticker.animated).then_some(sticker.id))
+                        .filter_map(|sticker| (!sticker.video).then_some(sticker.id))
                         .collect::<Vec<_>>();
                     if this.stickers.finish_stickers(
                         generation,
@@ -2498,7 +2503,7 @@ impl ShellInner {
                         &key,
                         stickers,
                     ) {
-                        for sticker_id in static_ids {
+                        for sticker_id in cell_ids {
                             this.download_sticker_cell(
                                 generation,
                                 content_generation,
@@ -2542,6 +2547,20 @@ impl ShellInner {
                 Ok(Some(path)) => path,
                 Ok(None) | Err(_) => return unavailable(weak.upgrade()),
             };
+            // Wave 6D: .tgs cells render through the Lottie thread, not the
+            // image decoder (which would fail and mark them unavailable).
+            if is_lottie(&path) {
+                if let Some(this) = weak.upgrade() {
+                    this.stickers.set_lottie_cell(
+                        generation,
+                        content_generation,
+                        &pack_id,
+                        sticker_id,
+                        path,
+                    );
+                }
+                return;
+            }
             let decode_path = path.clone();
             let decoded =
                 gio::spawn_blocking(move || gdk::Texture::from_filename(&decode_path)).await;
@@ -6417,6 +6436,14 @@ impl ShellInner {
         };
         glib::MainContext::default().spawn_local(async move {
             match self.tg.download_media(chat_id, msg_id).await {
+                // Wave 6D: a .tgs sticker is Lottie, not an image — it must
+                // never reach the texture decoder below.
+                Ok(Some(path)) if is_lottie(&path) => {
+                    if !self.is_current(chat_id, epoch) || !self.messages.contains(msg_id) {
+                        return;
+                    }
+                    self.messages.finish_lottie(msg_id, path);
+                }
                 Ok(Some(path)) if matches!(kind, MediaKind::Photo | MediaKind::Sticker) => {
                     let decode_path = path.clone();
                     let decoded =
@@ -7731,6 +7758,9 @@ impl ShellInner {
                 return;
             }
         }
+        if !self.run_wave6d_probe().await {
+            return;
+        }
         self.clone().open_chat(marta);
         if !poll_until(3500, || {
             self.open_chat.get() == Some(marta)
@@ -8982,7 +9012,9 @@ impl ShellInner {
             probe_fail("Omarchy sticker pack");
             return false;
         }
-        if self.stickers.sticker_sendable(9104) {
+        // Wave 6D: animated .tgs stickers ARE sendable now (the mock accepts
+        // send_sticker(9104) and the cell renders through the Lottie thread).
+        if !self.stickers.sticker_sendable(9104) {
             probe_fail("animated sticker sendability");
             return false;
         }
@@ -9516,6 +9548,233 @@ impl ShellInner {
         }
         true
     }
+
+    /// Wave 6D: animated (.tgs) stickers on the "Media Lab" fixture and in
+    /// the sticker picker (specs/spec-wave6.md §1.11).
+    async fn run_wave6d_probe(self: &Rc<Self>) -> bool {
+        let media_lab = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find_map(|(id, title)| (title == "Media Lab").then_some(id));
+        let Some(media_lab) = media_lab else {
+            probe_fail("find Media Lab");
+            return false;
+        };
+        self.clone().open_chat(media_lab);
+        if !poll_until(4_000, || {
+            self.open_chat.get() == Some(media_lab)
+                && !self.messages.is_loading()
+                && self.messages.contains(813)
+        })
+        .await
+        {
+            probe_fail("open Media Lab for animated stickers");
+            return false;
+        }
+
+        probe_step("lottie sticker renders");
+        // The .tgs row is the newest message, so it is on screen and plays.
+        if !poll_until(6_000, || {
+            self.messages
+                .lottie(813)
+                .is_some_and(|sticker| sticker.is_ready())
+        })
+        .await
+        {
+            probe_fail("lottie sticker first frame");
+            return false;
+        }
+        let Some(sticker) = self.messages.lottie(813) else {
+            probe_fail("lottie sticker widget");
+            return false;
+        };
+        if let Some(error) = sticker.error() {
+            probe_fail(&format!("lottie sticker error: {error}"));
+            return false;
+        }
+        // The row is the newest message, but a settling layout can leave it
+        // below the viewport — an off-screen sticker is paused by design.
+        if !self.messages.row_visible(813) {
+            self.messages.scroll_to_message(813);
+        }
+        if !poll_until(3_000, || self.messages.row_visible(813)).await {
+            probe_fail("animated sticker row on screen");
+            return false;
+        }
+        let (index, frames) = (sticker.frame_index(), sticker.frames_shown());
+        glib::timeout_future(Duration::from_millis(300)).await;
+        if !poll_until(3_000, || {
+            sticker.is_animating()
+                && sticker.frames_shown() > frames
+                && sticker.frame_index() != index
+        })
+        .await
+        {
+            probe_fail(&format!(
+                "lottie sticker frame advance (animating {}, visible {}, slots {}, frames {} -> {})",
+                sticker.is_animating(),
+                self.messages.row_visible(813),
+                lottie::animating_count(),
+                frames,
+                sticker.frames_shown()
+            ));
+            return false;
+        }
+
+        probe_step("lottie sticker offscreen pause");
+        if !self.messages.scroll_to_message(800) {
+            probe_fail("scroll away from the animated sticker");
+            return false;
+        }
+        if !poll_until(3_000, || {
+            !self.messages.row_visible(813)
+                && !sticker.is_animating()
+                && lottie::animating_count() == 0
+        })
+        .await
+        {
+            probe_fail("lottie sticker offscreen pause");
+            return false;
+        }
+        let paused = sticker.frames_shown();
+        glib::timeout_future(Duration::from_millis(300)).await;
+        if sticker.frames_shown() != paused {
+            probe_fail("off-screen lottie sticker kept rendering");
+            return false;
+        }
+        if !self.messages.scroll_to_message(813) {
+            probe_fail("scroll back to the animated sticker");
+            return false;
+        }
+        if !poll_until(3_000, || {
+            self.messages.row_visible(813) && sticker.frames_shown() > paused
+        })
+        .await
+        {
+            probe_fail("lottie sticker resume on screen");
+            return false;
+        }
+
+        probe_step("lottie master toggle");
+        self.settings
+            .update(|settings| settings.media.animated_stickers = false);
+        if !poll_until(2_000, || !sticker.is_animating()).await {
+            probe_fail("animated_stickers off pauses playback");
+            return false;
+        }
+        let frozen = sticker.frames_shown();
+        glib::timeout_future(Duration::from_millis(300)).await;
+        if sticker.frames_shown() != frozen {
+            probe_fail("animated_stickers off kept rendering");
+            return false;
+        }
+        self.settings
+            .update(|settings| settings.media.animated_stickers = true);
+        if !poll_until(3_000, || {
+            sticker.is_animating() && sticker.frames_shown() > frozen
+        })
+        .await
+        {
+            probe_fail("animated_stickers on resumes playback");
+            return false;
+        }
+        // The animations master switch pauses stickers as well (§1.8).
+        if let Some(gtk_settings) = gtk::Settings::default() {
+            gtk_settings.set_gtk_enable_animations(false);
+            if !poll_until(2_000, || !sticker.is_animating()).await {
+                gtk_settings.set_gtk_enable_animations(true);
+                probe_fail("animations master off pauses stickers");
+                return false;
+            }
+            let stopped = sticker.frames_shown();
+            glib::timeout_future(Duration::from_millis(300)).await;
+            let advanced = sticker.frames_shown() != stopped;
+            gtk_settings.set_gtk_enable_animations(true);
+            if advanced {
+                probe_fail("animations master off kept rendering");
+                return false;
+            }
+            if !poll_until(3_000, || sticker.is_animating()).await {
+                probe_fail("animations master on resumes stickers");
+                return false;
+            }
+        }
+
+        probe_step("lottie picker hover");
+        self.open_stickers();
+        if !poll_until(4_000, || {
+            self.stickers.stickers_ready() || self.stickers.retry_visible()
+        })
+        .await
+        {
+            probe_fail("lottie picker packs settlement");
+            return false;
+        }
+        if self.stickers.retry_visible() {
+            self.stickers.trigger_retry();
+            if !poll_until(4_000, || self.stickers.stickers_ready()).await {
+                probe_fail("lottie picker packs retry");
+                return false;
+            }
+        }
+        let Some(pack) = self.stickers.probe_pack_id_by_title("Omarchy") else {
+            probe_fail("lottie picker Omarchy pack");
+            return false;
+        };
+        self.stickers.probe_select_pack(&pack);
+        if !poll_until(4_000, || {
+            self.stickers.current_pack() == pack && self.stickers.sticker_sendable(9104)
+        })
+        .await
+        {
+            probe_fail("animated sticker cell listed and sendable");
+            return false;
+        }
+        if !poll_until(8_000, || {
+            self.stickers
+                .lottie(9104)
+                .is_some_and(|cell| cell.is_ready())
+        })
+        .await
+        {
+            probe_fail("animated sticker cell first frame");
+            return false;
+        }
+        let Some(cell) = self.stickers.lottie(9104) else {
+            probe_fail("animated sticker cell widget");
+            return false;
+        };
+        if cell.is_animating() {
+            probe_fail("animated sticker cell animates without hover");
+            return false;
+        }
+        let idle = cell.frames_shown();
+        if !self.stickers.probe_hover_sticker(9104, true) {
+            probe_fail("animated sticker cell hover enter");
+            return false;
+        }
+        if !poll_until(3_000, || cell.is_animating() && cell.frames_shown() > idle).await {
+            probe_fail("animated sticker cell plays on hover");
+            return false;
+        }
+        if !self.stickers.probe_hover_sticker(9104, false) {
+            probe_fail("animated sticker cell hover leave");
+            return false;
+        }
+        if !poll_until(2_000, || !cell.is_animating()).await {
+            probe_fail("animated sticker cell pauses on leave");
+            return false;
+        }
+        let left = cell.frames_shown();
+        glib::timeout_future(Duration::from_millis(300)).await;
+        if cell.frames_shown() != left {
+            probe_fail("unhovered animated sticker cell kept rendering");
+            return false;
+        }
+        self.close_stickers();
+        true
+    }
 }
 
 impl Drop for ShellInner {
@@ -9549,6 +9808,13 @@ impl Drop for ShellInner {
 
 fn clock_text() -> String {
     Local::now().format("%H:%M:%S").to_string()
+}
+
+/// Wave 6D: `.tgs` stickers are gzipped Lottie, rendered by `ui::lottie`.
+fn is_lottie(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("tgs"))
 }
 
 /// `main.rs` gives smoke runs a private state file. The probe contract also
