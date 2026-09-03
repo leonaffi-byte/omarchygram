@@ -133,8 +133,25 @@ not exist.
 - Stories: ring on avatars, view stories in a viewer (photo/video, auto
   advance), mark seen; posting is out.
 
-### 6G — Calls (very large, last; separate research spike first)
-- Voice calls, then video calls. Requires a tgcalls-style WebRTC stack that
-  does not exist in Rust yet; the spike decides build-vs-skip before any
-  implementation is scheduled. Not started until 6A–6F are merged.
+### 6G — Calls (spike DONE 2026-09-03; verdict: build later via ntgcalls, not in wave 6)
+- Spike result (orchestrator, research agent, sources checked 2026-09-03):
+  - No pure-Rust path exists and none is realistic: Telegram's call media
+    protocol (tgcalls v2) needs a custom reflector relay (not TURN), an
+    MTProto-style encrypted signaling channel and per-version negotiation
+    on top of a patched libwebrtc; `webrtc-rs`/`str0m` cannot speak it.
+  - Building `tgcalls` + `tg_owt` from source has no standalone build and
+    a C++-only API (1–2 weeks, fragile).
+  - The ONE workable path is **ntgcalls** (github.com/pytgcalls/ntgcalls,
+    LGPL-3, C ABI + an official `ntgcalls` Rust crate 3.0.0-rc01): prebuilt
+    Linux x86_64 static libs, `create_p2p_call`/`exchange_keys`/
+    `connect_p2p`, signaling stays in `src/tg/` on grammers (`phone.*` TL
+    functions are all in grammers-tl-types 0.10). Estimate: 3–5 days for
+    voice, +2–3 for video. Risks: release-candidate crate whose build.rs
+    downloads a 32 MB lib from GitHub (must be vendored), LGPL relinking
+    obligations, PipeWire capture/playback unverified, interop with the
+    current official clients only reported for ntgcalls 2.x.
+- Decision: NOT built in wave 6. Scheduled as its own wave 7 after the user
+  confirms the LGPL/vendoring trade-off; it starts with a 1-day interop
+  spike (one outgoing call to a real phone with two-way audio) before any
+  UI work.
 

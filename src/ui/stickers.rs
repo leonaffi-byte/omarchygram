@@ -357,6 +357,30 @@ impl StickerPicker {
         true
     }
 
+    /// A GIF whose mp4 arrived (wave 6: the mock renders one with ffmpeg;
+    /// playback in the picker is 6A's). The card stops looking like it is
+    /// loading and `downloaded_ids` lists it.
+    pub fn mark_gif_ready(
+        &self,
+        generation: u64,
+        content_generation: u64,
+        gif_id: i64,
+        path: PathBuf,
+    ) -> bool {
+        if !self.matches(generation, content_generation, "gifs") {
+            return false;
+        }
+        let Some(cell) = self.cells.borrow().get(&gif_id).cloned() else {
+            return false;
+        };
+        if let Some(button) = cell.button.upgrade() {
+            button.set_tooltip_text(Some("GIF"));
+        }
+        self.unavailable.borrow_mut().remove(&gif_id);
+        self.paths.borrow_mut().insert(gif_id, path);
+        true
+    }
+
     /// A cell whose image could not be downloaded or decoded keeps its emoji
     /// (or GIF) placeholder and says so, instead of silently looking like a
     /// still-loading cell. Only `animated` blocks sending.

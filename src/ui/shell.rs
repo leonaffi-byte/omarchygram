@@ -2574,9 +2574,15 @@ impl ShellInner {
             let Some(this) = weak.upgrade() else { return };
             // GIF cells carry no preview surface yet; when the file is not
             // there the card says so instead of pretending to be loading.
-            if !matches!(result, Ok(Some(_))) {
-                this.stickers
-                    .mark_unavailable(generation, content_generation, "gifs", gif_id);
+            match result {
+                Ok(Some(path)) => {
+                    this.stickers
+                        .mark_gif_ready(generation, content_generation, gif_id, path);
+                }
+                _ => {
+                    this.stickers
+                        .mark_unavailable(generation, content_generation, "gifs", gif_id);
+                }
             }
         });
     }
@@ -3520,6 +3526,11 @@ impl ShellInner {
                     self.load_pinned(chat_id);
                 }
             }
+            // Wave 6 events: handled by the 6B/6C/6E/6F packages (specs/spec-wave6.md).
+            Event::PollChanged { .. }
+            | Event::ScheduledChanged { .. }
+            | Event::TopicsChanged { .. }
+            | Event::StoriesChanged => {}
             Event::NewMessage(message) => self.handle_new_message(message),
             Event::MessageChanged(message) => {
                 let message_key = (message.chat_id, message.id);
@@ -7697,17 +7708,28 @@ impl ShellInner {
             probe_fail("audio card Download to Done/open");
             return;
         }
-        probe_step("media card unavailable");
+        // Since wave 6 the mock renders a real video-note file with ffmpeg;
+        // without ffmpeg (OMG_MOCK_NO_FFMPEG=1) the card must fail cleanly
+        // and never launch anything.
+        probe_step("media card video-note plays or is unavailable");
         let launches_before_unavailable = self.probe_media_launches.get();
         if !self.messages.trigger_media(703)
-            || !poll_until(4200, || {
-                matches!(self.messages.media_state(703), Some(MediaState::Failed))
+            || !poll_until(6000, || {
+                matches!(self.messages.media_state(703), Some(MediaState::Failed | MediaState::Done(_)))
             })
             .await
-            || self.probe_media_launches.get() != launches_before_unavailable
         {
-            probe_fail("video-note unavailable without launch");
+            probe_fail("video-note card never settled");
             return;
+        }
+        let launched = self.probe_media_launches.get().wrapping_sub(launches_before_unavailable);
+        match self.messages.media_state(703) {
+            Some(MediaState::Failed) if launched == 0 => {}
+            Some(MediaState::Done(_)) if launched == 1 => {}
+            other => {
+                probe_fail(&format!("video-note card state {other:?} with {launched} launch(es)"));
+                return;
+            }
         }
         self.clone().open_chat(marta);
         if !poll_until(3500, || {
@@ -8980,17 +9002,19 @@ impl ShellInner {
                 return false;
             }
         }
-        probe_step("GIF cards report unavailable");
-        // No mp4 fixture exists for either saved GIF, so both cards must say
-        // so instead of looking like they are still loading (A33).
+        probe_step("GIF cards settle");
+        // Since wave 6 the mock renders an mp4 fixture with ffmpeg: both cards
+        // must either download (ffmpeg present) or say they are unavailable
+        // (OMG_MOCK_NO_FFMPEG=1) — never look like they are still loading (A33).
         self.stickers.probe_select_pack("gifs");
-        if !poll_until(4_000, || {
+        if !poll_until(8_000, || {
             self.stickers.current_pack() == "gifs"
-                && self.stickers.unavailable_ids() == vec![9201, 9202]
+                && (self.stickers.unavailable_ids() == vec![9201, 9202]
+                    || self.stickers.downloaded_ids() == vec![9201, 9202])
         })
         .await
         {
-            probe_fail("GIF unavailable markers");
+            probe_fail("GIF cards settle");
             return false;
         }
         self.stickers.probe_select_pack("recent");
@@ -9156,7 +9180,7 @@ impl ShellInner {
         }
         probe_step("contacts Sam Rivera");
         self.open_contacts();
-        if !poll_until(4_000, || self.contacts.count() == 5 || self.contacts.retry_visible()).await {
+        if !poll_until(4_000, || self.contacts.count() == 6 || self.contacts.retry_visible()).await {
             probe_fail("contacts settlement");
             return false;
         }
@@ -9167,7 +9191,7 @@ impl ShellInner {
                 return false;
             }
             self.contacts.trigger_retry();
-            if !poll_until(4_000, || self.contacts.count() == 5).await {
+            if !poll_until(4_000, || self.contacts.count() == 6).await {
                 probe_fail("contacts retry");
                 return false;
             }
@@ -9185,7 +9209,7 @@ impl ShellInner {
         probe_step("new group Test");
         self.open_new_group();
         if !poll_until(4_000, || {
-            self.new_group.contact_count() == 5 || self.new_group.retry_visible()
+            self.new_group.contact_count() == 6 || self.new_group.retry_visible()
         })
         .await
         {
@@ -9194,7 +9218,7 @@ impl ShellInner {
         }
         if self.new_group.retry_visible() {
             self.new_group.trigger_retry();
-            if !poll_until(4_000, || self.new_group.contact_count() == 5).await {
+            if !poll_until(4_000, || self.new_group.contact_count() == 6).await {
                 probe_fail("new group contacts retry");
                 return false;
             }
@@ -9637,6 +9661,11 @@ fn message_preview(message: &Msg) -> String {
         Some(MediaKind::Gif) => "[GIF]".to_string(),
         Some(MediaKind::Audio) => "[audio]".to_string(),
         Some(MediaKind::VideoNote) => "[video message]".to_string(),
+        Some(MediaKind::Location) => "[location]".to_string(),
+        Some(MediaKind::Venue) => "[venue]".to_string(),
+        Some(MediaKind::Contact) => "[contact]".to_string(),
+        Some(MediaKind::Dice) => "[dice]".to_string(),
+        Some(MediaKind::Poll) => "[poll]".to_string(),
         Some(MediaKind::Unsupported) => "[unsupported]".to_string(),
         None => String::new(),
     }

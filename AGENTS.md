@@ -14,3 +14,4 @@ You are one of several agents working in this repo under an orchestrator. These 
 ## GUI runs (binding)
 - NEVER open the app on the user's desktop. Every `./target/debug/omarchygram`, `cargo run`, `--smoke`, `--probe` or screenshot run MUST be wrapped as `bin/headless <command>` (private headless Wayland compositor). If `bin/headless` is unavailable or fails, skip the GUI check and say so in your report — the orchestrator runs the gate. A visible window on the user's screen is a hard rule violation.
 - Never send synthetic keyboard/mouse input to the desktop (no xdotool/wtype/ydotool/wlrctl).
+- The acceptance gate is `bin/gate` (full) / `bin/gate quick` (while iterating); both already wrap every run in bin/headless. Run the full gate before your final report and paste its summary lines.

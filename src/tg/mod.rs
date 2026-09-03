@@ -131,6 +131,10 @@ pub struct ChatSummary {
     pub has_photo: bool,
     /// Server-side draft text (Telegram syncs it between devices).
     pub draft: String,
+    /// Supergroup with topics: opening it shows the topic list (wave 6E).
+    pub forum: bool,
+    /// Story ring around the avatar (wave 6F).
+    pub story_ring: StoryRing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,8 +147,220 @@ pub enum MediaKind {
     Gif,
     Audio,
     VideoNote,
-    /// Polls, locations, contacts, games… rendered as a "[unsupported]" card.
+    /// `Msg::location` (`live` is None for a plain point).
+    Location,
+    /// `Msg::location` with title/address.
+    Venue,
+    /// `Msg::contact`.
+    Contact,
+    /// `Msg::dice`.
+    Dice,
+    /// `Msg::poll`.
+    Poll,
+    /// Games, invoices, stories shared in chats… rendered as a "[unsupported]" card.
     Unsupported,
+}
+
+// ===================== wave 6: typed media payloads =====================
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct GeoPoint {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveLocation {
+    pub period_secs: u32,
+    pub expires: DateTime<Local>,
+    pub last_update: DateTime<Local>,
+    /// Degrees, when the sender's client reports one.
+    pub heading: Option<u16>,
+    /// Sharing ended (expired or stopped).
+    pub stopped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LocationInfo {
+    pub point: GeoPoint,
+    /// Venue only.
+    pub title: String,
+    /// Venue only.
+    pub address: String,
+    pub live: Option<LiveLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ContactCard {
+    pub first_name: String,
+    pub last_name: String,
+    pub phone: String,
+    /// Bot-API user id when the contact is a Telegram user.
+    pub user_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DiceInfo {
+    pub emoji: String,
+    /// 0 = still rolling (the final value arrives as MessageChanged).
+    pub value: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PollOption {
+    pub text: String,
+    pub voters: i32,
+    /// I voted for this option.
+    pub chosen: bool,
+    /// Quiz: known once voted or closed.
+    pub correct: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Poll {
+    pub id: i64,
+    pub question: String,
+    pub options: Vec<PollOption>,
+    pub total_voters: i32,
+    pub closed: bool,
+    /// false = anonymous.
+    pub public_voters: bool,
+    pub multiple_choice: bool,
+    pub quiz: bool,
+    /// Any option chosen by me.
+    pub voted: bool,
+    /// Quiz explanation, present once voted or closed.
+    pub solution: Option<String>,
+    pub close_date: Option<DateTime<Local>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PollDraft {
+    pub question: String,
+    /// 2..=10 entries.
+    pub options: Vec<String>,
+    pub anonymous: bool,
+    pub multiple_choice: bool,
+    pub quiz: bool,
+    /// Quiz only.
+    pub correct_option: Option<usize>,
+    /// Quiz only.
+    pub solution: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ButtonKind {
+    Callback(Vec<u8>),
+    Url(String),
+    SwitchInline { query: String, same_chat: bool },
+    /// Rendered insensitive.
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyButton {
+    pub text: String,
+    pub kind: ButtonKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Keyboard {
+    pub rows: Vec<Vec<KeyButton>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BotCommand {
+    /// Without the leading "/".
+    pub command: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Topic {
+    /// Telegram topic id (== id of the topic's first message; 1 = General).
+    pub id: i32,
+    /// Synthetic chat id that opens this topic (see `topic_chat_id`).
+    pub chat_id: i64,
+    /// The forum supergroup's chat id.
+    pub forum_id: i64,
+    pub title: String,
+    /// "" when the topic has none.
+    pub icon_emoji: String,
+    pub unread: i32,
+    pub last_message: String,
+    pub last_time: Option<DateTime<Local>>,
+    pub pinned: bool,
+    pub closed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StoryRing {
+    #[default]
+    None,
+    Unread,
+    Read,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StoryPeer {
+    pub chat_id: i64,
+    pub name: String,
+    pub unread: bool,
+    pub has_photo: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Story {
+    pub id: i32,
+    pub chat_id: i64,
+    pub ts: DateTime<Local>,
+    pub expires: DateTime<Local>,
+    pub video: bool,
+    pub duration: Option<u32>,
+    pub caption: String,
+    pub seen: bool,
+}
+
+/// Any chat id at or below this is a forum topic (see `topic_chat_id`).
+pub const TOPIC_CHAT_ID_BASE: i64 = -(1 << 62);
+const TOPIC_SHIFT: i64 = 1 << 28;
+
+/// Synthetic chat id for (forum, topic). Everything that takes a chat id
+/// accepts it: history, send_*, mark_read, pins, search, drafts, downloads.
+/// Limits: forum bare id < 2^34, topic id < 2^28 (both far beyond today's).
+pub fn topic_chat_id(forum_id: i64, topic_id: i32) -> i64 {
+    let bare = channel_bare_id(forum_id).max(0);
+    TOPIC_CHAT_ID_BASE - (bare * TOPIC_SHIFT + topic_id as i64)
+}
+
+/// Some((forum_id, topic_id)) when `chat_id` is a topic id.
+pub fn split_topic_chat_id(chat_id: i64) -> Option<(i64, i32)> {
+    if chat_id > TOPIC_CHAT_ID_BASE {
+        return None;
+    }
+    let offset = TOPIC_CHAT_ID_BASE - chat_id;
+    let bare = offset / TOPIC_SHIFT;
+    let topic = (offset % TOPIC_SHIFT) as i32;
+    Some((-1_000_000_000_000 - bare, topic))
+}
+
+/// Bot-API channel/supergroup id → bare id (-100xxxx → xxxx).
+fn channel_bare_id(chat_id: i64) -> i64 {
+    -chat_id - 1_000_000_000_000
+}
+
+/// Does `msg` (from an Event or a history page) belong to the chat the UI
+/// has open? Plain ids: `msg.chat_id == open_chat_id`. Topic ids:
+/// `msg.chat_id == forum_id && msg.topic_id == Some(topic_id)` (General,
+/// topic 1, also matches `topic_id == None`).
+pub fn msg_in_chat(msg: &Msg, open_chat_id: i64) -> bool {
+    match split_topic_chat_id(open_chat_id) {
+        None => msg.chat_id == open_chat_id,
+        Some((forum_id, topic_id)) => {
+            msg.chat_id == forum_id
+                && (msg.topic_id == Some(topic_id) || (topic_id == 1 && msg.topic_id.is_none()))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -228,6 +444,23 @@ pub struct Msg {
     pub sticker_emoji: Option<String>,
     /// Pinned in its chat.
     pub pinned: bool,
+    // ----- wave 6 -----
+    pub location: Option<LocationInfo>,
+    pub contact: Option<ContactCard>,
+    pub dice: Option<DiceInfo>,
+    pub poll: Option<Poll>,
+    /// Bot inline keyboard under the message.
+    pub keyboard: Option<Keyboard>,
+    /// Forum topic this message belongs to (None outside forums; General = Some(1)).
+    pub topic_id: Option<i32>,
+    /// From `get_scheduled`: `ts` is the scheduled send time, `id` the scheduled id.
+    pub scheduled: bool,
+    /// Audio: track title.
+    pub audio_title: Option<String>,
+    /// Audio: artist.
+    pub audio_performer: Option<String>,
+    /// VideoNote: always true (kept for symmetry with video stickers).
+    pub round: bool,
 }
 
 impl Default for Msg {
@@ -257,6 +490,16 @@ impl Default for Msg {
             photo_size: None,
             sticker_emoji: None,
             pinned: false,
+            location: None,
+            contact: None,
+            dice: None,
+            poll: None,
+            keyboard: None,
+            topic_id: None,
+            scheduled: false,
+            audio_title: None,
+            audio_performer: None,
+            round: false,
         }
     }
 }
@@ -282,6 +525,9 @@ pub struct ChatInfo {
     pub has_photo: bool,
     pub muted: bool,
     pub is_contact: bool,
+    /// Bots (and groups with bots): the "/" autocomplete list (wave 6E).
+    pub bot_commands: Vec<BotCommand>,
+    pub forum: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -309,6 +555,7 @@ pub struct Contact {
     pub phone: String,
     pub presence: Presence,
     pub has_photo: bool,
+    pub story_ring: StoryRing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,8 +587,11 @@ pub struct StickerPack {
 pub struct Sticker {
     pub id: i64,
     pub emoji: String,
-    /// .tgs/.webm — not renderable here; shown as a muted cell, not sendable.
+    /// .tgs (Lottie, wave 6D) or .webm (video, wave 6A); `download_sticker`
+    /// returns the raw file for these.
     pub animated: bool,
+    /// .webm video sticker (`animated` is true as well).
+    pub video: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -402,6 +652,14 @@ pub enum Event {
     DialogsChanged,
     /// Refetch `get_pinned_message` for this chat.
     PinnedChanged { chat_id: i64 },
+    /// A poll's votes/closed state changed (also after my own `send_vote`).
+    PollChanged { poll_id: i64, poll: Poll },
+    /// The scheduled list of this chat changed: refetch `get_scheduled`.
+    ScheduledChanged { chat_id: i64 },
+    /// The topic list of this forum changed: refetch `get_topics`.
+    TopicsChanged { forum_id: i64 },
+    /// Story rings changed: refetch `get_story_peers` (and dialogs' rings).
+    StoriesChanged,
 }
 
 /// User-facing error text; show it, don't parse it.
@@ -466,6 +724,28 @@ enum Command {
     DownloadSticker { sticker_id: i64, respond: Reply<Option<PathBuf>> },
     GetSavedGifs(Reply<Vec<Gif>>),
     DownloadGif { gif_id: i64, respond: Reply<Option<PathBuf>> },
+    // ----- wave 6 -----
+    DownloadMap { point: GeoPoint, zoom: u8, width: u32, height: u32, respond: Reply<Option<PathBuf>> },
+    SendVote { chat_id: i64, msg_id: i32, options: Vec<usize>, respond: Reply<()> },
+    AddContact { user_id: i64, first_name: String, last_name: String, phone: String, respond: Reply<()> },
+    SendPoll { chat_id: i64, draft: PollDraft, respond: Reply<Msg> },
+    SendLocation { chat_id: i64, point: GeoPoint, respond: Reply<Msg> },
+    SendTextAt { chat_id: i64, text: String, reply_to: Option<i32>, at: DateTime<Local>, respond: Reply<()> },
+    SendFileAt { chat_id: i64, path: PathBuf, caption: String, at: DateTime<Local>, respond: Reply<()> },
+    GetScheduled { chat_id: i64, respond: Reply<Vec<Msg>> },
+    SendScheduledNow { chat_id: i64, ids: Vec<i32>, respond: Reply<()> },
+    DeleteScheduled { chat_id: i64, ids: Vec<i32>, respond: Reply<()> },
+    PressButton { chat_id: i64, msg_id: i32, data: Vec<u8>, respond: Reply<Option<String>> },
+    GetTopics { forum_id: i64, respond: Reply<Vec<Topic>> },
+    CreateTopic { forum_id: i64, title: String, respond: Reply<Topic> },
+    SendVideoNote { chat_id: i64, path: PathBuf, duration: u32, size: u32, respond: Reply<Msg> },
+    SendLiveLocation { chat_id: i64, point: GeoPoint, period_secs: u32, respond: Reply<Msg> },
+    UpdateLiveLocation { chat_id: i64, msg_id: i32, point: GeoPoint, respond: Reply<()> },
+    StopLiveLocation { chat_id: i64, msg_id: i32, respond: Reply<()> },
+    GetStoryPeers(Reply<Vec<StoryPeer>>),
+    GetStories { chat_id: i64, respond: Reply<Vec<Story>> },
+    DownloadStory { chat_id: i64, story_id: i32, respond: Reply<Option<PathBuf>> },
+    MarkStoriesSeen { chat_id: i64, up_to_id: i32, respond: Reply<()> },
 }
 
 impl Command {
@@ -522,6 +802,27 @@ impl Command {
             Command::DownloadSticker { .. } => "DownloadSticker",
             Command::GetSavedGifs(_) => "GetSavedGifs",
             Command::DownloadGif { .. } => "DownloadGif",
+            Command::DownloadMap { .. } => "DownloadMap",
+            Command::SendVote { .. } => "SendVote",
+            Command::AddContact { .. } => "AddContact",
+            Command::SendPoll { .. } => "SendPoll",
+            Command::SendLocation { .. } => "SendLocation",
+            Command::SendTextAt { .. } => "SendTextAt",
+            Command::SendFileAt { .. } => "SendFileAt",
+            Command::GetScheduled { .. } => "GetScheduled",
+            Command::SendScheduledNow { .. } => "SendScheduledNow",
+            Command::DeleteScheduled { .. } => "DeleteScheduled",
+            Command::PressButton { .. } => "PressButton",
+            Command::GetTopics { .. } => "GetTopics",
+            Command::CreateTopic { .. } => "CreateTopic",
+            Command::SendVideoNote { .. } => "SendVideoNote",
+            Command::SendLiveLocation { .. } => "SendLiveLocation",
+            Command::UpdateLiveLocation { .. } => "UpdateLiveLocation",
+            Command::StopLiveLocation { .. } => "StopLiveLocation",
+            Command::GetStoryPeers(_) => "GetStoryPeers",
+            Command::GetStories { .. } => "GetStories",
+            Command::DownloadStory { .. } => "DownloadStory",
+            Command::MarkStoriesSeen { .. } => "MarkStoriesSeen",
         }
     }
 }
@@ -578,6 +879,26 @@ fn reject(cmd: Command, e: &str) {
         Command::GetStickerPacks(tx) => drop(tx.send(Err(e))),
         Command::GetStickers { respond, .. } => drop(respond.send(Err(e))),
         Command::GetSavedGifs(tx) => drop(tx.send(Err(e))),
+        Command::DownloadMap { respond, .. } | Command::DownloadStory { respond, .. } => drop(respond.send(Err(e))),
+        Command::SendVote { respond, .. }
+        | Command::AddContact { respond, .. }
+        | Command::SendTextAt { respond, .. }
+        | Command::SendFileAt { respond, .. }
+        | Command::SendScheduledNow { respond, .. }
+        | Command::DeleteScheduled { respond, .. }
+        | Command::UpdateLiveLocation { respond, .. }
+        | Command::StopLiveLocation { respond, .. }
+        | Command::MarkStoriesSeen { respond, .. } => drop(respond.send(Err(e))),
+        Command::SendPoll { respond, .. }
+        | Command::SendLocation { respond, .. }
+        | Command::SendVideoNote { respond, .. }
+        | Command::SendLiveLocation { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetScheduled { respond, .. } => drop(respond.send(Err(e))),
+        Command::PressButton { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetTopics { respond, .. } => drop(respond.send(Err(e))),
+        Command::CreateTopic { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetStoryPeers(tx) => drop(tx.send(Err(e))),
+        Command::GetStories { respond, .. } => drop(respond.send(Err(e))),
     }
 }
 
@@ -901,5 +1222,152 @@ impl Tg {
     /// MP4 path, cached. None when unavailable.
     pub async fn download_gif(&self, gif_id: i64) -> Result<Option<PathBuf>, TgError> {
         roundtrip!(self, |tx| Command::DownloadGif { gif_id, respond: tx })
+    }
+
+    // ----- wave 6B: display -----
+
+    /// PNG of an OpenStreetMap map centered on `point`, `width`×`height` px,
+    /// cached. Mock: a synthetic tile. `Ok(None)` when offline or the fetch
+    /// fails — never an error for a bad network.
+    pub async fn download_map(&self, point: GeoPoint, zoom: u8, width: u32, height: u32) -> Result<Option<PathBuf>, TgError> {
+        roundtrip!(self, |tx| Command::DownloadMap { point, zoom, width, height, respond: tx })
+    }
+
+    /// Empty `options` retracts. The new state arrives as `Event::PollChanged`.
+    pub async fn send_vote(&self, chat_id: i64, msg_id: i32, options: Vec<usize>) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::SendVote { chat_id, msg_id, options, respond: tx })
+    }
+
+    pub async fn add_contact(&self, user_id: i64, first_name: &str, last_name: &str, phone: &str) -> Result<(), TgError> {
+        let first_name = first_name.trim().to_string();
+        let last_name = last_name.trim().to_string();
+        let phone = phone.trim().to_string();
+        roundtrip!(self, |tx| Command::AddContact { user_id, first_name, last_name, phone, respond: tx })
+    }
+
+    // ----- wave 6C: sending -----
+
+    pub async fn send_poll(&self, chat_id: i64, draft: PollDraft) -> Result<Msg, TgError> {
+        roundtrip!(self, |tx| Command::SendPoll { chat_id, draft, respond: tx })
+    }
+
+    pub async fn send_location(&self, chat_id: i64, point: GeoPoint) -> Result<Msg, TgError> {
+        roundtrip!(self, |tx| Command::SendLocation { chat_id, point, respond: tx })
+    }
+
+    /// Scheduled sends return nothing: the message shows up in
+    /// `get_scheduled` and `Event::ScheduledChanged` fires.
+    pub async fn send_text_at(&self, chat_id: i64, text: &str, reply_to: Option<i32>, at: DateTime<Local>) -> Result<(), TgError> {
+        let text = text.to_string();
+        roundtrip!(self, |tx| Command::SendTextAt { chat_id, text, reply_to, at, respond: tx })
+    }
+
+    pub async fn send_file_at(&self, chat_id: i64, path: PathBuf, caption: &str, at: DateTime<Local>) -> Result<(), TgError> {
+        let caption = caption.to_string();
+        roundtrip!(self, |tx| Command::SendFileAt { chat_id, path, caption, at, respond: tx })
+    }
+
+    /// Soonest first. `Msg::scheduled == true`, `ts` = send time, `id` = the
+    /// scheduled id (valid only for the two calls below).
+    pub async fn get_scheduled(&self, chat_id: i64) -> Result<Vec<Msg>, TgError> {
+        roundtrip!(self, |tx| Command::GetScheduled { chat_id, respond: tx })
+    }
+
+    pub async fn send_scheduled_now(&self, chat_id: i64, ids: Vec<i32>) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::SendScheduledNow { chat_id, ids, respond: tx })
+    }
+
+    pub async fn delete_scheduled(&self, chat_id: i64, ids: Vec<i32>) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::DeleteScheduled { chat_id, ids, respond: tx })
+    }
+
+    // ----- wave 6E: bots and forums -----
+
+    /// Presses a Callback button. `Some(text)` = the bot answered with a
+    /// toast/alert text to show; `None` = silent ack. Url buttons are opened
+    /// by the UI.
+    pub async fn press_button(&self, chat_id: i64, msg_id: i32, data: Vec<u8>) -> Result<Option<String>, TgError> {
+        roundtrip!(self, |tx| Command::PressButton { chat_id, msg_id, data, respond: tx })
+    }
+
+    /// Topics of a forum supergroup, pinned first then newest activity first.
+    pub async fn get_topics(&self, forum_id: i64) -> Result<Vec<Topic>, TgError> {
+        roundtrip!(self, |tx| Command::GetTopics { forum_id, respond: tx })
+    }
+
+    pub async fn create_topic(&self, forum_id: i64, title: &str) -> Result<Topic, TgError> {
+        let title = title.trim().to_string();
+        roundtrip!(self, |tx| Command::CreateTopic { forum_id, title, respond: tx })
+    }
+
+    // ----- wave 6F: capture and live features -----
+
+    /// MP4 (h264, square `size` px) video circle.
+    pub async fn send_video_note(&self, chat_id: i64, path: PathBuf, duration: u32, size: u32) -> Result<Msg, TgError> {
+        roundtrip!(self, |tx| Command::SendVideoNote { chat_id, path, duration, size, respond: tx })
+    }
+
+    pub async fn send_live_location(&self, chat_id: i64, point: GeoPoint, period_secs: u32) -> Result<Msg, TgError> {
+        roundtrip!(self, |tx| Command::SendLiveLocation { chat_id, point, period_secs, respond: tx })
+    }
+
+    pub async fn update_live_location(&self, chat_id: i64, msg_id: i32, point: GeoPoint) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::UpdateLiveLocation { chat_id, msg_id, point, respond: tx })
+    }
+
+    pub async fn stop_live_location(&self, chat_id: i64, msg_id: i32) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::StopLiveLocation { chat_id, msg_id, respond: tx })
+    }
+
+    /// Peers with active stories, unread first.
+    pub async fn get_story_peers(&self) -> Result<Vec<StoryPeer>, TgError> {
+        roundtrip!(self, Command::GetStoryPeers)
+    }
+
+    /// Oldest first.
+    pub async fn get_stories(&self, chat_id: i64) -> Result<Vec<Story>, TgError> {
+        roundtrip!(self, |tx| Command::GetStories { chat_id, respond: tx })
+    }
+
+    /// JPG or MP4 path, cached. None when unavailable.
+    pub async fn download_story(&self, chat_id: i64, story_id: i32) -> Result<Option<PathBuf>, TgError> {
+        roundtrip!(self, |tx| Command::DownloadStory { chat_id, story_id, respond: tx })
+    }
+
+    pub async fn mark_stories_seen(&self, chat_id: i64, up_to_id: i32) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::MarkStoriesSeen { chat_id, up_to_id, respond: tx })
+    }
+}
+
+#[cfg(test)]
+mod topic_id_tests {
+    use super::*;
+
+    #[test]
+    fn topic_ids_round_trip() {
+        let forum = -1_002_345_678_901;
+        for topic in [1, 7, 4_000_000] {
+            let id = topic_chat_id(forum, topic);
+            assert!(id <= TOPIC_CHAT_ID_BASE);
+            assert_eq!(split_topic_chat_id(id), Some((forum, topic)));
+        }
+        assert_eq!(split_topic_chat_id(forum), None);
+        assert_eq!(split_topic_chat_id(42), None);
+    }
+
+    #[test]
+    fn msg_in_chat_routes_topics() {
+        let forum = -1_001_000_000_001;
+        let open = topic_chat_id(forum, 5);
+        let mut m = Msg { chat_id: forum, topic_id: Some(5), ..Msg::default() };
+        assert!(msg_in_chat(&m, open));
+        m.topic_id = Some(6);
+        assert!(!msg_in_chat(&m, open));
+        m.topic_id = None;
+        assert!(msg_in_chat(&m, topic_chat_id(forum, 1)));
+        assert!(!msg_in_chat(&m, open));
+        assert!(msg_in_chat(&m, forum));
+        m.chat_id = 9;
+        assert!(!msg_in_chat(&m, forum));
     }
 }

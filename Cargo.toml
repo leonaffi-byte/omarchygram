@@ -8,7 +8,10 @@ libc = "0.2"
 async-channel = "2.5.0"
 chrono = "0.4.45"
 dirs = "6.0.0"
+flate2 = "1"
 grammers-client = { version = "0.10.0", features = ["markdown"] }
+# Wave 6A audio playback (playbin3 with rate control); video goes through GTK's own media backend.
+gstreamer = "0.25"
 grammers-session = "0.10.0"
 grammers-tl-types = "0.10.0"
 gtk4 = { version = "0.11.4", features = ["v4_12"] }
@@ -17,5 +20,8 @@ libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "multipart"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# Wave 6D animated (.tgs) stickers: ThorVG vendored, software rasterizer only
+# (decided 2026-09-03 after the renderer spike; see specs/spec-wave6.md §5.1).
+thorvg = { version = "=0.5.1", default-features = false, features = ["vendored", "std", "lottie", "threads"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "io-util"] }
 toml = "1.1.4"

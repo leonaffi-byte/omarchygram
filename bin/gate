@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# The HARD acceptance gate for any UI change (CLAUDE.md): every run goes
+# through bin/headless, must exit 0 with G_DEBUG=fatal-criticals, and must
+# actually traverse (>= 50 "[probe]" lines).
+#   bin/gate            # full gate: 6 probes + 3 auth + 1 latency + 2 uistate seeds
+#   bin/gate quick      # one probe + one auth run (while iterating)
+set -uo pipefail
+cd "$(dirname "$0")/.."
+bin=./target/debug/omarchygram
+[ -x "$bin" ] || { echo "gate: build first (cargo build)" >&2; exit 2; }
+logs=${GATE_LOGS:-target/gate-logs}
+mkdir -p "$logs"
+fail=0
+run() {
+  local name=$1; shift
+  local log="$logs/$name.log"
+  bin/headless env G_DEBUG=fatal-criticals OMG_PROBE_TRACE=1 "$@" timeout 110 "$bin" --smoke --probe >"$log" 2>&1
+  local code=$?
+  local steps
+  steps=$(grep -c '^\[probe\]' "$log" || true)
+  if [ "$code" -ne 0 ] || [ "$steps" -lt 50 ]; then
+    echo "FAIL $name (exit $code, $steps probe lines) — $log"
+    tail -n 4 "$log" | sed 's/^/    /'
+    fail=1
+  else
+    echo "ok   $name ($steps probe lines)"
+  fi
+}
+seed() {
+  local f
+  f=$(mktemp -t omg-uistate.XXXXXX.toml)
+  printf '%s\n' "$@" >"$f"
+  echo "$f"
+}
+if [ "${1:-}" = quick ]; then
+  run probe-1
+  run auth-1 OMG_MOCK_AUTH=1
+else
+  for i in 1 2 3 4 5 6; do run "probe-$i"; done
+  for i in 1 2 3; do run "auth-$i" OMG_MOCK_AUTH=1; done
+  run latency OMG_MOCK_LATENCY_MS=400
+  s1=$(seed 'info_panel_open = true' 'info_width = 360')
+  run seed-info OMG_UISTATE_PATH="$s1"
+  s2=$(seed 'sidebar_width = 260' 'folder_id = 1')
+  run seed-sidebar OMG_UISTATE_PATH="$s2"
+  rm -f "$s1" "$s2"
+fi
+[ "$fail" -eq 0 ] && echo "gate: PASS" || { echo "gate: FAIL"; exit 1; }

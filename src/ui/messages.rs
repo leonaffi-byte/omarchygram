@@ -2155,6 +2155,11 @@ impl MessagesView {
                 | MediaKind::Gif
                 | MediaKind::Audio
                 | MediaKind::VideoNote
+                | MediaKind::Location
+                | MediaKind::Venue
+                | MediaKind::Contact
+                | MediaKind::Dice
+                | MediaKind::Poll
                 | MediaKind::Unsupported,
             ) => {
                 let button = media_card(message);
@@ -4176,6 +4181,11 @@ impl MessagesView {
                 | MediaKind::Gif
                 | MediaKind::Audio
                 | MediaKind::VideoNote
+                | MediaKind::Location
+                | MediaKind::Venue
+                | MediaKind::Contact
+                | MediaKind::Dice
+                | MediaKind::Poll
                 | MediaKind::Unsupported,
             ) => {
                 if let (Some(button), Some(base)) = (button, base) {
@@ -5211,6 +5221,30 @@ fn media_title(message: &Msg) -> String {
         Some(MediaKind::Gif) => message.doc_name.clone().unwrap_or_else(|| "GIF".into()),
         Some(MediaKind::Audio) => message.doc_name.clone().unwrap_or_else(|| "Audio".into()),
         Some(MediaKind::VideoNote) => "Video message".to_string(),
+        Some(MediaKind::Location) => "Location".to_string(),
+        Some(MediaKind::Venue) => message
+            .location
+            .as_ref()
+            .map(|l| l.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Venue".into()),
+        Some(MediaKind::Contact) => message
+            .contact
+            .as_ref()
+            .map(|c| format!("{} {}", c.first_name, c.last_name).trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Contact".into()),
+        Some(MediaKind::Dice) => message
+            .dice
+            .as_ref()
+            .map(|d| format!("{} {}", d.emoji, if d.value > 0 { d.value.to_string() } else { "rolling…".into() }))
+            .unwrap_or_else(|| "Dice".into()),
+        Some(MediaKind::Poll) => message
+            .poll
+            .as_ref()
+            .map(|p| p.question.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Poll".into()),
         Some(MediaKind::Unsupported) => "Unsupported message".to_string(),
         None => "Message".to_string(),
     }

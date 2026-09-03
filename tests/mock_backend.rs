@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use omarchygram::tg::{AuthState, Event, Tg};
+use omarchygram::tg::{topic_chat_id, AuthState, ChatKind, Event, GeoPoint, MediaKind, PollDraft, Tg};
 
 /// Generous upper bound: the mock's scripted reply lands after ~2s.
 const EVENT_WAIT: Duration = Duration::from_secs(5);
@@ -34,7 +34,7 @@ async fn dialogs_are_the_mock_chats_newest_first() {
 
     let chats = tg.get_dialogs().await.expect("get_dialogs()");
 
-    assert_eq!(chats.len(), 7, "expected the seven mock chats: {chats:?}");
+    assert_eq!(chats.len(), 12, "expected the twelve mock chats: {chats:?}");
     // Pinned chats first, then newest first within each group.
     for pair in chats.windows(2) {
         assert!(
@@ -208,4 +208,261 @@ async fn download_media_returns_an_existing_file_or_nothing() {
             path.display()
         );
     }
+}
+
+// ===================== wave 6 =====================
+
+/// Waits for the first event `pick` accepts, dropping the others.
+async fn wait_event<T>(tg: &Tg, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
+    let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = tokio::time::timeout(remaining, tg.events.recv())
+            .await
+            .expect("timed out waiting for an event")
+            .expect("event channel closed");
+        if let Some(found) = pick(&event) {
+            return found;
+        }
+    }
+}
+
+async fn chat_titled(tg: &Tg, title: &str) -> i64 {
+    tg.get_dialogs()
+        .await
+        .expect("get_dialogs()")
+        .into_iter()
+        .find(|c| c.title == title)
+        .unwrap_or_else(|| panic!("no mock chat titled {title}"))
+        .id
+}
+
+#[tokio::test]
+async fn media_lab_has_every_wave6_kind() {
+    let tg = started_mock().await;
+    let lab = chat_titled(&tg, "Media Lab").await;
+    let history = tg.get_history(lab, None).await.expect("history");
+    for kind in [
+        MediaKind::Voice,
+        MediaKind::Audio,
+        MediaKind::Video,
+        MediaKind::VideoNote,
+        MediaKind::Gif,
+        MediaKind::Location,
+        MediaKind::Venue,
+        MediaKind::Contact,
+        MediaKind::Dice,
+        MediaKind::Sticker,
+    ] {
+        assert!(history.iter().any(|m| m.media == Some(kind)), "missing {kind:?}");
+    }
+    let live = history.iter().find(|m| m.location.as_ref().is_some_and(|l| l.live.is_some())).expect("a live location");
+    assert!(!live.location.as_ref().unwrap().live.as_ref().unwrap().stopped);
+    let venue = history.iter().find(|m| m.media == Some(MediaKind::Venue)).unwrap();
+    assert_eq!(venue.location.as_ref().unwrap().title, "Café Einstein");
+    assert!(history.iter().any(|m| m.contact.as_ref().is_some_and(|c| c.user_id.is_none())), "a contact without user id");
+    assert!(history.iter().any(|m| m.dice.as_ref().is_some_and(|d| d.value == 0)), "a rolling dice");
+    let music = history.iter().find(|m| m.media == Some(MediaKind::Audio)).unwrap();
+    assert_eq!(music.audio_title.as_deref(), Some("Night Drive"));
+    let sticker = history.iter().find(|m| m.media == Some(MediaKind::Sticker)).unwrap();
+    let path = tg.download_media(lab, sticker.id).await.expect("download").expect("tgs path");
+    assert_eq!(path.extension().and_then(|e| e.to_str()), Some("tgs"));
+    let map = tg.download_media(lab, venue.id).await.expect("download").expect("map path");
+    assert_eq!(map.extension().and_then(|e| e.to_str()), Some("png"));
+    let tile = tg.download_map(GeoPoint { lat: 1.0, lon: 2.0 }, 12, 96, 96).await.expect("map").expect("tile");
+    assert!(tile.exists());
+    let tgs = tg.download_sticker(9104).await.expect("download_sticker").expect("animated sticker file");
+    assert_eq!(tgs.extension().and_then(|e| e.to_str()), Some("tgs"));
+}
+
+#[tokio::test]
+async fn polls_vote_retract_and_quiz() {
+    let tg = started_mock().await;
+    let polls = chat_titled(&tg, "Polls").await;
+    let history = tg.get_history(polls, None).await.expect("history");
+    let open = history.iter().find(|m| m.poll.as_ref().is_some_and(|p| !p.voted && !p.closed && !p.quiz && !p.multiple_choice)).unwrap();
+    let before = open.poll.clone().unwrap();
+    tg.send_vote(polls, open.id, vec![1]).await.expect("vote");
+    let poll = wait_event(&tg, |e| match e {
+        Event::PollChanged { poll_id, poll } if *poll_id == before.id => Some(poll.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(poll.voted);
+    assert!(poll.options[1].chosen);
+    assert_eq!(poll.options[1].voters, before.options[1].voters + 1);
+    assert_eq!(poll.total_voters, before.total_voters + 1);
+    assert!(tg.send_vote(polls, open.id, vec![0]).await.is_err(), "voting twice must fail");
+
+    tg.send_vote(polls, open.id, vec![]).await.expect("retract");
+    let poll = wait_event(&tg, |e| match e {
+        Event::PollChanged { poll_id, poll } if *poll_id == before.id => Some(poll.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(!poll.voted);
+    assert_eq!(poll.total_voters, before.total_voters);
+
+    let quiz = history.iter().find(|m| m.poll.as_ref().is_some_and(|p| p.quiz)).unwrap();
+    tg.send_vote(polls, quiz.id, vec![0]).await.expect("quiz vote");
+    let poll = wait_event(&tg, |e| match e {
+        Event::PollChanged { poll_id, poll } if *poll_id == quiz.poll.as_ref().unwrap().id => Some(poll.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(poll.options[0].correct, Some(false));
+    assert_eq!(poll.options[1].correct, Some(true));
+    assert!(poll.solution.is_some());
+    assert!(tg.send_vote(polls, quiz.id, vec![]).await.is_err(), "quiz answers cannot be retracted");
+
+    let closed = history.iter().find(|m| m.poll.as_ref().is_some_and(|p| p.closed)).unwrap();
+    assert!(tg.send_vote(polls, closed.id, vec![0]).await.is_err());
+
+    let draft = PollDraft {
+        question: "Lunch?".into(),
+        options: vec!["Ramen".into(), "Pizza".into(), "".into()],
+        anonymous: true,
+        multiple_choice: false,
+        quiz: false,
+        correct_option: None,
+        solution: None,
+    };
+    let sent = tg.send_poll(polls, draft).await.expect("send_poll");
+    assert_eq!(sent.media, Some(MediaKind::Poll));
+    assert_eq!(sent.poll.as_ref().unwrap().options.len(), 2, "empty options are dropped");
+    assert!(tg.send_poll(polls, PollDraft { question: "x".into(), options: vec!["a".into()], ..PollDraft::default() }).await.is_err());
+}
+
+#[tokio::test]
+async fn scheduled_messages_round_trip() {
+    let tg = started_mock().await;
+    let list = tg.get_scheduled(1).await.expect("get_scheduled");
+    assert_eq!(list.len(), 2);
+    assert!(list.iter().all(|m| m.scheduled));
+    assert!(list[0].ts <= list[1].ts, "soonest first");
+    let at = chrono::Local::now() + chrono::Duration::hours(1);
+    tg.send_text_at(1, "later", None, at).await.expect("send_text_at");
+    wait_event(&tg, |e| matches!(e, Event::ScheduledChanged { chat_id: 1 }).then_some(())).await;
+    let list = tg.get_scheduled(1).await.unwrap();
+    assert_eq!(list.len(), 3);
+    assert!(tg.send_text_at(1, "past", None, chrono::Local::now() - chrono::Duration::hours(1)).await.is_err());
+    let first = list[0].id;
+    tg.send_scheduled_now(1, vec![first]).await.expect("send now");
+    let landed = wait_event(&tg, |e| match e {
+        Event::NewMessage(m) if m.chat_id == 1 && m.text == list[0].text => Some(m.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(!landed.scheduled);
+    assert_eq!(tg.get_scheduled(1).await.unwrap().len(), 2);
+    let history = tg.get_history(1, None).await.unwrap();
+    assert!(history.iter().any(|m| m.id == landed.id));
+    let rest: Vec<i32> = tg.get_scheduled(1).await.unwrap().iter().map(|m| m.id).collect();
+    tg.delete_scheduled(1, rest).await.expect("delete");
+    assert!(tg.get_scheduled(1).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn forum_topics_and_topic_chat_ids() {
+    let tg = started_mock().await;
+    let forum = tg.get_dialogs().await.unwrap().into_iter().find(|c| c.forum).expect("a forum dialog");
+    assert_eq!(forum.title, "Omarchy Forum");
+    assert!(forum.unread >= 3, "forum unread sums its topics: {}", forum.unread);
+    let topics = tg.get_topics(forum.id).await.expect("get_topics");
+    assert_eq!(topics.len(), 4);
+    assert!(topics[0].pinned, "pinned topic first: {topics:?}");
+    let themes = topics.iter().find(|t| t.title == "Themes").unwrap();
+    assert_eq!(themes.unread, 3);
+    assert_eq!(themes.chat_id, topic_chat_id(forum.id, themes.id));
+    let history = tg.get_history(themes.chat_id, None).await.expect("topic history");
+    assert_eq!(history.len(), 8);
+    assert!(history.iter().all(|m| m.chat_id == forum.id && m.topic_id == Some(themes.id)));
+    let sent = tg.send_text(themes.chat_id, "porting now", None).await.expect("send in topic");
+    assert_eq!(sent.chat_id, forum.id);
+    assert_eq!(sent.topic_id, Some(themes.id));
+    let reply = wait_event(&tg, |e| match e {
+        Event::NewMessage(m) if !m.outgoing && m.chat_id == forum.id => Some(m.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(reply.topic_id, Some(themes.id), "the mock reply lands in the same topic");
+    tg.mark_read(themes.chat_id, reply.id).await.expect("mark_read on a topic");
+    let created = tg.create_topic(forum.id, "Keyboards").await.expect("create_topic");
+    wait_event(&tg, |e| matches!(e, Event::TopicsChanged { forum_id } if *forum_id == forum.id).then_some(())).await;
+    assert!(tg.get_topics(forum.id).await.unwrap().iter().any(|t| t.id == created.id));
+    assert!(tg.get_history(created.chat_id, None).await.unwrap().is_empty());
+    assert!(tg.get_topics(1).await.is_err(), "not a forum");
+}
+
+#[tokio::test]
+async fn bot_keyboard_and_commands() {
+    let tg = started_mock().await;
+    let bot = chat_titled(&tg, "Omarchy Bot").await;
+    let info = tg.get_chat_info(bot).await.expect("chat info");
+    assert_eq!(info.kind, ChatKind::Bot);
+    assert!(info.bot_commands.iter().any(|c| c.command == "theme"));
+    let history = tg.get_history(bot, None).await.unwrap();
+    let keyed = history.iter().find(|m| m.keyboard.is_some()).expect("a keyboard message");
+    let keyboard = keyed.keyboard.clone().unwrap();
+    assert_eq!(keyboard.rows.len(), 3);
+    let lock = match &keyboard.rows[0][1].kind {
+        omarchygram::tg::ButtonKind::Callback(data) => data.clone(),
+        other => panic!("expected a callback button, got {other:?}"),
+    };
+    assert_eq!(tg.press_button(bot, keyed.id, lock).await.unwrap(), Some("Locked (mock)".to_string()));
+    let next = match &keyboard.rows[0][0].kind {
+        omarchygram::tg::ButtonKind::Callback(data) => data.clone(),
+        other => panic!("expected a callback button, got {other:?}"),
+    };
+    assert_eq!(tg.press_button(bot, keyed.id, next).await.unwrap(), None);
+    let changed = wait_event(&tg, |e| match e {
+        Event::MessageChanged(m) if m.id == keyed.id => Some(m.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(changed.keyboard.unwrap().rows[0][0].text, "Next theme ✓");
+    let helper = chat_titled(&tg, "Helper Bot").await;
+    assert!(tg.get_history(helper, None).await.unwrap().is_empty(), "the Start button fixture is empty");
+}
+
+#[tokio::test]
+async fn stories_and_live_location() {
+    let tg = started_mock().await;
+    let peers = tg.get_story_peers().await.expect("story peers");
+    assert_eq!(peers[0].name, "Marta");
+    assert!(peers[0].unread);
+    let stories = tg.get_stories(1).await.unwrap();
+    assert_eq!(stories.len(), 2);
+    assert!(stories[1].video);
+    let photo = tg.download_story(1, stories[0].id).await.expect("download_story");
+    assert!(photo.is_none_or(|p| p.exists()));
+    tg.mark_stories_seen(1, 2).await.unwrap();
+    wait_event(&tg, |e| matches!(e, Event::StoriesChanged).then_some(())).await;
+    let peers = tg.get_story_peers().await.unwrap();
+    assert!(!peers.iter().find(|p| p.chat_id == 1).unwrap().unread);
+    let marta = tg.get_dialogs().await.unwrap().into_iter().find(|c| c.id == 1).unwrap();
+    assert_eq!(marta.story_ring, omarchygram::tg::StoryRing::Read);
+
+    let sent = tg.send_live_location(1, GeoPoint { lat: 52.5, lon: 13.4 }, 900).await.expect("live");
+    let live = sent.location.as_ref().and_then(|l| l.live.as_ref()).expect("live payload");
+    assert_eq!(live.period_secs, 900);
+    tg.update_live_location(1, sent.id, GeoPoint { lat: 52.6, lon: 13.4 }).await.expect("update");
+    let moved = wait_event(&tg, |e| match e {
+        Event::MessageChanged(m) if m.id == sent.id => Some(m.clone()),
+        _ => None,
+    })
+    .await;
+    assert!((moved.location.as_ref().unwrap().point.lat - 52.6).abs() < 1e-9);
+    tg.stop_live_location(1, sent.id).await.expect("stop");
+    let stopped = wait_event(&tg, |e| match e {
+        Event::MessageChanged(m) if m.id == sent.id => Some(m.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(stopped.location.unwrap().live.unwrap().stopped);
+    assert!(tg.update_live_location(1, sent.id, GeoPoint { lat: 1.0, lon: 1.0 }).await.is_err());
+    let plain = tg.send_location(1, GeoPoint { lat: 1.0, lon: 2.0 }).await.unwrap();
+    assert_eq!(plain.media, Some(MediaKind::Location));
+    tg.add_contact(5007, "Alex", "Petrov", "+7 900").await.expect("add_contact");
+    assert!(tg.add_contact(5008, "", "", "").await.is_err());
 }

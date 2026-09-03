@@ -44,6 +44,11 @@ fn media_str(m: Option<MediaKind>) -> Option<&'static str> {
         Some(MediaKind::Gif) => Some("gif"),
         Some(MediaKind::Audio) => Some("audio"),
         Some(MediaKind::VideoNote) => Some("video_note"),
+        Some(MediaKind::Location) => Some("location"),
+        Some(MediaKind::Venue) => Some("venue"),
+        Some(MediaKind::Contact) => Some("contact"),
+        Some(MediaKind::Dice) => Some("dice"),
+        Some(MediaKind::Poll) => Some("poll"),
         Some(MediaKind::Unsupported) => Some("unsupported"),
         None => None,
     }
@@ -60,6 +65,11 @@ fn media_kind(s: &Option<String>) -> Option<MediaKind> {
         Some("unsupported") => Some(MediaKind::Unsupported),
         Some("voice") => Some(MediaKind::Voice),
         Some("document") => Some(MediaKind::Document),
+        Some("location") => Some(MediaKind::Location),
+        Some("venue") => Some(MediaKind::Venue),
+        Some("contact") => Some(MediaKind::Contact),
+        Some("dice") => Some(MediaKind::Dice),
+        Some("poll") => Some(MediaKind::Poll),
         _ => None,
     }
 }

@@ -37,6 +37,35 @@ pub struct Settings {
     /// Keyboard overrides: action id -> GTK accelerator name (see `key_actions`).
     /// Missing = the action's default; "" = unbound.
     pub keys: BTreeMap<String, String>,
+    pub media: MediaSettings,
+}
+
+/// Wave 6 playback/rendering preferences (specs/spec-wave6.md §1.8).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MediaSettings {
+    /// GIFs and video stickers loop while visible.
+    pub autoplay_gifs: bool,
+    /// Video circles autoplay muted while visible.
+    pub autoplay_video_notes: bool,
+    /// Remembered voice/music speed: 1.0, 1.5 or 2.0.
+    pub voice_speed: f64,
+    /// false → animated stickers show their first frame only.
+    pub animated_stickers: bool,
+    /// false → no map tiles are fetched; location cards show coordinates only.
+    pub map_tiles: bool,
+}
+
+impl Default for MediaSettings {
+    fn default() -> Self {
+        MediaSettings {
+            autoplay_gifs: true,
+            autoplay_video_notes: true,
+            voice_speed: 1.0,
+            animated_stickers: true,
+            map_tiles: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -134,6 +163,7 @@ impl Default for Settings {
             animations: BTreeMap::new(),
             ui: UiSettings::default(),
             keys: BTreeMap::new(),
+            media: MediaSettings::default(),
         }
     }
 }

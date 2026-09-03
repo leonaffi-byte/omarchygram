@@ -35,6 +35,26 @@ pub const SAVE: &str = "\u{f0c7}";
 pub const STOP: &str = "\u{f04d}";
 pub const GHOST: &str = "\u{f02a0}";
 pub const COMPOSER_CURSOR: &str = "\u{258c}";
+// ----- wave 6 (specs/spec-wave6.md §1.9) -----
+pub const PLAY: &str = "\u{f04b}";
+pub const PAUSE: &str = "\u{f04c}";
+pub const VOLUME: &str = "\u{f028}";
+pub const VOLUME_OFF: &str = "\u{f026}";
+pub const FULLSCREEN: &str = "\u{f065}";
+pub const LOCATION: &str = "\u{f041}";
+pub const PHONE: &str = "\u{f095}";
+pub const POLL: &str = "\u{f080}";
+pub const DICE: &str = "\u{f522}";
+pub const CALENDAR: &str = "\u{f073}";
+pub const SCHEDULE: &str = "\u{f017}";
+pub const TOPIC: &str = "\u{f292}";
+pub const ROBOT: &str = "\u{f06a9}";
+pub const CAMERA: &str = "\u{f030}";
+pub const STORY: &str = "\u{f111}";
+pub const LIVE: &str = "\u{f1eb}";
+pub const ADD: &str = "\u{f067}";
+pub const EXTERNAL: &str = "\u{f08e}";
+pub const SPEED: &str = "\u{f0e7}";
 
 #[cfg(test)]
 mod tests {
@@ -79,6 +99,25 @@ mod tests {
         STOP,
         GHOST,
         COMPOSER_CURSOR,
+        PLAY,
+        PAUSE,
+        VOLUME,
+        VOLUME_OFF,
+        FULLSCREEN,
+        LOCATION,
+        PHONE,
+        POLL,
+        DICE,
+        CALENDAR,
+        SCHEDULE,
+        TOPIC,
+        ROBOT,
+        CAMERA,
+        STORY,
+        LIVE,
+        ADD,
+        EXTERNAL,
+        SPEED,
     ];
 
     #[test]

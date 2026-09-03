@@ -15,12 +15,148 @@ use chrono::{DateTime, Duration, Local};
 use tokio::sync::mpsc;
 
 use super::{
-    AuthState, BackendFlags, ChatInfo, ChatKind, ChatSummary, Command, Contact, Event, Folder, Gif,
-    Me, MediaKind, Member, MemberRole, Msg, MsgVersion, MuteMode, Presence, Reaction, SharedKind,
-    Span, SpanKind, Sticker, StickerPack, WebPreview, parse_markdown, paths, reject, to_markdown,
+    AuthState, BackendFlags, BotCommand, ButtonKind, ChatInfo, ChatKind, ChatSummary, Command, Contact,
+    ContactCard, DiceInfo, Event, Folder, GeoPoint, Gif, KeyButton, Keyboard, LiveLocation, LocationInfo,
+    Me, MediaKind, Member, MemberRole, Msg, MsgVersion, MuteMode, Poll, PollOption, Presence, Reaction,
+    SharedKind, Span, SpanKind, Sticker, StickerPack, Story, StoryPeer, StoryRing, Topic, WebPreview,
+    parse_markdown, paths, reject, split_topic_chat_id, to_markdown, topic_chat_id,
 };
 
 pub const ME_ID: i64 = 424242;
+/// Mock forum supergroup (wave 6E); a channel-style id so topic ids encode.
+pub const FORUM_ID: i64 = -1_001_000_000_011;
+const MEDIA_LAB: i64 = 8;
+const POLLS: i64 = 9;
+const BOT: i64 = 7007;
+const HELPER_BOT: i64 = 7008;
+const ALEX: i64 = 5007;
+
+/// Bundled minimal Lottie sticker (a spinning flame), gzip-compressed like a real .tgs.
+const FIRE_TGS: &[u8] = include_bytes!("fixtures/fire.tgs");
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.is_empty())
+}
+
+/// Playable mock media, rendered on first use with ffmpeg into the media
+/// cache (`mock-voice.ogg`, `mock-music.ogg`, `mock-video.mp4`,
+/// `mock-note.mp4`, `mock-gif.mp4`). None without ffmpeg (or with
+/// OMG_MOCK_NO_FFMPEG=1), which the UI must show as "unavailable".
+async fn mock_media(name: &str) -> Option<PathBuf> {
+    if env_flag("OMG_MOCK_NO_FFMPEG") {
+        return None;
+    }
+    let dir = paths::media_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("mock-{name}"));
+    if path.exists() {
+        return Some(path);
+    }
+    let (muxer, args): (&str, Vec<&str>) = match name {
+        "voice.ogg" => ("ogg", vec!["-f", "lavfi", "-i", "sine=frequency=440:duration=3", "-c:a", "libopus", "-b:a", "32k"]),
+        "music.ogg" => (
+            "ogg",
+            vec![
+                "-f", "lavfi", "-i", "sine=frequency=330:duration=3", "-metadata", "title=Night Drive", "-metadata",
+                "artist=Marta", "-c:a", "libopus", "-b:a", "48k",
+            ],
+        ),
+        "video.mp4" => (
+            "mp4",
+            vec![
+                "-f", "lavfi", "-i", "testsrc=duration=3:size=320x240:rate=15", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+            ],
+        ),
+        "note.mp4" => (
+            "mp4",
+            vec![
+                "-f", "lavfi", "-i", "testsrc=duration=3:size=240x240:rate=15", "-f", "lavfi", "-i",
+                "sine=frequency=520:duration=3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+            ],
+        ),
+        "gif.mp4" => (
+            "mp4",
+            vec!["-f", "lavfi", "-i", "testsrc=duration=2:size=200x150:rate=10", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p"],
+        ),
+        _ => return None,
+    };
+    let tmp = dir.join(format!("mock-{name}.{}.tmp", std::process::id()));
+    let run = tokio::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .args(&args)
+        .arg("-f")
+        .arg(muxer)
+        .arg(&tmp)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let ok = matches!(tokio::time::timeout(std::time::Duration::from_secs(30), run).await, Ok(Ok(st)) if st.success());
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return path.exists().then_some(path);
+    }
+    Some(path)
+}
+
+/// The bundled animated sticker, written to the media cache.
+fn mock_tgs() -> Option<PathBuf> {
+    let dir = paths::media_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("mock-fire.tgs");
+    if !path.exists() {
+        std::fs::write(&path, FIRE_TGS).ok()?;
+    }
+    Some(path)
+}
+
+/// A synthetic "map tile": neutral ground, a street grid offset by the
+/// coordinates (so neighbouring grid cells differ), a center marker.
+fn mock_map(point: GeoPoint, zoom: u8, width: u32, height: u32) -> Option<PathBuf> {
+    let dir = paths::media_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let key = format!("mock-map-{:.4}_{:.4}_{zoom}_{width}x{height}.png", point.lat, point.lon);
+    let path = dir.join(key);
+    if path.exists() {
+        return Some(path);
+    }
+    let width = width.clamp(16, 2048);
+    let height = height.clamp(16, 2048);
+    let ox = ((point.lat.abs() * 1000.0) as u32) % 40;
+    let oy = ((point.lon.abs() * 1000.0) as u32) % 40;
+    let mut img = image::RgbaImage::from_pixel(width, height, image::Rgba([0xe6, 0xe2, 0xd8, 0xff]));
+    for y in 0..height {
+        for x in 0..width {
+            let street = (x + ox) % 40 < 3 || (y + oy) % 40 < 3;
+            let avenue = (x + ox) % 120 < 6 || (y + oy) % 120 < 6;
+            if avenue {
+                img.put_pixel(x, y, image::Rgba([0xf6, 0xd9, 0x8a, 0xff]));
+            } else if street {
+                img.put_pixel(x, y, image::Rgba([0xff, 0xff, 0xff, 0xff]));
+            }
+        }
+    }
+    let (cx, cy) = (width as i32 / 2, height as i32 / 2);
+    for y in (cy - 8).max(0)..(cy + 8).min(height as i32) {
+        for x in (cx - 8).max(0)..(cx + 8).min(width as i32) {
+            let d2 = (x - cx).pow(2) + (y - cy).pow(2);
+            if d2 <= 36 {
+                img.put_pixel(x as u32, y as u32, image::Rgba([0xd0, 0x3a, 0x2f, 0xff]));
+            } else if d2 <= 64 {
+                img.put_pixel(x as u32, y as u32, image::Rgba([0xff, 0xff, 0xff, 0xff]));
+            }
+        }
+    }
+    img.save(&path).ok()?;
+    Some(path)
+}
 
 fn t(minutes_ago: i64) -> DateTime<Local> {
     Local::now() - Duration::minutes(minutes_ago)
@@ -80,6 +216,9 @@ struct MockChat {
     mentions: i32,
     phone: String,
     is_contact: bool,
+    forum: bool,
+    story_ring: StoryRing,
+    bot_commands: Vec<BotCommand>,
 }
 
 fn chat(id: i64, title: &str, kind: ChatKind) -> MockChat {
@@ -100,6 +239,9 @@ fn chat(id: i64, title: &str, kind: ChatKind) -> MockChat {
         mentions: 0,
         phone: String::new(),
         is_contact: false,
+        forum: false,
+        story_ring: StoryRing::None,
+        bot_commands: Vec::new(),
     }
 }
 
@@ -195,6 +337,15 @@ struct MockState {
     folders: Vec<Folder>,
     /// Commands that already failed once (OMG_MOCK_FAIL_ONCE).
     failed_once: HashSet<&'static str>,
+    // ----- wave 6 -----
+    /// Scheduled messages per chat (`Msg::scheduled`, `ts` = send time).
+    scheduled: HashMap<i64, Vec<Msg>>,
+    /// Forum topics per forum id (histories live under the topic's synthetic chat id).
+    topics: HashMap<i64, Vec<Topic>>,
+    /// Stories per peer, oldest first.
+    stories: HashMap<i64, Vec<Story>>,
+    /// Quiz answer keys: poll id -> correct option index.
+    quiz_correct: HashMap<i64, usize>,
 }
 
 impl MockState {
@@ -238,7 +389,79 @@ impl MockState {
         c.members = Some(4);
         chats.insert(7, c);
 
+        let mut c = chat(MEDIA_LAB, "Media Lab", ChatKind::Group);
+        c.members = Some(3);
+        c.about = "Every media kind Telegram knows, for the eyes.".into();
+        chats.insert(MEDIA_LAB, c);
+        let mut c = chat(POLLS, "Polls", ChatKind::Group);
+        c.members = Some(12);
+        chats.insert(POLLS, c);
+        let mut c = chat(BOT, "Omarchy Bot", ChatKind::Bot);
+        c.username = "omarchy_bot".into();
+        c.about = "Controls the desktop (mock).".into();
+        c.bot_commands = vec![
+            BotCommand { command: "start".into(), description: "Start the bot".into() },
+            BotCommand { command: "help".into(), description: "List what I can do".into() },
+            BotCommand { command: "theme".into(), description: "Switch the Omarchy theme".into() },
+            BotCommand { command: "screenshot".into(), description: "Take a screenshot".into() },
+        ];
+        chats.insert(BOT, c);
+        let mut c = chat(HELPER_BOT, "Helper Bot", ChatKind::Bot);
+        c.username = "omarchy_helper_bot".into();
+        c.bot_commands = vec![
+            BotCommand { command: "start".into(), description: "Start the bot".into() },
+            BotCommand { command: "help".into(), description: "Show help".into() },
+        ];
+        chats.insert(HELPER_BOT, c);
+        let mut c = chat(FORUM_ID, "Omarchy Forum", ChatKind::Group);
+        c.forum = true;
+        c.members = Some(240);
+        c.username = "omarchy_forum".into();
+        c.about = "Themes, bugs and everything else — in topics.".into();
+        chats.insert(FORUM_ID, c);
+        if let Some(c) = chats.get_mut(&1) {
+            c.story_ring = StoryRing::Unread;
+        }
+
         let mut history = HashMap::new();
+        history.insert(MEDIA_LAB, media_lab_messages());
+        history.insert(POLLS, poll_messages());
+        history.insert(BOT, bot_messages());
+        history.insert(HELPER_BOT, Vec::new());
+        let (topics, topic_histories) = forum_fixture();
+        for (chat_id, msgs) in topic_histories {
+            history.insert(chat_id, msgs);
+        }
+        let mut topics_map = HashMap::new();
+        topics_map.insert(FORUM_ID, topics);
+        let mut quiz_correct = HashMap::new();
+        quiz_correct.insert(9002, 1);
+        let mut scheduled = HashMap::new();
+        scheduled.insert(
+            1,
+            vec![
+                Msg {
+                    scheduled: true,
+                    ..msg(5001, 1, "Marta", "You", "morning! don't forget the ridge photos", tomorrow_at(9, 0), true)
+                },
+                Msg {
+                    scheduled: true,
+                    ..msg(5002, 1, "Marta", "You", "see you at the gallery", Local::now() + Duration::days(3) - Duration::hours(Local::now().format("%H").to_string().parse::<i64>().unwrap_or(0)) + Duration::hours(18) + Duration::minutes(30) - Duration::minutes(Local::now().format("%M").to_string().parse::<i64>().unwrap_or(0)), true)
+                },
+            ],
+        );
+        let mut stories = HashMap::new();
+        stories.insert(
+            1,
+            vec![
+                Story { id: 1, chat_id: 1, ts: t(180), expires: Local::now() + Duration::hours(21), video: false, duration: None, caption: "fog on the ridge".into(), seen: false },
+                Story { id: 2, chat_id: 1, ts: t(60), expires: Local::now() + Duration::hours(23), video: true, duration: Some(3), caption: String::new(), seen: false },
+            ],
+        );
+        stories.insert(
+            ALEX,
+            vec![Story { id: 1, chat_id: ALEX, ts: t(600), expires: Local::now() + Duration::hours(14), video: false, duration: None, caption: "new build farm".into(), seen: true }],
+        );
         history.insert(
             1,
             vec![
@@ -498,6 +721,7 @@ impl MockState {
                 phone: "+1 555 0142".into(),
                 presence: Presence::Online,
                 has_photo: true,
+            story_ring: StoryRing::None,
             },
             Contact {
                 user_id: 2,
@@ -506,6 +730,7 @@ impl MockState {
                 phone: String::new(),
                 presence: Presence::LastSeen(t(140)),
                 has_photo: false,
+            story_ring: StoryRing::None,
             },
             Contact {
                 user_id: 3,
@@ -514,6 +739,7 @@ impl MockState {
                 phone: "+1 555 0101".into(),
                 presence: Presence::LastWeek,
                 has_photo: false,
+            story_ring: StoryRing::None,
             },
             Contact {
                 user_id: 5005,
@@ -522,6 +748,16 @@ impl MockState {
                 phone: "+1 555 0177".into(),
                 presence: Presence::Recently,
                 has_photo: false,
+            story_ring: StoryRing::None,
+            },
+            Contact {
+                user_id: ALEX,
+                name: "Alex Petrov".into(),
+                username: "alexp".into(),
+                phone: "+7 900 000 0000".into(),
+                presence: Presence::Recently,
+                has_photo: false,
+                story_ring: StoryRing::Read,
             },
             Contact {
                 user_id: 5006,
@@ -530,6 +766,7 @@ impl MockState {
                 phone: "+81 90 0000 0000".into(),
                 presence: Presence::LastMonth,
                 has_photo: false,
+            story_ring: StoryRing::None,
             },
         ];
         let folders = vec![
@@ -549,7 +786,17 @@ impl MockState {
             next_id: 1000,
             next_chat_id: 100,
             chats,
-            unread: HashMap::from([(1, 1), (2, 0), (3, 0), (4, 3), (5, 0), (ME_ID, 0), (7, 0)]),
+            unread: HashMap::from([
+                (1, 1),
+                (2, 0),
+                (3, 0),
+                (4, 3),
+                (5, 0),
+                (ME_ID, 0),
+                (7, 0),
+                (MEDIA_LAB, 2),
+                (topic_chat_id(FORUM_ID, 20), 3),
+            ]),
             history,
             sent_files: HashMap::new(),
             flags: BackendFlags::default(),
@@ -561,7 +808,57 @@ impl MockState {
             contacts,
             folders,
             failed_once: HashSet::new(),
+            scheduled,
+            topics: topics_map,
+            stories,
+            quiz_correct,
         }
+    }
+
+    /// Messages of a chat, or of every topic when `chat_id` is a forum.
+    fn messages_of(&self, chat_id: i64) -> Vec<Msg> {
+        if let Some(topics) = self.topics.get(&chat_id) {
+            let mut all: Vec<Msg> = topics
+                .iter()
+                .filter_map(|t| self.history.get(&t.chat_id))
+                .flatten()
+                .cloned()
+                .collect();
+            all.sort_by_key(|m| (m.ts, m.id));
+            return all;
+        }
+        self.history.get(&chat_id).cloned().unwrap_or_default()
+    }
+
+    fn find_mut(&mut self, chat_id: i64, msg_id: i32) -> Option<&mut Msg> {
+        let key = if self.topics.contains_key(&chat_id) {
+            self.topics[&chat_id]
+                .iter()
+                .map(|t| t.chat_id)
+                .find(|id| self.history.get(id).is_some_and(|v| v.iter().any(|m| m.id == msg_id)))?
+        } else {
+            chat_id
+        };
+        self.history.get_mut(&key)?.iter_mut().find(|m| m.id == msg_id)
+    }
+
+    fn topics_of(&self, forum_id: i64) -> Vec<Topic> {
+        let mut out: Vec<Topic> = self
+            .topics
+            .get(&forum_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut t| {
+                let last = self.history.get(&t.chat_id).and_then(|v| v.last());
+                t.last_message = last.map(MockState::preview).unwrap_or_default();
+                t.last_time = last.map(|m| m.ts);
+                t.unread = *self.unread.get(&t.chat_id).unwrap_or(&0);
+                t
+            })
+            .collect();
+        out.sort_by_key(|t| (std::cmp::Reverse(t.pinned), std::cmp::Reverse(t.last_time)));
+        out
     }
 
     fn preview(m: &Msg) -> String {
@@ -581,12 +878,18 @@ impl MockState {
             Some(MediaKind::Gif) => "[GIF]".into(),
             Some(MediaKind::Audio) => "[audio]".into(),
             Some(MediaKind::VideoNote) => "[video message]".into(),
+            Some(MediaKind::Location) => "[location]".into(),
+            Some(MediaKind::Venue) => "[venue]".into(),
+            Some(MediaKind::Contact) => "[contact]".into(),
+            Some(MediaKind::Dice) => format!("{} [dice]", m.dice.as_ref().map(|d| d.emoji.as_str()).unwrap_or("")).trim().to_string(),
+            Some(MediaKind::Poll) => format!("[poll] {}", m.poll.as_ref().map(|p| p.question.as_str()).unwrap_or("")).trim().to_string(),
             Some(MediaKind::Unsupported) => "[unsupported]".into(),
             None => String::new(),
         }
     }
 
     fn chat_title(&self, chat_id: i64) -> String {
+        let chat_id = split_topic_chat_id(chat_id).map(|(f, _)| f).unwrap_or(chat_id);
         self.chats
             .get(&chat_id)
             .map(|c| c.title.clone())
@@ -594,7 +897,8 @@ impl MockState {
     }
 
     fn summary(&self, c: &MockChat) -> ChatSummary {
-        let msgs = self.history.get(&c.id);
+        let forum_msgs = c.forum.then(|| self.messages_of(c.id));
+        let msgs = if c.forum { forum_msgs.as_ref() } else { self.history.get(&c.id) };
         let last = msgs.and_then(|m| m.last());
         let last_sender = match (c.kind, last) {
             (ChatKind::Group, Some(m)) => {
@@ -616,7 +920,11 @@ impl MockState {
             last_time: last.map(|m| m.ts),
             last_msg_id: last.map(|m| m.id).unwrap_or(0),
             last_outgoing: last.is_some_and(|m| m.outgoing),
-            unread: *self.unread.get(&c.id).unwrap_or(&0),
+            unread: if c.forum {
+                self.topics.get(&c.id).map(|ts| ts.iter().map(|t| *self.unread.get(&t.chat_id).unwrap_or(&0)).sum()).unwrap_or(0)
+            } else {
+                *self.unread.get(&c.id).unwrap_or(&0)
+            },
             mentions: c.mentions,
             unread_mark: c.unread_mark,
             read_inbox_max_id: *self.read_inbox.get(&c.id).unwrap_or(&0),
@@ -627,10 +935,15 @@ impl MockState {
             presence: c.presence,
             has_photo: c.has_photo,
             draft: c.draft.clone(),
+            forum: c.forum,
+            story_ring: c.story_ring,
         }
     }
 
     fn find(&self, chat_id: i64, msg_id: i32) -> Option<Msg> {
+        if self.topics.contains_key(&chat_id) {
+            return self.messages_of(chat_id).into_iter().find(|m| m.id == msg_id);
+        }
         self.history
             .get(&chat_id)
             .and_then(|v| v.iter().find(|m| m.id == msg_id))
@@ -649,8 +962,16 @@ impl MockState {
             })
     }
 
-    fn push(&mut self, chat_id: i64, m: Msg) {
-        self.history.entry(chat_id).or_default().push(m);
+    /// Appends to a chat; messages of a topic get the forum's chat id and
+    /// their `topic_id` (they arrive that way from the real backend too).
+    fn push(&mut self, chat_id: i64, mut m: Msg) -> Msg {
+        if let Some((forum_id, topic_id)) = split_topic_chat_id(chat_id) {
+            m.chat_id = forum_id;
+            m.topic_id = Some(topic_id);
+            m.chat_title = self.chat_title(forum_id);
+        }
+        self.history.entry(chat_id).or_default().push(m.clone());
+        m
     }
 
     fn all_messages_newest_first(&self) -> Vec<Msg> {
@@ -840,7 +1161,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             respond,
         } => {
             let st = st.lock().unwrap();
-            let msgs = st.history.get(&chat_id).cloned().unwrap_or_default();
+            let msgs = st.messages_of(chat_id);
             let mut result = match before_id {
                 None => msgs,
                 Some(before) => {
@@ -882,13 +1203,14 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             respond,
         } => {
             // Spawned: downloads must never block other commands.
-            let (media, doc_name, sent_path) = {
+            let (media, doc_name, sent_path, point) = {
                 let st = st.lock().unwrap();
                 let found = st.find(chat_id, msg_id);
                 (
                     found.as_ref().and_then(|m| m.media),
                     found.as_ref().and_then(|m| m.doc_name.clone()),
                     st.sent_files.get(&msg_id).cloned(),
+                    found.as_ref().and_then(|m| m.location.as_ref()).map(|l| l.point),
                 )
             };
             tokio::spawn(async move {
@@ -898,13 +1220,18 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     Some(p)
                 } else {
                     match media {
-                        Some(MediaKind::Photo | MediaKind::Sticker) => {
-                            sample_image_n(msg_id as usize)
+                        Some(MediaKind::Sticker) if doc_name.as_deref() == Some("fire.tgs") => mock_tgs(),
+                        Some(MediaKind::Photo | MediaKind::Sticker) => sample_image_n(msg_id as usize),
+                        Some(MediaKind::Document) => sample_document(doc_name.as_deref().unwrap_or("file.txt")),
+                        Some(MediaKind::Voice) => mock_media("voice.ogg").await,
+                        Some(MediaKind::Audio) => mock_media("music.ogg").await,
+                        Some(MediaKind::Video) => mock_media("video.mp4").await,
+                        Some(MediaKind::VideoNote) => mock_media("note.mp4").await,
+                        Some(MediaKind::Gif) => mock_media("gif.mp4").await,
+                        Some(MediaKind::Location | MediaKind::Venue) => {
+                            point.and_then(|p| mock_map(p, 15, 320, 180))
                         }
-                        Some(MediaKind::Document | MediaKind::Audio | MediaKind::Video) => {
-                            sample_document(doc_name.as_deref().unwrap_or("file.txt"))
-                        }
-                        // Voice/gif playback files are not mocked; UI shows "unavailable".
+                        // Contact, dice and polls have no file behind them.
                         _ => None,
                     }
                 };
@@ -947,7 +1274,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     reply_to,
                     ..fmt_msg(st.next_id, chat_id, &title, "You", &text, t(0), true)
                 };
-                st.push(chat_id, sent.clone());
+                let sent = st.push(chat_id, sent);
                 st.next_id += 1; // reserve the reply's id
                 if let Some(c) = st.chats.get_mut(&chat_id) {
                     c.draft.clear();
@@ -1006,7 +1333,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     ..fmt_msg(st.next_id, chat_id, &title, "You", &caption, t(0), true)
                 };
                 st.sent_files.insert(sent.id, path);
-                st.push(chat_id, sent.clone());
+                let sent = st.push(chat_id, sent);
                 sent
             };
             schedule_read(st.clone(), &events, chat_id, sent.id);
@@ -1028,7 +1355,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     ..msg(st.next_id, chat_id, &title, "You", "", t(0), true)
                 };
                 st.sent_files.insert(sent.id, path);
-                st.push(chat_id, sent.clone());
+                let sent = st.push(chat_id, sent);
                 sent
             };
             schedule_read(st.clone(), &events, chat_id, sent.id);
@@ -1039,9 +1366,8 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             sticker_id,
             respond,
         } => {
-            let r = if sticker_id == 9104 {
-                Err("animated stickers cannot be sent from Omarchygram yet".to_string())
-            } else {
+            // Animated stickers are sendable since wave 6 (the UI renders them via 6D).
+            let r = {
                 let mut st = st.lock().unwrap();
                 st.next_id += 1;
                 let title = st.chat_title(chat_id);
@@ -1050,7 +1376,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     sticker_emoji: Some(sticker_emoji(sticker_id).into()),
                     ..msg(st.next_id, chat_id, &title, "You", "", t(0), true)
                 };
-                st.push(chat_id, sent.clone());
+                let sent = st.push(chat_id, sent);
                 Ok(sent)
             };
             let _ = respond.send(r);
@@ -1068,7 +1394,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                 doc_name: Some(format!("gif-{gif_id}.mp4")),
                 ..msg(st.next_id, chat_id, &title, "You", "", t(0), true)
             };
-            st.push(chat_id, sent.clone());
+            let sent = st.push(chat_id, sent);
             let _ = respond.send(Ok(sent));
         }
         Command::EditText {
@@ -1162,7 +1488,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     if let Some(p) = st.sent_files.get(&o.id).cloned() {
                         st.sent_files.insert(copy.id, p);
                     }
-                    st.push(to_chat, copy.clone());
+                    let copy = st.push(to_chat, copy);
                     out.push(copy);
                 }
                 out
@@ -1292,7 +1618,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                         });
                     }
                 }
-                if contains_ci("omarchy_bot", q) || contains_ci("Omarchy Bot", q) {
+                if !st.chats.contains_key(&BOT) && (contains_ci("omarchy_bot", q) || contains_ci("Omarchy Bot", q)) {
                     out.push(ChatSummary {
                         id: 7007,
                         title: "Omarchy Bot".into(),
@@ -1520,6 +1846,8 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     has_photo: c.has_photo,
                     muted: c.muted,
                     is_contact: c.is_contact,
+                    bot_commands: c.bot_commands.clone(),
+                    forum: c.forum,
                 }),
                 None => match st.contacts.iter().find(|c| c.user_id == chat_id) {
                     Some(c) => Ok(ChatInfo {
@@ -1718,6 +2046,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     id,
                     emoji: sticker_emoji(id).into(),
                     animated: id == 9104,
+                    video: false,
                 })
                 .collect();
             let _ = respond.send(Ok(out));
@@ -1729,7 +2058,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
                 let _ = respond.send(Ok(if sticker_id == 9104 {
-                    None
+                    mock_tgs()
                 } else {
                     sample_image_n(sticker_id as usize)
                 }));
@@ -1750,11 +2079,784 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             ]));
         }
         Command::DownloadGif { gif_id, respond } => {
-            // No mp4 fixture for any id; the UI shows the card fallback.
             let _wanted = gif_id;
-            let _ = respond.send(Ok(None));
+            tokio::spawn(async move {
+                let _ = respond.send(Ok(mock_media("gif.mp4").await));
+            });
+        }
+        // ===================== wave 6 =====================
+        Command::DownloadMap { point, zoom, width, height, respond } => {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                let _ = respond.send(Ok(mock_map(point, zoom, width, height)));
+            });
+        }
+        Command::SendVote { chat_id, msg_id, options, respond } => {
+            let (r, changed) = {
+                let mut st = st.lock().unwrap();
+                let quiz_keys = st.quiz_correct.clone();
+                match st.find_mut(chat_id, msg_id).and_then(|m| m.poll.as_mut()) {
+                    None => (Err("not a poll".to_string()), None),
+                    Some(poll) if poll.closed => (Err("this poll is closed".to_string()), None),
+                    Some(poll) => {
+                        if options.is_empty() {
+                            if poll.quiz && poll.voted {
+                                (Err("quiz answers can't be retracted".to_string()), None)
+                            } else {
+                                for o in poll.options.iter_mut() {
+                                    if o.chosen {
+                                        o.chosen = false;
+                                        o.voters = (o.voters - 1).max(0);
+                                    }
+                                    o.correct = None;
+                                }
+                                if poll.voted {
+                                    poll.total_voters = (poll.total_voters - 1).max(0);
+                                }
+                                poll.voted = false;
+                                (Ok(()), Some(poll.clone()))
+                            }
+                        } else if poll.voted {
+                            (Err("already voted".to_string()), None)
+                        } else if options.iter().any(|&i| i >= poll.options.len()) {
+                            (Err("no such option".to_string()), None)
+                        } else if !poll.multiple_choice && options.len() > 1 {
+                            (Err("this poll allows one answer".to_string()), None)
+                        } else {
+                            for &i in &options {
+                                poll.options[i].chosen = true;
+                                poll.options[i].voters += 1;
+                            }
+                            poll.total_voters += 1;
+                            poll.voted = true;
+                            if poll.quiz {
+                                let key = quiz_keys.get(&poll.id).copied().unwrap_or(0);
+                                for (i, o) in poll.options.iter_mut().enumerate() {
+                                    o.correct = Some(i == key);
+                                }
+                            }
+                            (Ok(()), Some(poll.clone()))
+                        }
+                    }
+                }
+            };
+            let _ = respond.send(r);
+            if let Some(poll) = changed {
+                let events = events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    let _ = events.send(Event::PollChanged { poll_id: poll.id, poll }).await;
+                });
+            }
+        }
+        Command::AddContact { user_id, first_name, last_name, phone, respond } => {
+            let mut st = st.lock().unwrap();
+            let name = format!("{first_name} {last_name}").trim().to_string();
+            if name.is_empty() {
+                let _ = respond.send(Err("a name is required".to_string()));
+                return;
+            }
+            if let Some(c) = st.contacts.iter_mut().find(|c| c.user_id == user_id) {
+                c.name = name;
+            } else {
+                st.contacts.push(Contact {
+                    user_id,
+                    name,
+                    username: String::new(),
+                    phone,
+                    presence: Presence::Unknown,
+                    has_photo: false,
+                    story_ring: StoryRing::None,
+                });
+            }
+            if let Some(c) = st.chats.get_mut(&user_id) {
+                c.is_contact = true;
+            }
+            let _ = respond.send(Ok(()));
+        }
+        Command::SendPoll { chat_id, draft, respond } => {
+            let r = {
+                let mut st = st.lock().unwrap();
+                let n = draft.options.iter().filter(|o| !o.trim().is_empty()).count();
+                if draft.question.trim().is_empty() {
+                    Err("the poll needs a question".to_string())
+                } else if !(2..=10).contains(&n) {
+                    Err("a poll needs 2 to 10 options".to_string())
+                } else if draft.quiz && draft.correct_option.is_none_or(|i| i >= n) {
+                    Err("a quiz needs a correct answer".to_string())
+                } else {
+                    st.next_id += 1;
+                    let id = st.next_id;
+                    let poll_id = 9_000_000 + id as i64;
+                    if let Some(i) = draft.correct_option.filter(|_| draft.quiz) {
+                        st.quiz_correct.insert(poll_id, i);
+                    }
+                    let title = st.chat_title(chat_id);
+                    let sent = Msg {
+                        media: Some(MediaKind::Poll),
+                        poll: Some(Poll {
+                            id: poll_id,
+                            question: draft.question.trim().to_string(),
+                            options: draft
+                                .options
+                                .iter()
+                                .filter(|o| !o.trim().is_empty())
+                                .map(|o| PollOption { text: o.trim().to_string(), ..PollOption::default() })
+                                .collect(),
+                            total_voters: 0,
+                            closed: false,
+                            public_voters: !draft.anonymous,
+                            multiple_choice: draft.multiple_choice && !draft.quiz,
+                            quiz: draft.quiz,
+                            voted: false,
+                            solution: draft.solution.filter(|s| !s.trim().is_empty()),
+                            close_date: None,
+                        }),
+                        ..msg(id, chat_id, &title, "You", "", t(0), true)
+                    };
+                    let sent = st.push(chat_id, sent);
+                    Ok(sent)
+                }
+            };
+            let _ = respond.send(r);
+        }
+        Command::SendLocation { chat_id, point, respond } => {
+            let mut st = st.lock().unwrap();
+            st.next_id += 1;
+            let title = st.chat_title(chat_id);
+            let sent = Msg {
+                media: Some(MediaKind::Location),
+                location: Some(LocationInfo { point, ..LocationInfo::default() }),
+                ..msg(st.next_id, chat_id, &title, "You", "", t(0), true)
+            };
+            let sent = st.push(chat_id, sent);
+            let _ = respond.send(Ok(sent));
+        }
+        Command::SendTextAt { chat_id, text, reply_to, at, respond } => {
+            if at <= Local::now() {
+                let _ = respond.send(Err("the time is in the past".to_string()));
+                return;
+            }
+            {
+                let mut st = st.lock().unwrap();
+                st.next_id += 1;
+                let title = st.chat_title(chat_id);
+                let m = Msg { reply_to, scheduled: true, ..fmt_msg(st.next_id, chat_id, &title, "You", &text, at, true) };
+                st.scheduled.entry(chat_id).or_default().push(m);
+            }
+            let _ = respond.send(Ok(()));
+            let _ = events.send(Event::ScheduledChanged { chat_id }).await;
+        }
+        Command::SendFileAt { chat_id, path, caption, at, respond } => {
+            if at <= Local::now() {
+                let _ = respond.send(Err("the time is in the past".to_string()));
+                return;
+            }
+            {
+                let mut st = st.lock().unwrap();
+                st.next_id += 1;
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let title = st.chat_title(chat_id);
+                let m = Msg {
+                    media: Some(MediaKind::Document),
+                    doc_name: Some(name),
+                    doc_size: std::fs::metadata(&path).map(|m| m.len()).ok(),
+                    scheduled: true,
+                    ..fmt_msg(st.next_id, chat_id, &title, "You", &caption, at, true)
+                };
+                st.sent_files.insert(m.id, path);
+                st.scheduled.entry(chat_id).or_default().push(m);
+            }
+            let _ = respond.send(Ok(()));
+            let _ = events.send(Event::ScheduledChanged { chat_id }).await;
+        }
+        Command::GetScheduled { chat_id, respond } => {
+            let st = st.lock().unwrap();
+            let mut list = st.scheduled.get(&chat_id).cloned().unwrap_or_default();
+            list.sort_by_key(|m| m.ts);
+            let _ = respond.send(Ok(list));
+        }
+        Command::SendScheduledNow { chat_id, ids, respond } => {
+            let sent: Vec<Msg> = {
+                let mut st = st.lock().unwrap();
+                let mut out = Vec::new();
+                let mut taken = Vec::new();
+                if let Some(list) = st.scheduled.get_mut(&chat_id) {
+                    let mut keep = Vec::new();
+                    for m in list.drain(..) {
+                        if ids.contains(&m.id) {
+                            taken.push(m);
+                        } else {
+                            keep.push(m);
+                        }
+                    }
+                    *list = keep;
+                }
+                for mut m in taken {
+                    let old = m.id;
+                    st.next_id += 1;
+                    m.id = st.next_id;
+                    m.scheduled = false;
+                    m.ts = Local::now();
+                    if let Some(p) = st.sent_files.remove(&old) {
+                        st.sent_files.insert(m.id, p);
+                    }
+                    let m = st.push(chat_id, m);
+                    out.push(st.find(chat_id, m.id).unwrap_or(m));
+                }
+                out
+            };
+            let _ = respond.send(Ok(()));
+            for m in sent {
+                let _ = events.send(Event::NewMessage(m)).await;
+            }
+            let _ = events.send(Event::ScheduledChanged { chat_id }).await;
+        }
+        Command::DeleteScheduled { chat_id, ids, respond } => {
+            {
+                let mut st = st.lock().unwrap();
+                if let Some(list) = st.scheduled.get_mut(&chat_id) {
+                    list.retain(|m| !ids.contains(&m.id));
+                }
+            }
+            let _ = respond.send(Ok(()));
+            let _ = events.send(Event::ScheduledChanged { chat_id }).await;
+        }
+        Command::PressButton { chat_id, msg_id, data, respond } => {
+            let (r, changed) = {
+                let mut st = st.lock().unwrap();
+                match st.find_mut(chat_id, msg_id) {
+                    None => (Err("message not found".to_string()), None),
+                    Some(m) => match data.as_slice() {
+                        b"lock" => (Ok(Some("Locked (mock)".to_string())), None),
+                        b"next_theme" => {
+                            if let Some(first) = m.keyboard.as_mut().and_then(|k| k.rows.first_mut()).and_then(|r| r.first_mut()) {
+                                first.text = "Next theme ✓".to_string();
+                            }
+                            (Ok(None), Some(m.clone()))
+                        }
+                        _ => (Ok(None), None),
+                    },
+                }
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let _ = respond.send(r);
+            if let Some(m) = changed {
+                let _ = events.send(Event::MessageChanged(m)).await;
+            }
+        }
+        Command::GetTopics { forum_id, respond } => {
+            let st = st.lock().unwrap();
+            let r = if st.topics.contains_key(&forum_id) {
+                Ok(st.topics_of(forum_id))
+            } else {
+                Err("not a forum".to_string())
+            };
+            let _ = respond.send(r);
+        }
+        Command::CreateTopic { forum_id, title, respond } => {
+            let r = {
+                let mut st = st.lock().unwrap();
+                if title.trim().is_empty() {
+                    Err("the topic needs a title".to_string())
+                } else if !st.topics.contains_key(&forum_id) {
+                    Err("not a forum".to_string())
+                } else {
+                    st.next_id += 1;
+                    let id = st.next_id;
+                    let topic = Topic {
+                        id,
+                        chat_id: topic_chat_id(forum_id, id),
+                        forum_id,
+                        title: title.trim().to_string(),
+                        icon_emoji: String::new(),
+                        unread: 0,
+                        last_message: String::new(),
+                        last_time: Some(Local::now()),
+                        pinned: false,
+                        closed: false,
+                    };
+                    st.history.entry(topic.chat_id).or_default();
+                    st.topics.entry(forum_id).or_default().push(topic.clone());
+                    Ok(topic)
+                }
+            };
+            let ok = r.is_ok();
+            let _ = respond.send(r);
+            if ok {
+                let _ = events.send(Event::TopicsChanged { forum_id }).await;
+            }
+        }
+        Command::SendVideoNote { chat_id, path, duration, size, respond } => {
+            let sent = {
+                let mut st = st.lock().unwrap();
+                st.next_id += 1;
+                let title = st.chat_title(chat_id);
+                let sent = Msg {
+                    media: Some(MediaKind::VideoNote),
+                    duration: Some(duration),
+                    photo_size: Some((size as i32, size as i32)),
+                    round: true,
+                    doc_size: std::fs::metadata(&path).map(|m| m.len()).ok(),
+                    ..msg(st.next_id, chat_id, &title, "You", "", t(0), true)
+                };
+                st.sent_files.insert(sent.id, path);
+                let sent = st.push(chat_id, sent);
+                sent
+            };
+            schedule_read(st.clone(), &events, chat_id, sent.id);
+            let _ = respond.send(Ok(sent));
+        }
+        Command::SendLiveLocation { chat_id, point, period_secs, respond } => {
+            let mut st = st.lock().unwrap();
+            st.next_id += 1;
+            let title = st.chat_title(chat_id);
+            let now = Local::now();
+            let sent = Msg {
+                media: Some(MediaKind::Location),
+                location: Some(LocationInfo {
+                    point,
+                    live: Some(LiveLocation {
+                        period_secs,
+                        expires: now + Duration::seconds(period_secs as i64),
+                        last_update: now,
+                        heading: None,
+                        stopped: false,
+                    }),
+                    ..LocationInfo::default()
+                }),
+                ..msg(st.next_id, chat_id, &title, "You", "", t(0), true)
+            };
+            let sent = st.push(chat_id, sent);
+            let _ = respond.send(Ok(sent));
+        }
+        Command::UpdateLiveLocation { chat_id, msg_id, point, respond } => {
+            let changed = {
+                let mut st = st.lock().unwrap();
+                match st.find_mut(chat_id, msg_id).and_then(|m| m.location.as_mut().map(|l| (l, m.id))) {
+                    Some((l, _)) if l.live.as_ref().is_some_and(|live| !live.stopped) => {
+                        l.point = point;
+                        if let Some(live) = l.live.as_mut() {
+                            live.last_update = Local::now();
+                        }
+                        Ok(())
+                    }
+                    Some(_) => Err("this location is not live".to_string()),
+                    None => Err("message not found".to_string()),
+                }
+            };
+            let ok = changed.is_ok();
+            let _ = respond.send(changed);
+            if ok {
+                let m = st.lock().unwrap().find(chat_id, msg_id);
+                if let Some(m) = m {
+                    let _ = events.send(Event::MessageChanged(m)).await;
+                }
+            }
+        }
+        Command::StopLiveLocation { chat_id, msg_id, respond } => {
+            let r = {
+                let mut st = st.lock().unwrap();
+                match st.find_mut(chat_id, msg_id).and_then(|m| m.location.as_mut()).and_then(|l| l.live.as_mut()) {
+                    Some(live) => {
+                        live.stopped = true;
+                        Ok(())
+                    }
+                    None => Err("this location is not live".to_string()),
+                }
+            };
+            let ok = r.is_ok();
+            let _ = respond.send(r);
+            if ok {
+                let m = st.lock().unwrap().find(chat_id, msg_id);
+                if let Some(m) = m {
+                    let _ = events.send(Event::MessageChanged(m)).await;
+                }
+            }
+        }
+        Command::GetStoryPeers(tx) => {
+            let st = st.lock().unwrap();
+            let mut peers: Vec<StoryPeer> = st
+                .stories
+                .iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(&chat_id, v)| {
+                    let (name, has_photo) = st
+                        .chats
+                        .get(&chat_id)
+                        .map(|c| (c.title.clone(), c.has_photo))
+                        .or_else(|| st.contacts.iter().find(|c| c.user_id == chat_id).map(|c| (c.name.clone(), c.has_photo)))
+                        .unwrap_or_else(|| ("Someone".into(), false));
+                    StoryPeer { chat_id, name, unread: v.iter().any(|s| !s.seen), has_photo }
+                })
+                .collect();
+            peers.sort_by_key(|p| (std::cmp::Reverse(p.unread), p.name.clone()));
+            let _ = tx.send(Ok(peers));
+        }
+        Command::GetStories { chat_id, respond } => {
+            let st = st.lock().unwrap();
+            let _ = respond.send(Ok(st.stories.get(&chat_id).cloned().unwrap_or_default()));
+        }
+        Command::DownloadStory { chat_id, story_id, respond } => {
+            let video = st
+                .lock()
+                .unwrap()
+                .stories
+                .get(&chat_id)
+                .and_then(|v| v.iter().find(|s| s.id == story_id))
+                .map(|s| s.video);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let path = match video {
+                    Some(true) => mock_media("video.mp4").await,
+                    Some(false) => sample_image_n((chat_id.unsigned_abs() as usize).wrapping_add(story_id as usize)),
+                    None => None,
+                };
+                let _ = respond.send(Ok(path));
+            });
+        }
+        Command::MarkStoriesSeen { chat_id, up_to_id, respond } => {
+            let changed = {
+                let mut st = st.lock().unwrap();
+                let mut changed = false;
+                if let Some(v) = st.stories.get_mut(&chat_id) {
+                    for s in v.iter_mut().filter(|s| s.id <= up_to_id && !s.seen) {
+                        s.seen = true;
+                        changed = true;
+                    }
+                }
+                let all_seen = st.stories.get(&chat_id).is_some_and(|v| v.iter().all(|s| s.seen));
+                let ring = if all_seen { StoryRing::Read } else { StoryRing::Unread };
+                if let Some(c) = st.chats.get_mut(&chat_id) {
+                    c.story_ring = ring;
+                }
+                if let Some(c) = st.contacts.iter_mut().find(|c| c.user_id == chat_id) {
+                    c.story_ring = ring;
+                }
+                changed
+            };
+            let _ = respond.send(Ok(()));
+            if changed {
+                let _ = events.send(Event::StoriesChanged).await;
+                let _ = events.send(Event::DialogsChanged).await;
+            }
         }
     }
+}
+
+/// Tomorrow at HH:MM local time.
+fn tomorrow_at(hour: u32, minute: u32) -> DateTime<Local> {
+    let tomorrow = Local::now().date_naive() + Duration::days(1);
+    tomorrow
+        .and_hms_opt(hour, minute, 0)
+        .and_then(|naive| naive.and_local_timezone(Local).single())
+        .unwrap_or_else(|| Local::now() + Duration::days(1))
+}
+
+fn geo(id: i32, sender: &str, minutes_ago: i64, lat: f64, lon: f64) -> Msg {
+    Msg {
+        media: Some(MediaKind::Location),
+        location: Some(LocationInfo { point: GeoPoint { lat, lon }, ..LocationInfo::default() }),
+        sender_id: Some(if sender == "Marta" { 1 } else { 4001 }),
+        ..msg(id, MEDIA_LAB, "Media Lab", sender, "", t(minutes_ago), false)
+    }
+}
+
+/// "Media Lab": every wave-6 media kind once (specs/spec-wave6.md §1.10).
+fn media_lab_messages() -> Vec<Msg> {
+    let now = Local::now();
+    let mut live = geo(807, "Marta", 30, 52.5163, 13.3777);
+    live.location.as_mut().unwrap().live = Some(LiveLocation {
+        period_secs: 3600,
+        expires: now + Duration::minutes(45),
+        last_update: now - Duration::minutes(2),
+        heading: Some(90),
+        stopped: false,
+    });
+    let mut venue = geo(806, "Robin", 34, 52.5033, 13.3559);
+    venue.media = Some(MediaKind::Venue);
+    if let Some(l) = venue.location.as_mut() {
+        l.title = "Café Einstein".into();
+        l.address = "Kurfürstenstraße 58, Berlin".into();
+    }
+    vec![
+        Msg {
+            media: Some(MediaKind::Voice),
+            duration: Some(3),
+            doc_size: Some(14_200),
+            sender_id: Some(1),
+            ..msg(800, MEDIA_LAB, "Media Lab", "Marta", "", t(60), false)
+        },
+        Msg {
+            media: Some(MediaKind::Audio),
+            duration: Some(3),
+            doc_name: Some("night-drive.ogg".into()),
+            doc_size: Some(48_000),
+            audio_title: Some("Night Drive".into()),
+            audio_performer: Some("Marta".into()),
+            sender_id: Some(1),
+            ..msg(801, MEDIA_LAB, "Media Lab", "Marta", "", t(58), false)
+        },
+        Msg {
+            media: Some(MediaKind::Video),
+            duration: Some(3),
+            doc_name: Some("ridge.mp4".into()),
+            doc_size: Some(180_000),
+            photo_size: Some((320, 240)),
+            sender_id: Some(4001),
+            ..msg(802, MEDIA_LAB, "Media Lab", "Robin", "test pattern from the ridge", t(52), false)
+        },
+        Msg {
+            media: Some(MediaKind::VideoNote),
+            duration: Some(3),
+            photo_size: Some((240, 240)),
+            round: true,
+            doc_size: Some(120_000),
+            sender_id: Some(1),
+            ..msg(803, MEDIA_LAB, "Media Lab", "Marta", "", t(50), false)
+        },
+        Msg {
+            media: Some(MediaKind::Gif),
+            doc_name: Some("loop.mp4".into()),
+            doc_size: Some(40_000),
+            photo_size: Some((200, 150)),
+            duration: Some(2),
+            sender_id: Some(4001),
+            ..msg(804, MEDIA_LAB, "Media Lab", "Robin", "", t(44), false)
+        },
+        geo(805, "Marta", 40, 52.5200, 13.4050),
+        venue,
+        live,
+        Msg {
+            media: Some(MediaKind::Contact),
+            contact: Some(ContactCard {
+                first_name: "Marta".into(),
+                last_name: "Koenig".into(),
+                phone: "+49 30 1234567".into(),
+                user_id: Some(1),
+            }),
+            sender_id: Some(4001),
+            ..msg(808, MEDIA_LAB, "Media Lab", "Robin", "", t(26), false)
+        },
+        Msg {
+            media: Some(MediaKind::Contact),
+            contact: Some(ContactCard {
+                first_name: "Unknown".into(),
+                last_name: "Caller".into(),
+                phone: "+1 555 0199".into(),
+                user_id: None,
+            }),
+            sender_id: Some(4001),
+            ..msg(809, MEDIA_LAB, "Media Lab", "Robin", "", t(25), false)
+        },
+        Msg {
+            media: Some(MediaKind::Dice),
+            dice: Some(DiceInfo { emoji: "🎲".into(), value: 4 }),
+            sender_id: Some(1),
+            ..msg(810, MEDIA_LAB, "Media Lab", "Marta", "", t(20), false)
+        },
+        Msg {
+            media: Some(MediaKind::Dice),
+            dice: Some(DiceInfo { emoji: "🎯".into(), value: 6 }),
+            ..msg(811, MEDIA_LAB, "Media Lab", "You", "", t(19), true)
+        },
+        Msg {
+            media: Some(MediaKind::Dice),
+            dice: Some(DiceInfo { emoji: "🎲".into(), value: 0 }),
+            sender_id: Some(4001),
+            ..msg(812, MEDIA_LAB, "Media Lab", "Robin", "", t(18), false)
+        },
+        Msg {
+            media: Some(MediaKind::Sticker),
+            sticker_emoji: Some("🔥".into()),
+            doc_name: Some("fire.tgs".into()),
+            photo_size: Some((512, 512)),
+            sender_id: Some(1),
+            ..msg(813, MEDIA_LAB, "Media Lab", "Marta", "", t(10), false)
+        },
+    ]
+}
+
+fn poll(id: i32, minutes_ago: i64, poll: Poll) -> Msg {
+    Msg {
+        media: Some(MediaKind::Poll),
+        poll: Some(poll),
+        sender_id: Some(4001),
+        ..msg(id, POLLS, "Polls", "Robin", "", t(minutes_ago), false)
+    }
+}
+
+fn opts(items: &[(&str, i32)]) -> Vec<PollOption> {
+    items.iter().map(|(text, voters)| PollOption { text: (*text).into(), voters: *voters, chosen: false, correct: None }).collect()
+}
+
+/// "Polls": open, multiple-choice, quiz, closed and public-voted polls.
+fn poll_messages() -> Vec<Msg> {
+    let mut voted = opts(&[("Tokyo Night", 7), ("Catppuccin", 5), ("Gruvbox", 4)]);
+    voted[1].chosen = true;
+    vec![
+        poll(
+            900,
+            90,
+            Poll {
+                id: 9001,
+                question: "Which theme should be the default?".into(),
+                options: opts(&[("Tokyo Night", 5), ("Catppuccin", 4), ("Gruvbox", 2), ("Nord", 1)]),
+                total_voters: 12,
+                ..Poll::default()
+            },
+        ),
+        poll(
+            901,
+            80,
+            Poll {
+                id: 9003,
+                question: "Which editors do you use? (pick all)".into(),
+                options: opts(&[("Neovim", 6), ("Helix", 2), ("VS Code", 3), ("Zed", 1)]),
+                total_voters: 8,
+                multiple_choice: true,
+                ..Poll::default()
+            },
+        ),
+        poll(
+            902,
+            70,
+            Poll {
+                id: 9002,
+                question: "What does omarchy-theme-next do?".into(),
+                options: opts(&[("Installs a theme", 2), ("Switches to the next theme", 9), ("Removes the theme", 1)]),
+                total_voters: 12,
+                quiz: true,
+                solution: Some("It rotates through the installed themes in order.".into()),
+                ..Poll::default()
+            },
+        ),
+        poll(
+            903,
+            60,
+            Poll {
+                id: 9004,
+                question: "Meetup on Friday?".into(),
+                options: opts(&[("Yes", 8), ("No", 3)]),
+                total_voters: 11,
+                closed: true,
+                ..Poll::default()
+            },
+        ),
+        poll(
+            904,
+            50,
+            Poll {
+                id: 9005,
+                question: "Favorite wallpaper pack (public vote)".into(),
+                options: voted,
+                total_voters: 16,
+                public_voters: true,
+                voted: true,
+                ..Poll::default()
+            },
+        ),
+    ]
+}
+
+/// "Omarchy Bot": a welcome message and an inline keyboard.
+fn bot_messages() -> Vec<Msg> {
+    vec![
+        Msg {
+            sender_id: Some(BOT),
+            ..msg(7100, BOT, "Omarchy Bot", "Omarchy Bot", "Hi! I control the desktop. Type / to see my commands.", t(30), false)
+        },
+        Msg {
+            sender_id: Some(BOT),
+            keyboard: Some(Keyboard {
+                rows: vec![
+                    vec![
+                        KeyButton { text: "Next theme".into(), kind: ButtonKind::Callback(b"next_theme".to_vec()) },
+                        KeyButton { text: "Lock".into(), kind: ButtonKind::Callback(b"lock".to_vec()) },
+                    ],
+                    vec![KeyButton { text: "Docs".into(), kind: ButtonKind::Url("https://omarchy.org".into()) }],
+                    vec![KeyButton {
+                        text: "Search".into(),
+                        kind: ButtonKind::SwitchInline { query: "omarchy".into(), same_chat: true },
+                    }],
+                ],
+            }),
+            ..msg(7101, BOT, "Omarchy Bot", "Omarchy Bot", "What should I do?", t(29), false)
+        },
+    ]
+}
+
+/// "Omarchy Forum": four topics with their histories under synthetic chat ids.
+fn forum_fixture() -> (Vec<Topic>, Vec<(i64, Vec<Msg>)>) {
+    let topic = |id: i32, title: &str, icon: &str, pinned: bool, closed: bool| Topic {
+        id,
+        chat_id: topic_chat_id(FORUM_ID, id),
+        forum_id: FORUM_ID,
+        title: title.into(),
+        icon_emoji: icon.into(),
+        unread: 0,
+        last_message: String::new(),
+        last_time: None,
+        pinned,
+        closed,
+    };
+    let topics = vec![
+        topic(1, "General", "", false, false),
+        topic(20, "Themes", "🎨", false, false),
+        topic(40, "Bugs", "🐛", true, false),
+        topic(60, "Off-topic", "", false, true),
+    ];
+    let tm = |id: i32, topic_id: i32, sender: &str, text: &str, minutes_ago: i64| Msg {
+        topic_id: Some(topic_id),
+        sender_id: Some(if sender == "You" { ME_ID } else { 4001 + (sender.len() as i64 % 3) }),
+        ..msg(id, FORUM_ID, "Omarchy Forum", sender, text, t(minutes_ago), sender == "You")
+    };
+    let histories = vec![
+        (
+            topic_chat_id(FORUM_ID, 1),
+            vec![
+                tm(2, 1, "Robin", "Welcome to the forum. Pick a topic on the left.", 3000),
+                tm(3, 1, "Sam", "Rules: be nice, search before asking.", 2990),
+                tm(4, 1, "You", "hi all", 2500),
+                tm(5, 1, "Robin", "hey!", 2490),
+                tm(6, 1, "Yuki", "is there a topic for keyboards?", 900),
+            ],
+        ),
+        (
+            topic_chat_id(FORUM_ID, 20),
+            vec![
+                tm(21, 20, "Robin", "Theme requests go here.", 2000),
+                tm(22, 20, "Sam", "Rosé Pine dawn variant please", 1800),
+                tm(23, 20, "Yuki", "+1 for Rosé Pine", 1790),
+                tm(24, 20, "You", "I can port it this weekend", 1500),
+                tm(25, 20, "Robin", "the accent should follow the terminal", 120),
+                tm(26, 20, "Sam", "screenshot?", 100),
+                tm(27, 20, "Yuki", "looks great in the preview", 40),
+                tm(28, 20, "Robin", "merging tonight", 12),
+            ],
+        ),
+        (
+            topic_chat_id(FORUM_ID, 40),
+            vec![
+                tm(41, 40, "Robin", "Report bugs with omarchy-version output.", 2200),
+                tm(42, 40, "Yuki", "waybar overlaps the bar after resume", 1000),
+                tm(43, 40, "Sam", "reproduced on 2.1", 990),
+                tm(44, 40, "You", "fix is in the next release", 800),
+                tm(45, 40, "Yuki", "confirmed fixed, thanks", 60),
+            ],
+        ),
+        (
+            topic_chat_id(FORUM_ID, 60),
+            vec![
+                tm(61, 60, "Sam", "anyone at the meetup on friday?", 5000),
+                tm(62, 60, "Robin", "yes!", 4990),
+                tm(63, 60, "Yuki", "closing this one, use General", 4900),
+                tm(64, 60, "Robin", "ok", 4890),
+                tm(65, 60, "Sam", "👍", 4880),
+            ],
+        ),
+    ];
+    (topics, histories)
 }
 
 fn sticker_emoji(id: i64) -> &'static str {
@@ -1820,11 +2922,12 @@ fn schedule_reply(
                 false,
             )
         };
-        {
+        let reply = {
             let mut st = st.lock().unwrap();
-            st.push(chat_id, reply.clone());
+            let reply = st.push(chat_id, reply);
             *st.unread.entry(chat_id).or_insert(0) += 1;
-        }
+            reply
+        };
         let _ = events.send(Event::NewMessage(reply.clone())).await;
         match demo {
             Demo::None => {}

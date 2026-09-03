@@ -11,12 +11,12 @@
 //! Chat ids exposed to the UI are Bot-API dialog ids (what `PeerId`
 //! bitpacks): positive for users, negative for groups/channels — no collisions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use chrono::{Local, TimeZone};
+use chrono::{DateTime, Local, TimeZone};
 use grammers_client::client::UpdatesConfiguration;
 use grammers_client::media::{ChatPhoto, Document, Media};
 use grammers_client::peer::Role;
@@ -32,9 +32,10 @@ use tokio::sync::mpsc;
 
 use super::archive::Archive;
 use super::{
-    parse_markdown, paths, reject, to_markdown, AuthState, BackendFlags, ChatInfo, ChatKind, ChatSummary, Command,
-    Contact, Event, Folder, Gif, Me, MediaKind, Member, MemberRole, Msg, MuteMode, Presence, Reaction, SharedKind,
-    Span, SpanKind, Sticker, StickerPack, TgError, WebPreview,
+    parse_markdown, paths, reject, to_markdown, AuthState, BackendFlags, BotCommand, ButtonKind, ChatInfo, ChatKind,
+    ChatSummary, Command, Contact, ContactCard, DiceInfo, Event, Folder, GeoPoint, Gif, KeyButton, Keyboard,
+    LiveLocation, LocationInfo, Me, MediaKind, Member, MemberRole, Msg, MuteMode, Poll, PollOption, Presence, Reaction,
+    SharedKind, Span, SpanKind, Sticker, StickerPack, StoryRing, TgError, WebPreview,
 };
 
 /// Shared between the command loop, spawned data tasks, and the update loop.
@@ -53,6 +54,10 @@ struct Ctx {
     sticker_sets: Mutex<HashMap<i64, i64>>,
     /// Per-dialog facts from the last get_dialogs (folder membership).
     meta: Mutex<HashMap<i64, DialogMeta>>,
+    /// Forum supergroups (chat ids) seen in dialogs — their messages get `topic_id`.
+    forums: Mutex<HashSet<i64>>,
+    /// Story rings from the last stories fetch (wave 6F).
+    story_rings: Mutex<HashMap<i64, StoryRing>>,
 }
 
 #[derive(Clone, Copy)]
@@ -146,6 +151,8 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
             photos: Mutex::new(HashMap::new()),
             documents: Mutex::new(HashMap::new()),
             sticker_sets: Mutex::new(HashMap::new()),
+            forums: Mutex::new(HashSet::new()),
+            story_rings: Mutex::new(HashMap::new()),
             meta: Mutex::new(HashMap::new()),
         }),
         events,
@@ -352,6 +359,29 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
         Command::DownloadGif { gif_id, respond } => {
             let _ = respond.send(download_document_by_id(&client, &ctx, gif_id, false).await);
         }
+        // Wave 6 commands land in the real implementation commit; until then
+        // they fail cleanly instead of being mistaken for auth commands.
+        cmd @ (Command::DownloadMap { .. }
+        | Command::SendVote { .. }
+        | Command::AddContact { .. }
+        | Command::SendPoll { .. }
+        | Command::SendLocation { .. }
+        | Command::SendTextAt { .. }
+        | Command::SendFileAt { .. }
+        | Command::GetScheduled { .. }
+        | Command::SendScheduledNow { .. }
+        | Command::DeleteScheduled { .. }
+        | Command::PressButton { .. }
+        | Command::GetTopics { .. }
+        | Command::CreateTopic { .. }
+        | Command::SendVideoNote { .. }
+        | Command::SendLiveLocation { .. }
+        | Command::UpdateLiveLocation { .. }
+        | Command::StopLiveLocation { .. }
+        | Command::GetStoryPeers(_)
+        | Command::GetStories { .. }
+        | Command::DownloadStory { .. }
+        | Command::MarkStoriesSeen { .. }) => reject(cmd, "not available yet"),
         other => reject(other, "auth commands are handled serially"),
     }
 }
@@ -611,6 +641,8 @@ async fn get_dialogs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<ChatSummary>
             presence: facts.presence,
             has_photo: facts.photo_id.is_some(),
             draft,
+            forum: facts.forum,
+            story_ring: ctx.story_rings.lock().unwrap().get(&chat_id).copied().unwrap_or_default(),
         });
     }
     // The archive folder is not part of iter_dialogs; fetch it raw. A failure
@@ -649,7 +681,7 @@ async fn get_archived_dialogs(client: &Client, ctx: &Arc<Ctx>, now: i32) -> Resu
         let tl::enums::Dialog::Dialog(d) = dialog else { continue };
         let chat_id = peer_chat_id(&d.peer);
         // Resolve the peer from the response's user/chat lists.
-        let (title, kind, username, photo_id, presence, contact, peer_ref) = match &d.peer {
+        let (title, kind, username, photo_id, presence, contact, peer_ref, forum) = match &d.peer {
             tl::enums::Peer::User(pu) => {
                 let Some(tl::enums::User::User(u)) = users.iter().find(|u| matches!(u, tl::enums::User::User(x) if x.id == pu.user_id)) else { continue };
                 let (name, username, _phone, presence, _has_photo, contact) = user_facts(u);
@@ -657,21 +689,24 @@ async fn get_archived_dialogs(client: &Client, ctx: &Arc<Ctx>, now: i32) -> Resu
                 let photo_id = match &u.photo { Some(tl::enums::UserProfilePhoto::Photo(p)) => Some(p.photo_id), _ => None };
                 let title = if u.is_self { "Saved Messages".to_string() } else { name };
                 let peer_ref = PeerRef { id: PeerId::user_unchecked(u.id), auth: PeerAuth::from_hash(u.access_hash.unwrap_or(0)) };
-                (title, kind, username, photo_id, presence, contact, peer_ref)
+                (title, kind, username, photo_id, presence, contact, peer_ref, false)
             }
             tl::enums::Peer::Chat(pc) => {
                 let Some(tl::enums::Chat::Chat(c)) = chats.iter().find(|c| matches!(c, tl::enums::Chat::Chat(x) if x.id == pc.chat_id)) else { continue };
                 let photo_id = match &c.photo { tl::enums::ChatPhoto::Photo(p) => Some(p.photo_id), _ => None };
-                (c.title.clone(), ChatKind::Group, String::new(), photo_id, Presence::Unknown, false, PeerId::chat_unchecked(c.id).to_ambient_ref())
+                (c.title.clone(), ChatKind::Group, String::new(), photo_id, Presence::Unknown, false, PeerId::chat_unchecked(c.id).to_ambient_ref(), false)
             }
             tl::enums::Peer::Channel(pc) => {
                 let Some(tl::enums::Chat::Channel(c)) = chats.iter().find(|c| matches!(c, tl::enums::Chat::Channel(x) if x.id == pc.channel_id)) else { continue };
                 let photo_id = match &c.photo { tl::enums::ChatPhoto::Photo(p) => Some(p.photo_id), _ => None };
                 let kind = if c.megagroup { ChatKind::Group } else { ChatKind::Channel };
                 let peer_ref = PeerRef { id: PeerId::channel_unchecked(c.id), auth: PeerAuth::from_hash(c.access_hash.unwrap_or(0)) };
-                (c.title.clone(), kind, c.username.clone().unwrap_or_default(), photo_id, Presence::Unknown, false, peer_ref)
+                (c.title.clone(), kind, c.username.clone().unwrap_or_default(), photo_id, Presence::Unknown, false, peer_ref, c.forum)
             }
         };
+        if forum {
+            ctx.forums.lock().unwrap().insert(chat_id);
+        }
         ctx.remember(chat_id, peer_ref, Some(&title));
         if let Some(pid) = photo_id {
             ctx.photos.lock().unwrap().insert(chat_id, pid);
@@ -728,6 +763,8 @@ async fn get_archived_dialogs(client: &Client, ctx: &Arc<Ctx>, now: i32) -> Resu
             presence,
             has_photo: photo_id.is_some(),
             draft: draft_text(d.draft.as_ref()),
+            forum,
+            story_ring: ctx.story_rings.lock().unwrap().get(&chat_id).copied().unwrap_or_default(),
         });
     }
     Ok(out)
@@ -740,6 +777,7 @@ struct PeerFacts {
     username: String,
     contact: bool,
     title_override: Option<String>,
+    forum: bool,
 }
 
 fn describe_peer(peer: &Peer) -> PeerFacts {
@@ -757,6 +795,7 @@ fn describe_peer(peer: &Peer) -> PeerFacts {
             username: u.username().unwrap_or("").to_string(),
             contact: u.contact(),
             title_override: if u.is_self() { Some("Saved Messages".to_string()) } else { None },
+            forum: false,
         },
         Peer::Group(g) => PeerFacts {
             kind: ChatKind::Group,
@@ -765,6 +804,7 @@ fn describe_peer(peer: &Peer) -> PeerFacts {
             username: g.username().unwrap_or("").to_string(),
             contact: false,
             title_override: None,
+            forum: false,
         },
         Peer::Channel(c) => PeerFacts {
             kind: if c.raw.megagroup { ChatKind::Group } else { ChatKind::Channel },
@@ -773,6 +813,7 @@ fn describe_peer(peer: &Peer) -> PeerFacts {
             username: c.username().unwrap_or("").to_string(),
             contact: false,
             title_override: None,
+            forum: c.raw.forum,
         },
     }
 }
@@ -836,6 +877,11 @@ fn preview_of(m: &Msg) -> String {
         Some(MediaKind::Gif) => "[GIF]".into(),
         Some(MediaKind::Audio) => "[audio]".into(),
         Some(MediaKind::VideoNote) => "[video message]".into(),
+        Some(MediaKind::Location) => "[location]".into(),
+        Some(MediaKind::Venue) => "[venue]".into(),
+        Some(MediaKind::Contact) => "[contact]".into(),
+        Some(MediaKind::Dice) => format!("{} [dice]", m.dice.as_ref().map(|d| d.emoji.as_str()).unwrap_or("")).trim().to_string(),
+        Some(MediaKind::Poll) => format!("[poll] {}", m.poll.as_ref().map(|p| p.question.as_str()).unwrap_or("")).trim().to_string(),
         Some(MediaKind::Unsupported) => "[unsupported]".into(),
         None => String::new(),
     }
@@ -1128,7 +1174,7 @@ fn register_media(ctx: &Ctx, m: &Message, chat_id: i64) {
 }
 
 fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
-    let mi = media_info(m.media().as_ref());
+    let mi = media_info(m.media().as_ref(), m.date().with_timezone(&Local), m.edit_date().map(|d| d.with_timezone(&Local)));
     register_media(ctx, m, chat_id);
 
     let reactions = match &m.raw {
@@ -1202,6 +1248,16 @@ fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
         edited: m.edit_date().is_some() && !m.edit_hide(),
         deleted: false,
         pinned: m.pinned(),
+        location: mi.location,
+        contact: mi.contact,
+        dice: mi.dice,
+        poll: mi.poll,
+        keyboard: keyboard_of(m),
+        topic_id: topic_of(ctx, m, chat_id),
+        scheduled: false,
+        audio_title: mi.audio_title,
+        audio_performer: mi.audio_performer,
+        round: mi.round,
     };
     if let Some(archive) = &ctx.archive {
         archive.record(msg.clone());
@@ -1396,6 +1452,14 @@ struct MediaInfo {
     photo_size: Option<(i32, i32)>,
     sticker_emoji: Option<String>,
     webpage: Option<WebPreview>,
+    // wave 6
+    location: Option<LocationInfo>,
+    contact: Option<ContactCard>,
+    dice: Option<DiceInfo>,
+    poll: Option<Poll>,
+    audio_title: Option<String>,
+    audio_performer: Option<String>,
+    round: bool,
 }
 
 /// (voice, audio, video, round, animated) from Telegram's own attributes.
@@ -1425,9 +1489,53 @@ fn doc_flags(d: &Document) -> (bool, bool, bool, bool, bool) {
     f
 }
 
-fn media_info(media: Option<&Media>) -> MediaInfo {
+fn media_info(media: Option<&Media>, date: DateTime<Local>, edited: Option<DateTime<Local>>) -> MediaInfo {
     let mut mi = MediaInfo::default();
     match media {
+        Some(Media::Geo(g)) => {
+            mi.kind = Some(MediaKind::Location);
+            mi.location = Some(LocationInfo { point: GeoPoint { lat: g.raw.lat, lon: g.raw.long }, ..Default::default() });
+        }
+        Some(Media::Venue(v)) => {
+            mi.kind = Some(MediaKind::Venue);
+            let point = v.geo.as_ref().map(|g| GeoPoint { lat: g.raw.lat, lon: g.raw.long }).unwrap_or_default();
+            mi.location = Some(LocationInfo { point, title: v.title().to_string(), address: v.address().to_string(), live: None });
+        }
+        Some(Media::GeoLive(l)) => {
+            mi.kind = Some(MediaKind::Location);
+            let point = l.geo.as_ref().map(|g| GeoPoint { lat: g.raw.lat, lon: g.raw.long }).unwrap_or_default();
+            let period = l.raw_geolive.period.max(0) as u32;
+            let expires = date + chrono::Duration::seconds(period as i64);
+            mi.location = Some(LocationInfo {
+                point,
+                title: String::new(),
+                address: String::new(),
+                live: Some(LiveLocation {
+                    period_secs: period,
+                    expires,
+                    last_update: edited.unwrap_or(date),
+                    heading: l.raw_geolive.heading.and_then(|h| u16::try_from(h).ok()),
+                    stopped: period == 0 || Local::now() > expires,
+                }),
+            });
+        }
+        Some(Media::Contact(c)) => {
+            mi.kind = Some(MediaKind::Contact);
+            mi.contact = Some(ContactCard {
+                first_name: c.first_name().to_string(),
+                last_name: c.last_name().to_string(),
+                phone: c.phone_number().to_string(),
+                user_id: (c.raw.user_id != 0).then_some(c.raw.user_id),
+            });
+        }
+        Some(Media::Dice(d)) => {
+            mi.kind = Some(MediaKind::Dice);
+            mi.dice = Some(DiceInfo { emoji: d.emoji().to_string(), value: d.value() });
+        }
+        Some(Media::Poll(p)) => {
+            mi.kind = Some(MediaKind::Poll);
+            mi.poll = Some(poll_of(&p.raw, &p.raw_results));
+        }
         Some(Media::Photo(p)) => {
             mi.kind = Some(MediaKind::Photo);
             mi.doc_size = p.size().map(|s| s as u64);
@@ -1454,6 +1562,17 @@ fn media_info(media: Option<&Media>) -> MediaInfo {
             if !voice {
                 mi.doc_name = Some(d.name().filter(|n| !n.is_empty()).unwrap_or("file").to_string());
             }
+            mi.round = round;
+            if audio {
+                if let Some(tl::enums::Document::Document(doc)) = d.raw.document.as_ref() {
+                    for attr in &doc.attributes {
+                        if let tl::enums::DocumentAttribute::Audio(a) = attr {
+                            mi.audio_title = a.title.clone().filter(|t| !t.is_empty());
+                            mi.audio_performer = a.performer.clone().filter(|t| !t.is_empty());
+                        }
+                    }
+                }
+            }
             mi.doc_size = d.size().map(|s| s as u64);
             mi.duration = d.duration().map(|s| s.round() as u32);
             mi.photo_size = d.resolution();
@@ -1472,6 +1591,131 @@ fn media_info(media: Option<&Media>) -> MediaInfo {
         None => {}
     }
     mi
+}
+
+// ===================== wave 6: typed media helpers =====================
+
+fn poll_of(raw: &tl::types::Poll, results: &tl::types::PollResults) -> Poll {
+    let voters: Vec<&tl::types::PollAnswerVoters> = results
+        .results
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|v| {
+            let tl::enums::PollAnswerVoters::Voters(v) = v;
+            v
+        })
+        .collect();
+    let options: Vec<PollOption> = raw
+        .answers
+        .iter()
+        .map(|a| {
+            let (text, option) = match a {
+                tl::enums::PollAnswer::Answer(a) => (text_of(&a.text), a.option.clone()),
+                tl::enums::PollAnswer::InputPollAnswer(a) => (text_of(&a.text), Vec::new()),
+            };
+            let v = voters.iter().find(|v| v.option == option);
+            PollOption {
+                text,
+                voters: v.and_then(|v| v.voters).unwrap_or(0),
+                chosen: v.is_some_and(|v| v.chosen),
+                correct: if raw.quiz && !results.min && !voters.is_empty() { v.map(|v| v.correct) } else { None },
+            }
+        })
+        .collect();
+    let voted = options.iter().any(|o| o.chosen);
+    Poll {
+        id: raw.id,
+        question: text_of(&raw.question),
+        options,
+        total_voters: results.total_voters.unwrap_or(0),
+        closed: raw.closed,
+        public_voters: raw.public_voters,
+        multiple_choice: raw.multiple_choice,
+        quiz: raw.quiz,
+        voted,
+        solution: results.solution.clone().filter(|s| !s.is_empty()),
+        close_date: raw.close_date.map(|d| Local.timestamp_opt(d as i64, 0).single().unwrap_or_else(Local::now)),
+    }
+}
+
+fn keyboard_of(m: &Message) -> Option<Keyboard> {
+    let tl::enums::Message::Message(raw) = &m.raw else { return None };
+    let tl::enums::ReplyMarkup::ReplyInlineMarkup(markup) = raw.reply_markup.as_ref()? else { return None };
+    let rows: Vec<Vec<KeyButton>> = markup
+        .rows
+        .iter()
+        .map(|row| {
+            let tl::enums::KeyboardButtonRow::Row(row) = row;
+            row.buttons
+                .iter()
+                .map(|b| {
+                    use tl::enums::KeyboardButton as B;
+                    match b {
+                        B::Callback(b) => KeyButton { text: b.text.clone(), kind: ButtonKind::Callback(b.data.clone()) },
+                        B::Url(b) => KeyButton { text: b.text.clone(), kind: ButtonKind::Url(b.url.clone()) },
+                        B::SwitchInline(b) => KeyButton {
+                            text: b.text.clone(),
+                            kind: ButtonKind::SwitchInline { query: b.query.clone(), same_chat: b.same_peer },
+                        },
+                        B::Button(b) => KeyButton { text: b.text.clone(), kind: ButtonKind::Other },
+                        B::Game(b) => KeyButton { text: b.text.clone(), kind: ButtonKind::Other },
+                        B::Buy(b) => KeyButton { text: b.text.clone(), kind: ButtonKind::Other },
+                        B::UrlAuth(b) => KeyButton { text: b.text.clone(), kind: ButtonKind::Url(b.url.clone()) },
+                        B::WebView(b) => KeyButton { text: b.text.clone(), kind: ButtonKind::Url(b.url.clone()) },
+                        B::SimpleWebView(b) => KeyButton { text: b.text.clone(), kind: ButtonKind::Url(b.url.clone()) },
+                        B::Copy(b) => KeyButton { text: b.text.clone(), kind: ButtonKind::Other },
+                        other => KeyButton { text: button_text(other), kind: ButtonKind::Other },
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    if rows.iter().all(|r| r.is_empty()) {
+        return None;
+    }
+    Some(Keyboard { rows })
+}
+
+fn button_text(b: &tl::enums::KeyboardButton) -> String {
+    use tl::enums::KeyboardButton as B;
+    match b {
+        B::RequestPhone(b) => b.text.clone(),
+        B::RequestGeoLocation(b) => b.text.clone(),
+        B::InputKeyboardButtonUrlAuth(b) => b.text.clone(),
+        B::RequestPoll(b) => b.text.clone(),
+        B::InputKeyboardButtonUserProfile(b) => b.text.clone(),
+        B::UserProfile(b) => b.text.clone(),
+        B::RequestPeer(b) => b.text.clone(),
+        B::InputKeyboardButtonRequestPeer(b) => b.text.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Topic of a message in a forum: the reply header's top id (or its reply
+/// target when the header is flagged `forum_topic`), General (1) otherwise.
+fn topic_of(ctx: &Ctx, m: &Message, chat_id: i64) -> Option<i32> {
+    if !ctx.forums.lock().unwrap().contains(&chat_id) {
+        return None;
+    }
+    let tl::enums::Message::Message(raw) = &m.raw else { return Some(1) };
+    match raw.reply_to.as_ref() {
+        Some(tl::enums::MessageReplyHeader::Header(h)) if h.forum_topic => h.reply_to_top_id.or(h.reply_to_msg_id).or(Some(1)),
+        _ => Some(1),
+    }
+}
+
+fn bot_commands_of(info: Option<&tl::enums::BotInfo>) -> Vec<BotCommand> {
+    let Some(tl::enums::BotInfo::Info(info)) = info else { return vec![] };
+    info.commands
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|c| {
+            let tl::enums::BotCommand::Command(c) = c;
+            BotCommand { command: c.command.clone(), description: c.description.clone() }
+        })
+        .collect()
 }
 
 fn forwarded_from(ctx: &Ctx, m: &Message) -> Option<String> {
@@ -1658,7 +1902,8 @@ fn sticker_from_doc(d: &tl::types::Document) -> Sticker {
             _ => None,
         })
         .unwrap_or_default();
-    Sticker { id: d.id, emoji, animated: d.mime_type != "image/webp" && d.mime_type != "image/png" }
+    let animated = d.mime_type != "image/webp" && d.mime_type != "image/png";
+    Sticker { id: d.id, emoji, animated, video: d.mime_type == "video/webm" }
 }
 
 // ===================== wave 5: messages =====================
@@ -2040,6 +2285,8 @@ async fn get_chat_info(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<
                 has_photo,
                 muted: is_muted(&f.notify_settings, now),
                 is_contact: contact,
+                bot_commands: bot_commands_of(f.bot_info.as_ref()),
+                forum: false,
             })
         }
         PeerKind::Chat => {
@@ -2095,6 +2342,7 @@ async fn get_chat_info(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<
                 about,
                 members,
                 muted,
+                forum: ctx.forums.lock().unwrap().contains(&chat_id),
                 ..ChatInfo::default()
             })
         }
@@ -2156,7 +2404,7 @@ async fn get_contacts(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<Contact>, T
         if let Ok(Some(r)) = user.to_ref().await {
             ctx.remember(id, r, Some(&name));
         }
-        out.push(Contact { user_id: id, name, username, phone, presence, has_photo });
+        out.push(Contact { user_id: id, name, username, phone, presence, has_photo, story_ring: StoryRing::None });
     }
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(out)
