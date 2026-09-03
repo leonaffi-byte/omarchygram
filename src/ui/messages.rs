@@ -24,6 +24,7 @@ use super::menus::{self, ChatAction, PopoverSlot};
 use super::player;
 use super::recorder::{RecorderBar, RecorderUiAction};
 use super::scheduled::{ScheduledAction, ScheduledPanel, SendLaterPopover};
+use super::videonote::{VideoRecorderAction, VideoRecorderBar};
 use super::virtual_chat::is_virtual;
 use crate::settings::SettingsStore;
 
@@ -249,6 +250,10 @@ pub enum MessageAction {
     RecorderCancel,
     RecorderSend,
     RecorderRetry,
+    VideoNoteStart,
+    VideoNoteCancel,
+    VideoNoteSend,
+    VideoNoteClose,
     AttachFile,
     AttachPoll,
     AttachLocation,
@@ -291,6 +296,7 @@ pub enum MessageAction {
     RetractVote(i32),
     AddContact(i32),
     OpenInBrowser(String),
+    UpdateLive(i32),
     StopLive(i32),
     RedownloadMedia(i32),
     PressButton {
@@ -485,6 +491,7 @@ struct MessagesInner {
     selection: RefCell<SelectionBook>,
     selection_mode: Cell<bool>,
     recorder: RecorderBar,
+    video_recorder: VideoRecorderBar,
     store: RefCell<MessageStore>,
     action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
     time_format: RefCell<String>,
@@ -847,6 +854,9 @@ impl MessagesView {
         let recorder = RecorderBar::new();
         widget.append(&recorder.widget);
 
+        let video_recorder = VideoRecorderBar::new();
+        widget.append(&video_recorder.widget);
+
         let composer_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         composer_box.add_css_class("omg-composer");
         let attach = gtk::Button::with_label(icons::ATTACH);
@@ -1047,6 +1057,7 @@ impl MessagesView {
             selection: RefCell::new(SelectionBook::default()),
             selection_mode: Cell::new(false),
             recorder,
+            video_recorder,
             store: RefCell::new(MessageStore::default()),
             action,
             time_format: RefCell::new("%H:%M".to_string()),
@@ -1237,6 +1248,19 @@ impl MessagesView {
                 }
             }));
         }
+        {
+            let action = self.inner.action.clone();
+            self.inner.video_recorder.set_action(Rc::new(move |event| {
+                let event = match event {
+                    VideoRecorderAction::Cancel => MessageAction::VideoNoteCancel,
+                    VideoRecorderAction::Send => MessageAction::VideoNoteSend,
+                    VideoRecorderAction::Close => MessageAction::VideoNoteClose,
+                };
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(event);
+                }
+            }));
+        }
         for button in [reply_close, edit_close] {
             let action = self.inner.action.clone();
             button.connect_clicked(move |_| {
@@ -1266,19 +1290,46 @@ impl MessagesView {
         {
             // Spec §4.4: secondary click or long press on SEND, and
             // Ctrl+Shift+Enter in the composer, open the send-later picker.
+            // Spec §7.1: secondary click or long press on MIC, and
+            // Ctrl+Shift+V in the composer, start a video note.
             let this = self.clone();
+            let action = self.inner.action.clone();
+            let composer = self.inner.composer.clone();
             let gesture = gtk::GestureClick::new();
             gesture.set_button(gdk::BUTTON_SECONDARY);
             gesture.connect_released(move |gesture, _, _, _| {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
-                this.show_send_later();
+                let buffer = composer.buffer();
+                let empty = buffer
+                    .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                    .is_empty();
+                if empty {
+                    if let Some(callback) = action.borrow().as_ref().cloned() {
+                        callback(MessageAction::VideoNoteStart);
+                    }
+                } else {
+                    this.show_send_later();
+                }
             });
             self.inner.send.add_controller(gesture);
+
             let this = self.clone();
+            let action = self.inner.action.clone();
+            let composer = self.inner.composer.clone();
             let long = gtk::GestureLongPress::new();
             long.connect_pressed(move |gesture, _, _| {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
-                this.show_send_later();
+                let buffer = composer.buffer();
+                let empty = buffer
+                    .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                    .is_empty();
+                if empty {
+                    if let Some(callback) = action.borrow().as_ref().cloned() {
+                        callback(MessageAction::VideoNoteStart);
+                    }
+                } else {
+                    this.show_send_later();
+                }
             });
             self.inner.send.add_controller(long);
 
@@ -1291,6 +1342,19 @@ impl MessagesView {
                 let this = self.clone();
                 let action = gtk::CallbackAction::new(move |_, _| {
                     this.show_send_later();
+                    glib::Propagation::Stop
+                });
+                shortcuts.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+            }
+            for accel in ["<Control><Shift>v", "<Control><Shift>V"] {
+                let Some(trigger) = gtk::ShortcutTrigger::parse_string(accel) else {
+                    continue;
+                };
+                let action_cb = self.inner.action.clone();
+                let action = gtk::CallbackAction::new(move |_, _| {
+                    if let Some(callback) = action_cb.borrow().as_ref().cloned() {
+                        callback(MessageAction::VideoNoteStart);
+                    }
                     glib::Propagation::Stop
                 });
                 shortcuts.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
@@ -3810,6 +3874,96 @@ impl MessagesView {
 
     pub fn probe_recorder_retry(&self) {
         self.inner.recorder.trigger_retry();
+    }
+
+    pub fn show_video_note_starting(&self) {
+        self.exit_selection_mode();
+        self.release_composer_focus();
+        self.inner.composer_box.set_visible(false);
+        self.inner.video_recorder.show_starting();
+    }
+
+    pub fn show_video_note_recording(&self, rx: async_channel::Receiver<Vec<u8>>) {
+        self.release_composer_focus();
+        self.inner.composer_box.set_visible(false);
+        self.inner.video_recorder.show_recording(rx);
+    }
+
+    pub fn show_video_note_stopping(&self) {
+        self.inner.video_recorder.show_stopping();
+    }
+
+    pub fn show_video_note_error(&self, message: &str) {
+        self.release_composer_focus();
+        self.inner.composer_box.set_visible(false);
+        self.inner.video_recorder.show_error(message);
+    }
+
+    pub fn hide_video_note(&self) {
+        self.inner.video_recorder.hide();
+        if !self.inner.selection_mode.get() {
+            self.inner.composer_box.set_visible(true);
+        }
+    }
+
+    pub fn video_recorder_visible(&self) -> bool {
+        self.inner.video_recorder.is_visible()
+    }
+
+    pub fn video_recorder_status(&self) -> String {
+        self.inner.video_recorder.status_text()
+    }
+
+    pub fn video_recorder_has_frame(&self) -> bool {
+        self.inner.video_recorder.has_frame()
+    }
+
+    pub fn probe_video_recorder_cancel(&self) {
+        self.inner.video_recorder.probe_cancel();
+    }
+
+    pub fn probe_video_recorder_send(&self) {
+        self.inner.video_recorder.probe_send();
+    }
+
+    pub fn probe_video_recorder_close(&self) {
+        self.inner.video_recorder.probe_close();
+    }
+
+    pub fn expire_live_location(&self, msg_id: i32) {
+        if let Some(mut message) = self.message(msg_id) {
+            if let Some(ref mut loc) = message.location {
+                if let Some(ref mut live) = loc.live {
+                    live.stopped = true;
+                }
+            }
+            self.merge_event(message);
+        }
+    }
+
+    pub fn probe_click_card_button(&self, msg_id: i32, text: &str) -> bool {
+        let Some(widget) = self.card_widget(msg_id) else {
+            return false;
+        };
+        let mut child = widget.first_child();
+        while let Some(btn) = child {
+            if let Some(button) = btn.downcast_ref::<gtk::Button>() {
+                if let Some(lbl) = button.child().and_then(|c| {
+                    if let Some(box_widget) = c.downcast_ref::<gtk::Box>() {
+                        box_widget.last_child().and_then(|l| l.downcast::<gtk::Label>().ok())
+                    } else {
+                        c.downcast::<gtk::Label>().ok()
+                    }
+                }) {
+                    if lbl.text().contains(text) {
+                        button.emit_clicked();
+                        return true;
+                    }
+                }
+            }
+            child = btn.next_sibling();
+        }
+        false
     }
 
     pub fn prepare_attachment(&self) {

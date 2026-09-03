@@ -106,11 +106,24 @@ pub fn build_geo(
         let render = {
             let line = line.clone();
             let live = live.clone();
+            let outgoing = message.outgoing;
             move || {
                 if live.stopped || Local::now() > live.expires {
                     line.set_label("Sharing ended");
                     line.remove_css_class("omg-accent");
                     line.add_css_class("omg-muted");
+                } else if outgoing {
+                    let mins = (live.expires - Local::now()).num_minutes().max(0);
+                    let when = if mins <= 1 {
+                        "1 min".to_string()
+                    } else if mins < 60 {
+                        format!("{mins} min")
+                    } else {
+                        format!("{} hr", (mins + 59) / 60)
+                    };
+                    line.set_label(&format!("Live · sharing for {when}"));
+                    line.remove_css_class("omg-muted");
+                    line.add_css_class("omg-accent");
                 } else {
                     let mins = (Local::now() - live.last_update).num_seconds().max(0) / 60;
                     let when = if mins < 1 {
@@ -128,15 +141,17 @@ pub fn build_geo(
         };
         render();
         card.append(&line);
-        if !live.stopped && Local::now() <= live.expires {
-            let tick = render.clone();
-            let source = glib::timeout_add_seconds_local(60, move || {
-                tick();
-                glib::ControlFlow::Continue
+        let own_buttons = if message.outgoing && !live.stopped && Local::now() <= live.expires {
+            let update = omg_button(icons::LOCATION, "Update position");
+            let act = action.clone();
+            let msg_id = message.id;
+            update.connect_clicked(move |_| {
+                if let Some(callback) = act.borrow().as_ref().cloned() {
+                    callback(MessageAction::UpdateLive(msg_id));
+                }
             });
-            animation_sources.borrow_mut().push(source);
-        }
-        if message.outgoing && !live.stopped && Local::now() <= live.expires {
+            card.append(&update);
+
             let stop = omg_button(icons::STOP, "Stop sharing");
             let act = action.clone();
             let msg_id = message.id;
@@ -146,6 +161,27 @@ pub fn build_geo(
                 }
             });
             card.append(&stop);
+            Some((update, stop))
+        } else {
+            None
+        };
+        if !live.stopped && Local::now() <= live.expires {
+            let tick = render.clone();
+            let buttons = own_buttons;
+            let live_exp = live.expires;
+            let source = glib::timeout_add_seconds_local(60, move || {
+                tick();
+                if Local::now() > live_exp {
+                    if let Some((ref u, ref s)) = buttons {
+                        u.set_visible(false);
+                        s.set_visible(false);
+                    }
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+            animation_sources.borrow_mut().push(source);
         }
     }
 

@@ -19,7 +19,7 @@ use crate::os::{self, OsPolicy, Parsed};
 use crate::settings::{Settings, SettingsStore};
 use crate::tg::{
     AuthState, BackendFlags, ChatInfo, ChatKind, ChatSummary, Event, Me, MediaKind, Msg, MuteMode,
-    SharedKind, Tg, Topic, msg_in_chat, split_topic_chat_id, topic_chat_id,
+    SharedKind, StoryPeer, StoryRing, Tg, Topic, msg_in_chat, split_topic_chat_id, topic_chat_id,
 };
 use crate::uistate::UiState;
 
@@ -45,6 +45,7 @@ use super::recorder::{
 };
 use super::settings_view::SettingsView;
 use super::stickers::{StickerAction, StickerPicker, StickerSend};
+use super::stories::{StoriesStrip, StoryViewer};
 use super::switcher::Switcher;
 use super::topics::{TopicAction, TopicListView};
 use super::viewer::{Viewer, ViewerAction};
@@ -209,6 +210,7 @@ impl ShellInner {
         }
         self.close_forward();
         self.close_viewer();
+        self.close_stories_viewer();
         self.close_contacts();
         self.close_new_group();
         self.close_stickers();
@@ -216,15 +218,51 @@ impl ShellInner {
         self.close_poll_dialog();
         self.switcher.close();
         self.close_settings();
+        self.updating_live_msg.set(None);
         let last = self.ui_state.borrow().last_location;
         let map_tiles = self.settings.get().media.map_tiles;
         self.location_dialog.begin(last, map_tiles);
         self.apply_info_layout(self.current_window_width());
     }
 
+    fn open_update_live_dialog(self: &Rc<Self>, msg_id: i32) {
+        if self.open_chat.get().is_none_or(is_virtual) {
+            return;
+        }
+        let Some(message) = self.messages.message(msg_id) else {
+            return;
+        };
+        let Some(point) = message.location.as_ref().map(|l| l.point) else {
+            return;
+        };
+        self.close_forward();
+        self.close_viewer();
+        self.close_stories_viewer();
+        self.close_contacts();
+        self.close_new_group();
+        self.close_stickers();
+        self.close_caption_dialog();
+        self.close_poll_dialog();
+        self.switcher.close();
+        self.close_settings();
+        self.updating_live_msg.set(Some(msg_id));
+        let map_tiles = self.settings.get().media.map_tiles;
+        self.location_dialog.begin_update(point, map_tiles);
+        self.apply_info_layout(self.current_window_width());
+    }
+
     fn close_location_dialog(&self) {
         if self.location_dialog.is_open() {
+            self.updating_live_msg.set(None);
             self.location_dialog.close();
+            self.messages.focus_composer();
+            self.apply_info_layout(self.current_window_width());
+        }
+    }
+
+    fn close_stories_viewer(&self) {
+        if self.stories_viewer.is_open() {
+            self.stories_viewer.close();
             self.messages.focus_composer();
             self.apply_info_layout(self.current_window_width());
         }
@@ -296,27 +334,51 @@ impl ShellInner {
         let Some(session_epoch) = self.begin_mutation() else {
             return;
         };
+        let updating_msg = self.updating_live_msg.take();
+        if let Some(msg_id) = updating_msg {
+            self.location_dialog.set_busy(true);
+            let tg = self.tg.clone();
+            let this = self.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let result = tg.update_live_location(chat_id, msg_id, point).await;
+                this.finish_mutation();
+                if !this.is_session_current(session_epoch) {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        this.close_location_dialog();
+                    }
+                    Err(error) => {
+                        shell_log!("update_live_location({chat_id}, {msg_id}): {error}");
+                        this.location_dialog.show_error(&error);
+                    }
+                }
+            });
+            return;
+        }
         self.ui_state.borrow_mut().last_location = Some((point.lat, point.lon));
         self.schedule_ui_save();
         let epoch = self.epoch.get();
         let title = self.title_for(chat_id);
         self.location_dialog.set_busy(true);
+        let this = self.clone();
         glib::MainContext::default().spawn_local(async move {
             let result = match live_secs {
-                Some(secs) => self.tg.send_live_location(chat_id, point, secs).await,
-                None => self.tg.send_location(chat_id, point).await,
+                Some(secs) => this.tg.send_live_location(chat_id, point, secs).await,
+                None => this.tg.send_location(chat_id, point).await,
             };
-            self.finish_mutation();
-            if !self.is_session_current(session_epoch) {
+            this.finish_mutation();
+            if !this.is_session_current(session_epoch) {
                 return;
             }
             match result {
                 Ok(message) => {
-                    self.close_location_dialog();
-                    let message = self.apply_tombstone(message);
+                    this.close_location_dialog();
+                    let message = this.apply_tombstone(message);
                     if !message.deleted {
-                        self.remember_last(&message);
-                        self.dialog_upsert(
+                        this.remember_last(&message);
+                        this.dialog_upsert(
                             chat_id,
                             &title,
                             &message_preview(&message),
@@ -324,14 +386,19 @@ impl ShellInner {
                             UnreadUpdate::Delta(0),
                         );
                     }
-                    if self.is_current(chat_id, epoch) {
-                        let inserted = self.messages.merge_event(message);
-                        self.post_render(inserted);
+                    if let Some(loc) = &message.location {
+                        if let Some(live) = &loc.live {
+                            this.track_own_live_location(chat_id, message.id, live.expires);
+                        }
+                    }
+                    if this.is_current(chat_id, epoch) {
+                        let inserted = this.messages.merge_event(message);
+                        this.post_render(inserted);
                     }
                 }
                 Err(error) => {
                     shell_log!("send_location({chat_id}): {error}");
-                    self.location_dialog.show_error(&error);
+                    this.location_dialog.show_error(&error);
                 }
             }
         });
@@ -511,6 +578,13 @@ struct ShellInner {
     viewer: Viewer,
     poll_dialog: Rc<PollDialog>,
     location_dialog: Rc<LocationDialog>,
+    stories_strip: Rc<StoriesStrip>,
+    stories_viewer: Rc<StoryViewer>,
+    stories_peers: RefCell<Vec<StoryPeer>>,
+    updating_live_msg: Cell<Option<i32>>,
+    own_live_locations: RefCell<Vec<(i64, i32, DateTime<Local>)>>,
+    live_expiry_timer: RefCell<Option<glib::SourceId>>,
+    video_recording_active: Cell<bool>,
     paned: gtk::Paned,
     content_paned: gtk::Paned,
     effects: Rc<Effects>,
@@ -699,11 +773,15 @@ impl Shell {
         // overlay, so atmosphere/launch layers can never paint over Ctrl+K.
         let poll_dialog = PollDialog::new();
         let location_dialog = LocationDialog::new(tg.clone());
+        let stories_strip = Rc::new(StoriesStrip::new(tg.clone()));
+        chatlist.set_stories_strip(stories_strip.widget.upcast_ref());
+        let stories_viewer = StoryViewer::new(tg.clone());
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&stack));
         overlay.add_overlay(&info.widget);
         overlay.add_overlay(&viewer.widget);
         overlay.add_overlay(&video_fullscreen.widget);
+        overlay.add_overlay(&stories_viewer.widget);
         overlay.add_overlay(&forward.widget);
         overlay.add_overlay(&contacts.widget);
         overlay.add_overlay(&new_group.widget);
@@ -748,6 +826,13 @@ impl Shell {
             viewer,
             poll_dialog,
             location_dialog,
+            stories_strip,
+            stories_viewer,
+            stories_peers: RefCell::new(Vec::new()),
+            updating_live_msg: Cell::new(None),
+            own_live_locations: RefCell::new(Vec::new()),
+            live_expiry_timer: RefCell::new(None),
+            video_recording_active: Cell::new(false),
             paned,
             content_paned,
             effects,
@@ -1043,6 +1128,22 @@ impl ShellInner {
         }
         {
             let weak = Rc::downgrade(this);
+            this.stories_strip.set_on_peer_click(move |chat_id| {
+                if let Some(this) = weak.upgrade() {
+                    this.open_stories_for_peer(chat_id);
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.stories_viewer.set_on_closed(move || {
+                if let Some(this) = weak.upgrade() {
+                    this.messages.focus_composer();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(this);
             this.switcher.widget.connect_visible_notify(move |_| {
                 if let Some(this) = weak.upgrade() {
                     this.apply_info_layout(this.current_window_width());
@@ -1163,6 +1264,8 @@ impl ShellInner {
                 if key == gdk::Key::Escape {
                     if player::fullscreen_open() {
                         player::close_fullscreen();
+                    } else if this.stories_viewer.is_open() {
+                        this.close_stories_viewer();
                     } else if this.viewer.is_open() {
                         this.close_viewer();
                     } else if this.forward.is_open() {
@@ -1181,6 +1284,8 @@ impl ShellInner {
                         this.close_stickers();
                     } else if this.caption_dialog.borrow().is_some() {
                         this.close_caption_dialog();
+                    } else if this.messages.video_recorder_visible() {
+                        this.cancel_video_note();
                     } else if this.messages.recorder_visible() {
                         // Keyboard-first: Esc cancels an active (or failed)
                         // recording before it touches any panel.
@@ -1292,6 +1397,7 @@ impl ShellInner {
         self.load_folders();
         self.load_me();
         self.load_available_reactions();
+        self.reload_stories();
         if first_ready {
             self.start_probe();
         }
@@ -3165,6 +3271,7 @@ impl ShellInner {
     }
 
     fn cancel_recording(self: &Rc<Self>) {
+        self.cancel_video_note();
         self.voice_retry.borrow_mut().take();
         let token = self.recorder_token.get();
         match self.recorder.borrow_mut().cancel() {
@@ -3355,6 +3462,176 @@ impl ShellInner {
                 }
             }
         });
+    }
+
+    fn start_video_note(self: &Rc<Self>) {
+        if self.open_chat.get().is_none_or(is_virtual) {
+            return;
+        }
+        self.cancel_recording();
+        self.video_recording_active.set(true);
+        self.messages.show_video_note_starting();
+        let local = self.local.clone();
+        let this = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            match local.video_start(240).await {
+                Ok(rx) => {
+                    if this.video_recording_active.get() {
+                        this.messages.show_video_note_recording(rx);
+                    }
+                }
+                Err(error) => {
+                    this.video_recording_active.set(false);
+                    this.messages.show_video_note_error(&error);
+                }
+            }
+        });
+    }
+
+    fn cancel_video_note(self: &Rc<Self>) {
+        if !self.video_recording_active.replace(false) {
+            self.messages.hide_video_note();
+            return;
+        }
+        self.messages.hide_video_note();
+        let local = self.local.clone();
+        glib::MainContext::default().spawn_local(async move {
+            local.video_cancel().await;
+        });
+    }
+
+    fn send_video_note(self: &Rc<Self>) {
+        if !self.video_recording_active.replace(false) {
+            return;
+        }
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            self.messages.hide_video_note();
+            return;
+        };
+        let Some(session_epoch) = self.begin_mutation() else {
+            self.messages.hide_video_note();
+            return;
+        };
+        let epoch = self.epoch.get();
+        let title = self.title_for(chat_id);
+        self.messages.show_video_note_stopping();
+        let local = self.local.clone();
+        let tg = self.tg.clone();
+        let this = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let stop_res = local.video_stop().await;
+            this.messages.hide_video_note();
+            let (path, duration) = match stop_res {
+                Ok(res) => res,
+                Err(error) => {
+                    this.finish_mutation();
+                    this.messages.show_error(&error);
+                    return;
+                }
+            };
+            let result = tg.send_video_note(chat_id, path, duration, 240).await;
+            this.finish_mutation();
+            if !this.is_session_current(session_epoch) {
+                return;
+            }
+            match result {
+                Ok(message) => {
+                    let message = this.apply_tombstone(message);
+                    if !message.deleted {
+                        this.remember_last(&message);
+                        this.dialog_upsert(
+                            chat_id,
+                            &title,
+                            &message_preview(&message),
+                            Some(message.ts),
+                            UnreadUpdate::Delta(0),
+                        );
+                    }
+                    if this.is_current(chat_id, epoch) {
+                        let inserted = this.messages.merge_event(message);
+                        this.post_render(inserted);
+                    }
+                }
+                Err(error) => {
+                    shell_log!("send_video_note({chat_id}): {error}");
+                    this.messages.show_error(&error);
+                }
+            }
+        });
+    }
+
+    fn track_own_live_location(self: &Rc<Self>, chat_id: i64, msg_id: i32, expires: DateTime<Local>) {
+        let mut list = self.own_live_locations.borrow_mut();
+        if !list.iter().any(|(c, m, _)| *c == chat_id && *m == msg_id) {
+            list.push((chat_id, msg_id, expires));
+        }
+        drop(list);
+        self.schedule_live_expiry_check();
+    }
+
+    fn schedule_live_expiry_check(self: &Rc<Self>) {
+        if self.live_expiry_timer.borrow().is_some() {
+            return;
+        }
+        let this_weak = Rc::downgrade(self);
+        let source = glib::timeout_add_seconds_local(1, move || {
+            let Some(this) = this_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let now = Local::now();
+            let mut list = this.own_live_locations.borrow_mut();
+            let mut expired = Vec::new();
+            list.retain(|(chat_id, msg_id, expires)| {
+                if now >= *expires {
+                    expired.push((*chat_id, *msg_id));
+                    false
+                } else {
+                    true
+                }
+            });
+            let keep_going = !list.is_empty();
+            drop(list);
+            for (chat_id, msg_id) in expired {
+                if this.open_chat.get() == Some(chat_id) {
+                    this.messages.expire_live_location(msg_id);
+                }
+            }
+            if !keep_going {
+                *this.live_expiry_timer.borrow_mut() = None;
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+        *self.live_expiry_timer.borrow_mut() = Some(source);
+    }
+
+    fn check_own_live_message(self: &Rc<Self>, message: &Msg) {
+        if message.outgoing {
+            if let Some(loc) = &message.location {
+                if let Some(live) = &loc.live {
+                    if !live.stopped && Local::now() <= live.expires {
+                        self.track_own_live_location(message.chat_id, message.id, live.expires);
+                    }
+                }
+            }
+        }
+    }
+
+    fn reload_stories(self: &Rc<Self>) {
+        let tg = self.tg.clone();
+        let this = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            if let Ok(peers) = tg.get_story_peers().await {
+                *this.stories_peers.borrow_mut() = peers.clone();
+                this.stories_strip.update_peers(peers);
+            }
+        });
+    }
+
+    fn open_stories_for_peer(self: &Rc<Self>, chat_id: i64) {
+        let peers = self.stories_peers.borrow().clone();
+        self.stories_viewer.open(peers, chat_id);
     }
 
     fn capture_current_draft(&self, chat_id: i64) {
@@ -3848,7 +4125,7 @@ impl ShellInner {
                 }
             });
         }
-        if std::env::var("OMG_SMOKE_RECORDING").is_ok_and(|value| !value.is_empty()) {
+        if std::env::var("OMG_SMOKE_RECORDING").is_ok_and(|value| !value.is_empty() && value != "video") {
             let weak = Rc::downgrade(self);
             glib::MainContext::default().spawn_local(async move {
                 let Some(this) = weak.upgrade() else { return };
@@ -3864,6 +4141,41 @@ impl ShellInner {
                 }
                 if poll_until(8_000, || !this.messages.is_loading()).await {
                     this.start_recording();
+                }
+            });
+        }
+        if std::env::var("OMG_SMOKE_RECORD").is_ok_and(|value| value == "video")
+            || std::env::var("OMG_SMOKE_RECORDING").is_ok_and(|value| value == "video")
+        {
+            let weak = Rc::downgrade(self);
+            glib::MainContext::default().spawn_local(async move {
+                let Some(this) = weak.upgrade() else { return };
+                if this.open_chat.get().is_none() {
+                    if let Some(chat_id) = this
+                        .chatlist
+                        .ordered()
+                        .into_iter()
+                        .find_map(|(id, title)| (title == "Marta").then_some(id))
+                    {
+                        this.clone().open_chat(chat_id);
+                    }
+                }
+                if poll_until(8_000, || !this.messages.is_loading()).await {
+                    this.start_video_note();
+                }
+            });
+        }
+        if let Ok(target) = std::env::var("OMG_SMOKE_STORIES") {
+            let weak = Rc::downgrade(self);
+            glib::MainContext::default().spawn_local(async move {
+                let Some(this) = weak.upgrade() else { return };
+                if poll_until(8_000, || this.stories_strip.peer_count() > 0).await {
+                    let chat_id = if let Ok(id) = target.parse::<i64>() {
+                        id
+                    } else {
+                        1 // Marta
+                    };
+                    this.open_stories_for_peer(chat_id);
                 }
             });
         }
@@ -3987,7 +4299,7 @@ impl ShellInner {
             Event::PollChanged { poll_id, poll } => {
                 self.messages.update_poll(poll_id, poll);
             }
-            Event::StoriesChanged => {}
+            Event::StoriesChanged => self.reload_stories(),
             Event::ScheduledChanged { chat_id } => {
                 if self.open_chat.get() == Some(chat_id) {
                     self.clone().refresh_scheduled(chat_id);
@@ -4012,6 +4324,7 @@ impl ShellInner {
                     .borrow_mut()
                     .insert(message_key, change);
                 let message = self.apply_tombstone(message);
+                self.check_own_live_message(&message);
                 let is_open = self
                     .open_chat
                     .get()
@@ -4142,6 +4455,7 @@ impl ShellInner {
 
     fn handle_new_message(self: &Rc<Self>, message: Msg) {
         let message = self.apply_tombstone(message);
+        self.check_own_live_message(&message);
         let active = self.window_is_active();
         let is_open = self
             .open_chat
@@ -4554,6 +4868,9 @@ impl ShellInner {
                     if let Some(last) = messages.iter().rev().find(|message| !message.deleted) {
                         self.remember_last(last);
                     }
+                    for msg in &messages {
+                        self.check_own_live_message(msg);
+                    }
                     let inserted = self.messages.finish_initial(messages);
                     self.post_render(inserted);
                     self.messages.animate_chat_switched();
@@ -4626,6 +4943,10 @@ impl ShellInner {
             MessageAction::RecorderCancel => self.cancel_recording(),
             MessageAction::RecorderSend => self.stop_and_send_recording(),
             MessageAction::RecorderRetry => self.retry_voice(),
+            MessageAction::VideoNoteStart => self.start_video_note(),
+            MessageAction::VideoNoteCancel => self.cancel_video_note(),
+            MessageAction::VideoNoteSend => self.send_video_note(),
+            MessageAction::VideoNoteClose => self.cancel_video_note(),
             MessageAction::DraftChanged => self.composer_draft_changed(),
             MessageAction::DraftRetry => {
                 if let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
@@ -4736,6 +5057,7 @@ impl ShellInner {
             }
             MessageAction::AddContact(msg_id) => self.add_contact(msg_id),
             MessageAction::OpenInBrowser(url) => self.open_in_browser(&url),
+            MessageAction::UpdateLive(msg_id) => self.open_update_live_dialog(msg_id),
             MessageAction::StopLive(msg_id) => {
                 if let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
                     self.stop_live(chat_id, msg_id);
@@ -11971,6 +12293,263 @@ impl ShellInner {
             return false;
         }
         self.close_stickers();
+
+        // Wave 6F probe steps (specs/spec-wave6.md §1.11, §7)
+        let marta = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find_map(|(id, title)| (title == "Marta").then_some(id))
+            .unwrap_or(1);
+        self.clone().open_chat(marta);
+        if !poll_until(4_000, || !self.messages.is_loading()).await {
+            probe_fail("open Marta for wave 6F");
+            return false;
+        }
+
+        // Camera failure path when OMG_MOCK_CAMERA=none
+        unsafe {
+            std::env::set_var("OMG_MOCK_CAMERA", "none");
+        }
+        self.clone().start_video_note();
+        if !poll_until(4_000, || {
+            self.messages.video_recorder_visible()
+                && self.messages.video_recorder_status().contains("no camera found")
+        })
+        .await
+        {
+            unsafe {
+                std::env::remove_var("OMG_MOCK_CAMERA");
+            }
+            probe_fail("video note record: camera failure not shown");
+            return false;
+        }
+        self.messages.probe_video_recorder_close();
+        if !poll_until(2_000, || !self.messages.video_recorder_visible()).await {
+            unsafe {
+                std::env::remove_var("OMG_MOCK_CAMERA");
+            }
+            probe_fail("video note record: error close failed");
+            return false;
+        }
+        unsafe {
+            std::env::remove_var("OMG_MOCK_CAMERA");
+        }
+
+        // 1. video note record
+        probe_step("video note record");
+        self.clone().start_video_note();
+        if !poll_until(4_000, || {
+            self.messages.video_recorder_visible()
+                && self.messages.video_recorder_status().contains("Recording")
+        })
+        .await
+        {
+            probe_fail("video note record: bar not recording");
+            return false;
+        }
+        if !poll_until(6_000, || self.messages.video_recorder_has_frame()).await {
+            probe_fail("video note record: no frame received");
+            return false;
+        }
+
+        // 2. video note cancel
+        probe_step("video note cancel");
+        self.messages.probe_video_recorder_cancel();
+        if !poll_until(3_000, || !self.messages.video_recorder_visible()).await {
+            probe_fail("video note cancel: bar stayed visible");
+            return false;
+        }
+
+        // 3. video note send
+        probe_step("video note send");
+        let notes_before = self
+            .messages
+            .messages()
+            .iter()
+            .filter(|m| m.media == Some(MediaKind::VideoNote))
+            .count();
+        self.clone().start_video_note();
+        if !poll_until(6_000, || self.messages.video_recorder_has_frame()).await {
+            probe_fail("video note send: no frame received");
+            return false;
+        }
+        self.messages.probe_video_recorder_send();
+        if !poll_until(6_000, || {
+            !self.messages.video_recorder_visible()
+                && self
+                    .messages
+                    .messages()
+                    .iter()
+                    .filter(|m| m.media == Some(MediaKind::VideoNote))
+                    .count()
+                    > notes_before
+        })
+        .await
+        {
+            probe_fail("video note send: message not sent");
+            return false;
+        }
+
+        // 4. live location send
+        probe_step("live location send");
+        let live_before = self
+            .messages
+            .messages()
+            .iter()
+            .filter(|m| m.location.as_ref().is_some_and(|l| l.live.is_some()))
+            .count();
+        self.clone().open_location_dialog();
+        if !poll_until(3_000, || self.location_dialog.is_open()).await {
+            probe_fail("live location send: dialog failed to open");
+            return false;
+        }
+        self.location_dialog.probe_set_point(52.52, 13.405);
+        self.location_dialog.probe_set_live(1); // 15 min
+        self.location_dialog.probe_send();
+        if !poll_until(5_000, || {
+            !self.location_dialog.is_open()
+                && self
+                    .messages
+                    .messages()
+                    .iter()
+                    .filter(|m| m.location.as_ref().is_some_and(|l| l.live.is_some()))
+                    .count()
+                    > live_before
+        })
+        .await
+        {
+            probe_fail("live location send: message not created");
+            return false;
+        }
+        let live_msg = self
+            .messages
+            .messages()
+            .into_iter()
+            .rev()
+            .find(|m| m.location.as_ref().is_some_and(|l| l.live.is_some()))
+            .map(|m| m.id)
+            .unwrap();
+        if !poll_until(3_000, || {
+            self.messages
+                .card_text(live_msg)
+                .is_some_and(|t| t.contains("Live"))
+        })
+        .await
+        {
+            probe_fail("live location send: card text does not contain Live");
+            return false;
+        }
+
+        // 5. live location update
+        probe_step("live location update");
+        if !self
+            .messages
+            .probe_click_card_button(live_msg, "Update position")
+        {
+            probe_fail("live location update: button missing");
+            return false;
+        }
+        if !poll_until(3_000, || self.location_dialog.is_open()).await {
+            probe_fail("live location update: dialog not opened");
+            return false;
+        }
+        self.location_dialog.probe_set_point(52.53, 13.41);
+        self.location_dialog.probe_send();
+        if !poll_until(4_000, || !self.location_dialog.is_open()).await {
+            probe_fail("live location update: dialog send failed");
+            return false;
+        }
+        if !poll_until(4_000, || {
+            self.messages
+                .message(live_msg)
+                .and_then(|m| m.location)
+                .is_some_and(|l| (l.point.lat - 52.53).abs() < 0.001)
+        })
+        .await
+        {
+            probe_fail("live location update: point coordinates not updated");
+            return false;
+        }
+
+        // 6. live location stop
+        probe_step("live location stop");
+        if !self
+            .messages
+            .probe_click_card_button(live_msg, "Stop sharing")
+        {
+            probe_fail("live location stop: button missing");
+            return false;
+        }
+        if !poll_until(4_000, || {
+            self.messages
+                .card_text(live_msg)
+                .is_some_and(|t| t.contains("Sharing ended"))
+        })
+        .await
+        {
+            probe_fail("live location stop: card not flipped to Sharing ended");
+            return false;
+        }
+
+        // 7. stories strip
+        probe_step("stories strip");
+        if !poll_until(4_000, || {
+            self.stories_strip.is_visible() && self.stories_strip.peer_count() >= 2
+        })
+        .await
+        {
+            probe_fail("stories strip: strip not visible or peers missing");
+            return false;
+        }
+        if self.stories_strip.peer_unread(1) != Some(true) {
+            probe_fail("stories strip: Marta unread ring not present");
+            return false;
+        }
+
+        // 8. stories viewer
+        probe_step("stories viewer");
+        self.stories_strip.probe_click_peer(1);
+        if !poll_until(4_000, || {
+            self.stories_viewer.is_open()
+                && self.stories_viewer.current_peer_name() == "Marta"
+                && self.stories_viewer.story_count() >= 2
+        })
+        .await
+        {
+            probe_fail("stories viewer: viewer not open for Marta");
+            return false;
+        }
+        if self.stories_viewer.current_story_index() != 0 {
+            probe_fail("stories viewer: expected story index 0");
+            return false;
+        }
+
+        // 9. stories viewer advance
+        probe_step("stories viewer advance");
+        self.stories_viewer.probe_advance();
+        if !poll_until(4_000, || self.stories_viewer.current_story_index() == 1).await {
+            probe_fail("stories viewer advance: did not advance to second story");
+            return false;
+        }
+
+        // 10. stories seen
+        probe_step("stories seen");
+        self.stories_viewer.probe_close();
+        if !poll_until(2_000, || !self.stories_viewer.is_open()).await {
+            probe_fail("stories seen: viewer failed to close");
+            return false;
+        }
+        if !poll_until(4_000, || {
+            self.chatlist.probe_chat_story_ring(1) == Some(StoryRing::Read)
+                || self.stories_strip.peer_unread(1) == Some(false)
+        })
+        .await
+        {
+            probe_fail("stories seen: Marta story ring not marked Read");
+            return false;
+        }
+
         true
     }
 }
@@ -11997,6 +12576,11 @@ impl Drop for ShellInner {
         }
         if let Some(tick) = self.layout_tick.borrow_mut().take() {
             tick.remove();
+        }
+        if let Some(source) = self.live_expiry_timer.borrow_mut().take() {
+            if let Some(source) = glib::MainContext::default().find_source_by_id(&source) {
+                source.destroy();
+            }
         }
         self.main_menu.dismiss();
         self.chatlist.dismiss_popovers();

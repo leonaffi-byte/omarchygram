@@ -56,12 +56,15 @@ pub struct LocationDialog {
     zoom_label: gtk::Label,
     zoom_in: gtk::Button,
     zoom_out: gtk::Button,
+    heading_label: gtk::Label,
+    live_row: gtk::Box,
     live: gtk::DropDown,
     send: gtk::Button,
     tg: Tg,
     point: Cell<GeoPoint>,
     zoom: Cell<u8>,
     map_tiles: Cell<bool>,
+    is_update: Cell<bool>,
     /// Bumped on every open/close and every re-centre: a tile that arrives
     /// for an older view is dropped instead of painted over the new one.
     generation: Cell<u64>,
@@ -182,12 +185,15 @@ impl LocationDialog {
             zoom_label,
             zoom_in,
             zoom_out,
+            heading_label,
+            live_row,
             live,
             send,
             tg,
             point: Cell::new(DEFAULT_POINT),
             zoom: Cell::new(DEFAULT_ZOOM),
             map_tiles: Cell::new(true),
+            is_update: Cell::new(false),
             generation: Cell::new(0),
             updating: Cell::new(false),
             busy: Cell::new(false),
@@ -272,9 +278,13 @@ impl LocationDialog {
                 }
                 let Some(point) = this.read_point() else { return };
                 this.point.set(point);
-                let live_secs = LIVE_CHOICES
-                    .get(this.live.selected() as usize)
-                    .and_then(|(_, secs)| *secs);
+                let live_secs = if this.is_update.get() {
+                    None
+                } else {
+                    LIVE_CHOICES
+                        .get(this.live.selected() as usize)
+                        .and_then(|(_, secs)| *secs)
+                };
                 this.emit(LocationDialogAction::Send { point, live_secs });
             });
         }
@@ -297,6 +307,9 @@ impl LocationDialog {
     /// `settings.media.map_tiles` toggle (off → no network fetch, no grid).
     pub fn begin(&self, last: Option<(f64, f64)>, map_tiles: bool) {
         self.bump();
+        self.is_update.set(false);
+        self.heading_label.set_label("Share location");
+        self.live_row.set_visible(true);
         self.map_tiles.set(map_tiles);
         self.busy.set(false);
         self.send.set_label("Send");
@@ -313,6 +326,22 @@ impl LocationDialog {
         self.lat.grab_focus();
     }
 
+    pub fn begin_update(&self, point: GeoPoint, map_tiles: bool) {
+        self.bump();
+        self.is_update.set(true);
+        self.heading_label.set_label("Update position");
+        self.live_row.set_visible(false);
+        self.map_tiles.set(map_tiles);
+        self.busy.set(false);
+        self.send.set_label("Update");
+        self.error.set_label("");
+        self.error.set_visible(false);
+        self.zoom.set(DEFAULT_ZOOM);
+        self.set_point(point);
+        self.widget.set_visible(true);
+        self.lat.grab_focus();
+    }
+
     pub fn close(&self) {
         if !self.widget.is_visible() {
             return;
@@ -321,6 +350,9 @@ impl LocationDialog {
         move_focus_outside(self.widget.upcast_ref());
         self.widget.set_visible(false);
         self.set_busy(false);
+        self.heading_label.set_label("Share location");
+        self.live_row.set_visible(true);
+        self.is_update.set(false);
     }
 
     pub fn is_open(&self) -> bool {
@@ -329,7 +361,8 @@ impl LocationDialog {
 
     pub fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
-        self.send.set_label(if busy { "Sending…" } else { "Send" });
+        let default_label = if self.is_update.get() { "Update" } else { "Send" };
+        self.send.set_label(if busy { "Sending…" } else { default_label });
         self.lat.set_sensitive(!busy);
         self.lon.set_sensitive(!busy);
         self.live.set_sensitive(!busy);
