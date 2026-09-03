@@ -1205,7 +1205,13 @@ impl ChatList {
         } else {
             &summary.title
         };
-        row.title.set_label(title);
+        // A forum row is marked with the TOPIC glyph (§6): the row opens a
+        // topic list, not a history.
+        if summary.forum {
+            row.title.set_label(&format!("{} {title}", icons::TOPIC));
+        } else {
+            row.title.set_label(title);
+        }
         *row.title_text.borrow_mut() = title.to_string();
         row.widget.set_tooltip_text(Some(title));
         let show_avatars = self.show_avatars.get();

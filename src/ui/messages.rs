@@ -11,7 +11,8 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 
 use crate::tg::{
-    ChatInfo, ChatKind, ChatSummary, MediaKind, Msg, MsgVersion, Poll, Presence, SpanKind, Tg,
+    BotCommand, ChatInfo, ChatKind, ChatSummary, MediaKind, Msg, MsgVersion, Poll, Presence, SpanKind,
+    Tg, msg_in_chat,
 };
 
 use super::anim::Effects;
@@ -292,6 +293,17 @@ pub enum MessageAction {
     OpenInBrowser(String),
     StopLive(i32),
     RedownloadMedia(i32),
+    PressButton {
+        msg_id: i32,
+        data: Vec<u8>,
+    },
+    Start,
+    Back,
+    SwitchInline {
+        query: String,
+        same_chat: bool,
+        bot_username: String,
+    },
     UnpinMessage(i32),
     RetryPinned,
     Delete(i32),
@@ -342,6 +354,7 @@ struct MessageRow {
     media_button: Option<gtk::Button>,
     transcribe_button: Option<gtk::Button>,
     aux_slot: gtk::Box,
+    keyboard_slot: gtk::Box,
     animation_sources: Rc<RefCell<Vec<glib::SourceId>>>,
     /// The asciiload placeholder timer only — drained when the media
     /// finishes, without touching receipt/cascade/particle timers.
@@ -520,6 +533,15 @@ struct MessagesInner {
     available_reactions_loading: Cell<bool>,
     available_reactions_error: RefCell<Option<String>>,
     darker_background: RefCell<String>,
+    bot_commands: RefCell<Vec<BotCommand>>,
+    bot_username: super::bots::BotUsername,
+    start_button: gtk::Button,
+    bot_start: Cell<bool>,
+    back_button: gtk::Button,
+    /// "Forum › Topic" while a forum topic is open; the header keeps it when
+    /// a summary or chat-info refresh lands (§6.3).
+    topic_breadcrumb: RefCell<Option<String>>,
+    command_popover: RefCell<Option<Rc<super::bots::CommandPopover>>>,
     effects: Rc<Effects>,
     /// `settings.media.map_tiles` — gates the map download for 6B geo cards.
     map_tiles: Cell<bool>,
@@ -613,6 +635,12 @@ impl MessagesView {
         header_more.set_tooltip_text(Some("More actions"));
         header_actions.append(&header_more);
         header.append(&header_actions);
+
+        let back_button = gtk::Button::with_label(icons::LEFT);
+        back_button.add_css_class("omg-icon-button");
+        back_button.set_tooltip_text(Some("Back to topics"));
+        back_button.set_visible(false);
+        header.prepend(&back_button);
 
         // Jump back to the latest page; always visible while detached.
         let bottom_button = gtk::Button::new();
@@ -927,6 +955,16 @@ impl MessagesView {
                 }
             }));
         }
+        let start_button = super::bots::build_start(Rc::new({
+            let action = action.clone();
+            move |message_action| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(message_action);
+                }
+            }
+        }));
+        start_button.set_visible(false);
+        widget.append(&start_button);
         let drop_target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
         composer_box.add_controller(drop_target.clone());
 
@@ -1062,6 +1100,13 @@ impl MessagesView {
                     .cloned()
                     .unwrap_or_default(),
             ),
+            bot_commands: RefCell::new(Vec::new()),
+            bot_username: Rc::new(RefCell::new(String::new())),
+            start_button,
+            bot_start: Cell::new(false),
+            back_button,
+            topic_breadcrumb: RefCell::new(None),
+            command_popover: RefCell::new(None),
             effects,
             map_tiles: Cell::new(true),
             added_contacts: RefCell::new(HashSet::new()),
@@ -1090,6 +1135,39 @@ impl MessagesView {
             selection_forward,
             selection_cancel,
         );
+        {
+            let inner = view.inner.clone();
+            let on_choose = Rc::new({
+                let inner = inner.clone();
+                move |text: String| {
+                    inner.composer_signal_blocked.set(true);
+                    inner.composer.buffer().set_text(&format!("{text} "));
+                    inner.composer_signal_blocked.set(false);
+                    if let Some(popover) = inner.command_popover.borrow().as_ref() {
+                        popover.dismiss();
+                    }
+                    inner.composer.grab_focus();
+                }
+            });
+            let popover = super::bots::CommandPopover::new(&inner.composer, on_choose);
+            *inner.command_popover.borrow_mut() = Some(popover);
+            let key_inner = inner.clone();
+            let key = gtk::EventControllerKey::new();
+            key.set_propagation_phase(gtk::PropagationPhase::Capture);
+            key.connect_key_pressed(move |_, keyval, _, _| {
+                let handled = key_inner
+                    .command_popover
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| p.handle_key(keyval));
+                if handled {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            inner.composer.add_controller(key);
+        }
         view
     }
 
@@ -1280,6 +1358,14 @@ impl MessagesView {
             });
         }
         {
+            let action = self.inner.action.clone();
+            self.inner.back_button.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::Back);
+                }
+            });
+        }
+        {
             let inner = self.inner.clone();
             self.inner.header_more.connect_clicked(move |button| {
                 MessagesView::show_header_menu(&inner, button);
@@ -1362,6 +1448,7 @@ impl MessagesView {
                     if let Some(callback) = inner.action.borrow().as_ref().cloned() {
                         callback(MessageAction::DraftChanged);
                     }
+                    Self::refresh_command_popover(&inner);
                 }
             });
         }
@@ -2084,6 +2171,9 @@ impl MessagesView {
         self.inner
             .effects
             .empty_state(&self.inner.empty_effects, false);
+        self.clear_topic_header();
+        self.set_start_mode(false);
+        *self.inner.bot_commands.borrow_mut() = Vec::new();
     }
 
     pub fn clear_selection(&self, epoch: u64) {
@@ -2181,6 +2271,9 @@ impl MessagesView {
         if self.inner.store.borrow().order.is_empty() {
             self.inner.loading.set_label("No messages yet");
             self.inner.loading.set_visible(true);
+            if self.inner.chat_kind.get() == ChatKind::Bot {
+                self.set_start_mode(true);
+            }
         } else {
             self.inner.loading.set_visible(false);
         }
@@ -2212,6 +2305,9 @@ impl MessagesView {
             && self.inner.effects.on("unreaddivider")
             && !self.inner.unread_divider_shown.replace(true);
         let inserted = self.merge(vec![message], true, show_unread_divider);
+        if self.inner.bot_start.get() && !inserted.is_empty() {
+            self.set_start_mode(false);
+        }
         if incoming && !should_stick && !inserted.is_empty() {
             let unread = self.inner.bottom_unread.get().saturating_add(1);
             self.inner.bottom_unread.set(unread);
@@ -2305,7 +2401,12 @@ impl MessagesView {
                 self.drop_selection_ids(&[message.id]);
             }
             let current_chat = self.inner.store.borrow().chat_id;
-            if current_chat != Some(message.chat_id) {
+            // Topic messages carry the FORUM chat id plus `topic_id`, so an
+            // open topic routes them with `msg_in_chat` (§1.4); local pending
+            // rows are addressed with the open (synthetic) id itself.
+            let belongs = current_chat
+                .is_some_and(|open| message.chat_id == open || msg_in_chat(&message, open));
+            if !belongs {
                 continue;
             }
             let existing = self.inner.store.borrow().entries.contains_key(&message.id);
@@ -2627,6 +2728,23 @@ impl MessagesView {
         let aux_slot = gtk::Box::new(gtk::Orientation::Vertical, 4);
         content.append(&aux_slot);
 
+        let keyboard_slot = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        keyboard_slot.set_halign(gtk::Align::Start);
+        if let Some(keyboard) = &message.keyboard {
+            let action: Rc<dyn Fn(MessageAction)> = Rc::new({
+                let a = self.inner.action.clone();
+                move |message_action| {
+                    if let Some(callback) = a.borrow().as_ref().cloned() {
+                        callback(message_action);
+                    }
+                }
+            });
+            let bot_username = self.inner.bot_username.clone();
+            let widget = super::bots::build_keyboard(keyboard, message.id, action, bot_username);
+            keyboard_slot.append(&widget);
+        }
+        content.append(&keyboard_slot);
+
         let gesture = gtk::GestureClick::new();
         gesture.set_button(3);
         {
@@ -2688,6 +2806,7 @@ impl MessagesView {
             media_button,
             transcribe_button,
             aux_slot,
+            keyboard_slot,
             animation_sources,
             media_loading_source,
             lottie: Rc::new(RefCell::new(None)),
@@ -2817,6 +2936,26 @@ impl MessagesView {
             &self.inner.action,
             is_live,
         );
+        if message.keyboard.is_some() {
+            let action: Rc<dyn Fn(MessageAction)> = Rc::new({
+                let a = self.inner.action.clone();
+                move |message_action| {
+                    if let Some(callback) = a.borrow().as_ref().cloned() {
+                        callback(message_action);
+                    }
+                }
+            });
+            let bot_username = self.inner.bot_username.clone();
+            super::bots::update_keyboard(
+                &row.keyboard_slot,
+                message.keyboard.as_ref().unwrap(),
+                message.id,
+                action,
+                bot_username,
+            );
+        } else {
+            super::bots::clear_keyboard(&row.keyboard_slot);
+        }
         if message.edited && (!was_edited || old_text != message.text) {
             self.inner.effects.message_edited(row.widget.upcast_ref());
         }
@@ -3735,6 +3874,7 @@ impl MessagesView {
         self.inner.composer_signal_blocked.set(true);
         self.inner.composer.buffer().set_text(text);
         self.inner.composer_signal_blocked.set(false);
+        Self::refresh_command_popover(&self.inner);
     }
 
     pub fn composer_cursor(&self) -> i32 {
@@ -3836,6 +3976,8 @@ impl MessagesView {
     }
 
     pub fn show_error(&self, message: &str) {
+        self.inner.error.remove_css_class("omg-info");
+        self.inner.error.add_css_class("omg-error");
         self.inner.error.set_label(message);
         self.inner.error.set_visible(true);
     }
@@ -3859,6 +4001,111 @@ impl MessagesView {
         self.inner.error.set_label("");
         self.inner.draft_retry.set_visible(false);
         self.inner.operation_retry.set_visible(false);
+    }
+
+    /// Sibling of `show_error`: the same bar, `omg-info` instead of
+    /// `omg-error` — a bot's toast/alert text after a callback button (§6.1).
+    pub fn show_info(&self, message: &str) {
+        self.inner.error.remove_css_class("omg-error");
+        self.inner.error.add_css_class("omg-info");
+        self.inner.error.set_label(message);
+        self.inner.error.set_visible(true);
+    }
+
+    /// Bots: the `/` autocomplete list, also used by groups whose
+    /// `ChatInfo.bot_commands` is non-empty. `bot_username` feeds the
+    /// keyboard's SwitchInline buttons.
+    pub fn set_bot_commands(&self, commands: Vec<BotCommand>, bot_username: String) {
+        *self.inner.bot_commands.borrow_mut() = commands.clone();
+        *self.inner.bot_username.borrow_mut() = bot_username;
+        if let Some(popover) = self.inner.command_popover.borrow().as_ref() {
+            popover.set_commands(commands);
+        }
+        Self::refresh_command_popover(&self.inner);
+    }
+
+    /// Show the full-width Start button in place of the composer (a bot chat
+    /// with an empty history). `false` restores the composer.
+    pub fn set_start_mode(&self, enabled: bool) {
+        self.inner.bot_start.set(enabled);
+        self.inner.start_button.set_visible(enabled);
+        self.inner.composer_box.set_visible(!enabled);
+    }
+
+    /// Topic header: "Forum › Topic" with a back button to the topic list.
+    pub fn set_topic_header(&self, breadcrumb: &str) {
+        *self.inner.topic_breadcrumb.borrow_mut() = Some(breadcrumb.to_string());
+        self.inner.header_title.set_label(breadcrumb);
+        self.inner.back_button.set_visible(true);
+    }
+
+    pub fn clear_topic_header(&self) {
+        self.inner.topic_breadcrumb.borrow_mut().take();
+        self.inner.back_button.set_visible(false);
+    }
+
+    /// Rebuild one message's inline keyboard from the store (restores the
+    /// pressed button after a callback answered, §6.1).
+    pub fn refresh_keyboard(&self, msg_id: i32) {
+        let store = self.inner.store.borrow();
+        let Some(entry) = store.entries.get(&msg_id) else {
+            return;
+        };
+        let slot = entry.row.keyboard_slot.clone();
+        let keyboard = entry.msg.keyboard.clone();
+        drop(store);
+        // The pressed button may hold keyboard focus (GTK4 lesson).
+        self.move_focus_before_removal(&slot);
+        match keyboard {
+            Some(keyboard) => {
+                let action: Rc<dyn Fn(MessageAction)> = Rc::new({
+                    let action = self.inner.action.clone();
+                    move |message_action| {
+                        if let Some(callback) = action.borrow().as_ref().cloned() {
+                            callback(message_action);
+                        }
+                    }
+                });
+                super::bots::update_keyboard(
+                    &slot,
+                    &keyboard,
+                    msg_id,
+                    action,
+                    self.inner.bot_username.clone(),
+                );
+            }
+            None => super::bots::clear_keyboard(&slot),
+        }
+    }
+
+    fn dismiss_command_popover(inner: &Rc<MessagesInner>) {
+        if let Some(popover) = inner.command_popover.borrow().as_ref() {
+            popover.dismiss();
+        }
+    }
+
+    fn refresh_command_popover(inner: &Rc<MessagesInner>) {
+        if inner.bot_commands.borrow().is_empty() {
+            Self::dismiss_command_popover(inner);
+            return;
+        }
+        let buffer = inner.composer.buffer();
+        let text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), true)
+            .to_string();
+        // Only a bare "/prefix" at the very start of the composer lists
+        // commands; a space (the command is complete) closes the popover.
+        let Some(prefix) = text.strip_prefix('/') else {
+            Self::dismiss_command_popover(inner);
+            return;
+        };
+        if prefix.contains(char::is_whitespace) {
+            Self::dismiss_command_popover(inner);
+            return;
+        }
+        if let Some(popover) = inner.command_popover.borrow().as_ref() {
+            popover.refresh(prefix);
+        }
     }
 
     pub fn message(&self, msg_id: i32) -> Option<Msg> {
@@ -4048,6 +4295,112 @@ impl MessagesView {
             child = widget.next_sibling();
         }
         false
+    }
+
+    /// The inline-keyboard buttons under a message, in row order.
+    fn keyboard_buttons(&self, msg_id: i32) -> Vec<gtk::Button> {
+        let slot = self
+            .inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .map(|entry| entry.row.keyboard_slot.clone());
+        let mut buttons = Vec::new();
+        if let Some(slot) = slot {
+            collect_buttons(slot.upcast_ref(), &mut buttons);
+        }
+        buttons
+    }
+
+    /// Probe hook: the visible keyboard labels, without the in-flight "…" and
+    /// the EXTERNAL glyph a Url button carries.
+    pub fn keyboard_button_labels(&self, msg_id: i32) -> Vec<String> {
+        self.keyboard_buttons(msg_id)
+            .iter()
+            .map(|button| base_label(button))
+            .collect()
+    }
+
+    /// Probe hook: click a real inline-keyboard button by its label.
+    pub fn click_keyboard_button(&self, msg_id: i32, label: &str) -> bool {
+        let Some(button) = self
+            .keyboard_buttons(msg_id)
+            .into_iter()
+            .find(|button| base_label(button) == label)
+        else {
+            return false;
+        };
+        button.emit_clicked();
+        true
+    }
+
+    /// Probe hook: is that button pressable (a callback in flight is not)?
+    pub fn keyboard_button_ready(&self, msg_id: i32, label: &str) -> bool {
+        self.keyboard_buttons(msg_id)
+            .into_iter()
+            .find(|button| base_label(button) == label)
+            .is_some_and(|button| button.is_sensitive())
+    }
+
+    /// The bot-alert bar is the error bar wearing `omg-info` (§6.1).
+    pub fn info_visible(&self) -> bool {
+        self.inner.error.is_visible() && self.inner.error.has_css_class("omg-info")
+    }
+
+    pub fn start_button_visible(&self) -> bool {
+        self.inner.start_button.is_visible()
+    }
+
+    pub fn command_popover_open(&self) -> bool {
+        self.inner
+            .command_popover
+            .borrow()
+            .as_ref()
+            .is_some_and(|popover| popover.is_open())
+    }
+
+    pub fn command_popover_rows(&self) -> usize {
+        self.inner
+            .command_popover
+            .borrow()
+            .as_ref()
+            .map(|popover| popover.row_count())
+            .unwrap_or(0)
+    }
+
+    pub fn click_start(&self) {
+        self.inner.start_button.emit_clicked();
+    }
+
+    pub fn composer_visible(&self) -> bool {
+        self.inner.composer_box.is_visible()
+    }
+
+    pub fn back_button_visible(&self) -> bool {
+        self.inner.back_button.is_visible()
+    }
+
+    /// Probe hook: the topic back button (returns to the topic list).
+    pub fn click_back(&self) {
+        self.inner.back_button.emit_clicked();
+    }
+
+    /// Probe hook: the highlighted command in the `/` popover.
+    pub fn command_popover_selected(&self) -> Option<String> {
+        self.inner
+            .command_popover
+            .borrow()
+            .as_ref()
+            .and_then(|popover| popover.selected())
+    }
+
+    /// Probe hook: the Enter/Tab path of the `/` popover (no synthetic input).
+    pub fn command_popover_activate(&self) {
+        let popover = self.inner.command_popover.borrow().clone();
+        if let Some(popover) = popover {
+            popover.activate_selected();
+        }
     }
 
     pub fn pagination_ready(&self) -> bool {
@@ -5308,7 +5661,13 @@ impl MessagesView {
     }
 
     pub fn set_chat_summary(&self, summary: &ChatSummary, tg: &Tg) {
-        self.inner.header_title.set_label(&summary.title);
+        let title = self
+            .inner
+            .topic_breadcrumb
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| summary.title.clone());
+        self.inner.header_title.set_label(&title);
         self.inner
             .header_avatar
             .bind(tg, summary.id, &summary.title, summary.has_photo);
@@ -5341,6 +5700,7 @@ impl MessagesView {
             ChatKind::Saved => "saved messages".to_string(),
         };
         self.set_base_status(&status, info.presence == Presence::Online);
+        self.set_bot_commands(info.bot_commands.clone(), info.username.clone());
     }
 
     pub fn set_virtual_header(&self, chat_id: i64, tg: &Tg) {
@@ -6357,6 +6717,34 @@ pub fn search_position(index: Option<usize>, total: usize) -> String {
         (Some(index), total) if index < total => format!("{} of {total}", index + 1),
         _ => "No results".to_string(),
     }
+}
+
+/// Every `gtk::Button` under `widget`, depth first, in visual order.
+fn collect_buttons(widget: &gtk::Widget, out: &mut Vec<gtk::Button>) {
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        match current.clone().downcast::<gtk::Button>() {
+            Ok(button) => out.push(button),
+            Err(_) => collect_buttons(&current, out),
+        }
+        child = current.next_sibling();
+    }
+}
+
+/// A keyboard button's plain text: without the in-flight "…" suffix and
+/// without the EXTERNAL glyph a Url button shows.
+fn base_label(button: &gtk::Button) -> String {
+    button
+        .label()
+        .map(|label| {
+            label
+                .trim_end_matches(icons::EXTERNAL)
+                .trim_end()
+                .trim_end_matches('…')
+                .trim_end()
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 fn aux_label(text: &str, error: bool) -> gtk::Label {

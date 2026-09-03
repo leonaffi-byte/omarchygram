@@ -18,8 +18,8 @@ use crate::local::Local as LocalServices;
 use crate::os::{self, OsPolicy, Parsed};
 use crate::settings::{Settings, SettingsStore};
 use crate::tg::{
-    AuthState, BackendFlags, ChatInfo, ChatKind, Event, Me, MediaKind, Msg, MuteMode,
-    SharedKind, Tg,
+    AuthState, BackendFlags, ChatInfo, ChatKind, ChatSummary, Event, Me, MediaKind, Msg, MuteMode,
+    SharedKind, Tg, Topic, msg_in_chat, split_topic_chat_id, topic_chat_id,
 };
 use crate::uistate::UiState;
 
@@ -46,6 +46,7 @@ use super::recorder::{
 use super::settings_view::SettingsView;
 use super::stickers::{StickerAction, StickerPicker, StickerSend};
 use super::switcher::Switcher;
+use super::topics::{TopicAction, TopicListView};
 use super::viewer::{Viewer, ViewerAction};
 use super::virtual_chat::{
     ASSISTANT_CHAT, AuxState, OMARCHY_CHAT, ReqState, VirtualStore, is_virtual, virtual_title,
@@ -496,6 +497,12 @@ struct ShellInner {
     auth: AuthView,
     chatlist: ChatList,
     messages: MessagesView,
+    topics: TopicListView,
+    content_area: gtk::Stack,
+    forum_list_open: Cell<bool>,
+    /// SwitchInline text waiting for the chat the switcher picks (§6.1).
+    pending_inline_query: RefCell<Option<String>>,
+    forum_topics: RefCell<Vec<Topic>>,
     info: InfoPanel,
     contacts: ContactsDialog,
     new_group: NewGroupDialog,
@@ -618,6 +625,12 @@ impl Shell {
         let messages = MessagesView::new(effects.clone());
         messages.set_player_settings(settings.clone());
         messages.set_probe(probe);
+        let topics = TopicListView::new();
+        let content_area = gtk::Stack::new();
+        content_area.set_transition_type(gtk::StackTransitionType::None);
+        content_area.add_named(&messages.widget, Some("messages"));
+        content_area.add_named(&topics.widget, Some("topics"));
+        content_area.set_visible_child_name("messages");
         let info = InfoPanel::new(tg.clone());
         let contacts = ContactsDialog::new(tg.clone());
         let new_group = NewGroupDialog::new();
@@ -659,7 +672,7 @@ impl Shell {
         content_paned.add_css_class("omg-handle");
         content_paned.set_hexpand(true);
         content_paned.set_vexpand(true);
-        content_paned.set_start_child(Some(&messages.widget));
+        content_paned.set_start_child(Some(&content_area));
         content_paned.set_resize_start_child(true);
         content_paned.set_shrink_start_child(false);
         content_paned.set_resize_end_child(false);
@@ -696,6 +709,7 @@ impl Shell {
         overlay.add_overlay(&new_group.widget);
         overlay.add_overlay(&poll_dialog.widget);
         overlay.add_overlay(&location_dialog.widget);
+        overlay.add_overlay(&topics.dialog);
         overlay.set_hexpand(true);
         overlay.set_vexpand(true);
         let shell_overlay = gtk::Overlay::new();
@@ -721,6 +735,11 @@ impl Shell {
             auth,
             chatlist,
             messages,
+            topics,
+            content_area,
+            forum_list_open: Cell::new(false),
+            pending_inline_query: RefCell::new(None),
+            forum_topics: RefCell::new(Vec::new()),
             info,
             contacts,
             new_group,
@@ -940,6 +959,20 @@ impl ShellInner {
         }
         {
             let weak = Rc::downgrade(this);
+            this.topics.set_action(Rc::new(move |action| {
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                match action {
+                    TopicAction::OpenTopic(chat_id) => this.clone().open_chat(chat_id),
+                    TopicAction::CreateTopic(title) => {
+                        this.clone().create_topic_from_dialog(title);
+                    }
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
             this.forward.set_action(Rc::new(move |action| {
                 if let Some(this) = weak.upgrade() {
                     this.handle_forward_action(action);
@@ -1142,6 +1175,8 @@ impl ShellInner {
                         this.close_poll_dialog();
                     } else if this.location_dialog.is_open() {
                         this.close_location_dialog();
+                    } else if this.topics.dialog_is_open() {
+                        this.topics.close_dialog();
                     } else if this.stickers.is_open() {
                         this.close_stickers();
                     } else if this.caption_dialog.borrow().is_some() {
@@ -1158,6 +1193,7 @@ impl ShellInner {
                     } else if this.messages.search_is_open() {
                         this.close_in_chat_search();
                     } else if this.switcher.is_open() {
+                        this.pending_inline_query.borrow_mut().take();
                         this.clear_window_focus();
                         this.switcher.close();
                         this.messages.focus_composer();
@@ -2489,7 +2525,13 @@ impl ShellInner {
         if !self.ui_state.borrow().info_panel_open {
             return;
         }
-        let Some(chat_id) = self.open_chat.get().filter(|chat_id| !is_virtual(*chat_id)) else {
+        // A forum topic has no chat info of its own: the panel shows the forum.
+        let Some(chat_id) = self
+            .open_chat
+            .get()
+            .map(dialog_id)
+            .filter(|chat_id| !is_virtual(*chat_id))
+        else {
             self.info.unbind();
             self.apply_info_layout(self.current_window_width());
             return;
@@ -3667,7 +3709,8 @@ impl ShellInner {
         unread: UnreadUpdate,
     ) {
         self.bump_dialogs_revision();
-        self.chatlist.upsert(chat_id, title, preview, time, unread);
+        self.chatlist
+            .upsert(dialog_id(chat_id), title, preview, time, unread);
     }
 
     fn run_smoke_hooks(self: &Rc<Self>) {
@@ -3915,7 +3958,7 @@ impl ShellInner {
                 let known = *known;
                 drop(read);
                 self.chatlist.set_read_outbox(chat_id, known);
-                if self.open_chat.get() == Some(chat_id) {
+                if self.open_chat_is(chat_id) {
                     self.messages.set_read_outbox(known);
                 }
             }
@@ -3936,18 +3979,23 @@ impl ShellInner {
                 self.schedule_dialogs_reload();
             }
             Event::PinnedChanged { chat_id } => {
-                if self.open_chat.get() == Some(chat_id) {
-                    self.load_pinned(chat_id);
+                if let Some(open) = self.open_chat.get().filter(|_| self.open_chat_is(chat_id)) {
+                    self.load_pinned(open);
                 }
             }
             // Wave 6 events: handled by the 6B/6C/6E/6F packages (specs/spec-wave6.md).
             Event::PollChanged { poll_id, poll } => {
                 self.messages.update_poll(poll_id, poll);
             }
-            Event::TopicsChanged { .. } | Event::StoriesChanged => {}
+            Event::StoriesChanged => {}
             Event::ScheduledChanged { chat_id } => {
                 if self.open_chat.get() == Some(chat_id) {
                     self.clone().refresh_scheduled(chat_id);
+                }
+            }
+            Event::TopicsChanged { forum_id } => {
+                if self.forum_list_open.get() && self.open_chat.get() == Some(forum_id) {
+                    self.schedule_forum_topics_refresh(forum_id);
                 }
             }
             Event::NewMessage(message) => self.handle_new_message(message),
@@ -3964,7 +4012,11 @@ impl ShellInner {
                     .borrow_mut()
                     .insert(message_key, change);
                 let message = self.apply_tombstone(message);
-                if self.open_chat.get() == Some(message.chat_id) {
+                let is_open = self
+                    .open_chat
+                    .get()
+                    .is_some_and(|id| msg_in_chat(&message, id));
+                if is_open && !self.forum_list_open.get() {
                     let was_last = self.messages.is_last(message.id);
                     let inserted = self.messages.merge_event(message.clone());
                     self.post_render(inserted);
@@ -3988,7 +4040,7 @@ impl ShellInner {
                 if viewer_closed {
                     self.close_viewer();
                 }
-                let is_open = self.open_chat.get() == Some(chat_id);
+                let is_open = self.open_chat_is(chat_id);
                 let anti_delete = self.settings.get().anti_delete;
                 let tracked_last = self
                     .last_by_chat
@@ -4089,9 +4141,14 @@ impl ShellInner {
     fn handle_new_message(self: &Rc<Self>, message: Msg) {
         let message = self.apply_tombstone(message);
         let active = self.window_is_active();
-        let is_open = self.open_chat.get() == Some(message.chat_id);
+        let is_open = self
+            .open_chat
+            .get()
+            .is_some_and(|id| msg_in_chat(&message, id));
+        let forum_list = self.forum_list_open.get();
+        let show_in_messages = is_open && !forum_list;
         let manual_unread = self.manual_unread_hold.borrow().contains(&message.chat_id);
-        let read_triggered = is_open && active && !manual_unread;
+        let read_triggered = show_in_messages && active && !manual_unread;
         // Outgoing = sent from the user's own other device: show it (the store
         // dedupes against local sends by id), but never notify or count unread.
         let own = message.outgoing;
@@ -4114,14 +4171,20 @@ impl ShellInner {
                 },
             );
         }
-        if is_open {
+        if forum_list && is_open {
+            // A topic got a new message while its list is open: bump the unread
+            // in the list (the mock also emits TopicsChanged, which refetches).
+            self.schedule_forum_topics_refresh(message.chat_id);
+        }
+        if show_in_messages {
             let inserted = self.messages.merge_event(message.clone());
             self.post_render(inserted);
             if !own && !message.deleted {
                 self.messages.mark_recent_incoming();
             }
             if read_triggered && !own && !message.deleted {
-                self.queue_mark_read(message.chat_id, message.id, self.epoch.get());
+                let read_chat = self.open_chat.get().unwrap_or(message.chat_id);
+                self.queue_mark_read(read_chat, message.id, self.epoch.get());
             }
         }
         if !own && !message.deleted && !is_open {
@@ -4206,7 +4269,20 @@ impl ShellInner {
         }
         let epoch = self.bump_epoch();
         self.open_chat.set(Some(chat_id));
-        self.chatlist.select_chat(chat_id);
+
+        // A forum supergroup row shows its topic list instead of a history
+        // (§6.3); a synthetic topic id opens like a normal chat, but the
+        // chat-list selection stays on the forum row.
+        let topic = split_topic_chat_id(chat_id);
+        if topic.is_none() {
+            if let Some(summary) = self.chatlist.summary(chat_id).filter(|s| s.forum) {
+                self.open_forum(chat_id, &summary, epoch);
+                return;
+            }
+        }
+        self.forum_list_open.set(false);
+        self.content_area.set_visible_child_name("messages");
+        self.chatlist.select_chat(dialog_id(chat_id));
         {
             let mut recent = self.recent_real_chats.borrow_mut();
             recent.retain(|id| *id != chat_id);
@@ -4214,7 +4290,10 @@ impl ShellInner {
         }
         let title = self.title_for(chat_id);
         self.messages.reset_chat(chat_id, &title, epoch);
-        if let Some(summary) = self.chatlist.summary(chat_id) {
+        if let Some(summary) = self.chatlist.summary(dialog_id(chat_id)) {
+            if let Some((forum_id, topic_id)) = topic {
+                self.set_topic_breadcrumb(forum_id, topic_id, epoch);
+            }
             self.messages.set_chat_summary(&summary, &self.tg);
             let known = self
                 .read_outbox
@@ -4223,10 +4302,20 @@ impl ShellInner {
                 .copied()
                 .unwrap_or(summary.read_outbox_max_id);
             self.messages.set_read_outbox(known);
+        } else if let Some((forum_id, topic_id)) = topic {
+            self.set_topic_breadcrumb(forum_id, topic_id, epoch);
         }
         self.restore_draft(chat_id);
+        if let Some(text) = self.pending_inline_query.borrow_mut().take() {
+            self.messages.set_composer_text(&text);
+            self.messages.focus_composer();
+        }
         self.bind_info_panel();
-        self.load_chat_info(chat_id, epoch);
+        // A topic has no chat info of its own; its bot commands, members and
+        // presence are the forum's, which the topic list already showed.
+        if topic.is_none() {
+            self.load_chat_info(chat_id, epoch);
+        }
         self.load_pinned(chat_id);
         let recent = self
             .recent_incoming
@@ -4239,6 +4328,125 @@ impl ShellInner {
         self.clone().start_initial_load(chat_id, epoch);
         // Spec §4.4: the strip belongs to the chat, so every open refetches.
         self.refresh_scheduled(chat_id);
+    }
+
+    /// Show a forum's topic list in place of the message pane.
+    fn open_forum(self: &Rc<Self>, forum_id: i64, summary: &ChatSummary, epoch: u64) {
+        self.forum_list_open.set(true);
+        self.chatlist.select_chat(forum_id);
+        {
+            let mut recent = self.recent_real_chats.borrow_mut();
+            recent.retain(|id| *id != forum_id);
+            recent.insert(0, forum_id);
+        }
+        self.messages.reset_chat(forum_id, &summary.title, epoch);
+        self.topics.set_forum(&summary.title);
+        self.topics.clear();
+        self.content_area.set_visible_child_name("topics");
+        self.bind_info_panel();
+        self.load_forum_topics(forum_id, epoch);
+    }
+
+    fn load_forum_topics(self: &Rc<Self>, forum_id: i64, epoch: u64) {
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.get_topics(forum_id).await;
+            let Some(this) = weak.upgrade().filter(|this| {
+                this.session_ready.get() && this.session_epoch.get() == session_epoch
+            }) else {
+                return;
+            };
+            match result {
+                Ok(topics) => {
+                    *this.forum_topics.borrow_mut() = topics.clone();
+                    if this.is_current(forum_id, epoch) && this.forum_list_open.get() {
+                        this.topics.set_topics(topics);
+                    }
+                }
+                Err(error) => {
+                    shell_log!("get_topics({forum_id}): {error}");
+                    if this.is_current(forum_id, epoch) && this.forum_list_open.get() {
+                        this.messages.show_error(&error);
+                    }
+                }
+            }
+        });
+    }
+
+    /// `TopicsChanged`, or a new message in a topic of the open forum.
+    fn schedule_forum_topics_refresh(self: &Rc<Self>, forum_id: i64) {
+        if !self.forum_list_open.get() || self.open_chat.get() != Some(forum_id) {
+            return;
+        }
+        self.load_forum_topics(forum_id, self.epoch.get());
+    }
+
+    /// Create a topic from the new-topic dialog, then open it (§6.3).
+    fn create_topic_from_dialog(self: Rc<Self>, title: String) {
+        let Some(forum_id) = self.open_chat.get().filter(|_| self.forum_list_open.get()) else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        glib::MainContext::default().spawn_local(async move {
+            match self.tg.create_topic(forum_id, &title).await {
+                Ok(topic) => {
+                    // The backend also emits TopicsChanged; refetch so the new
+                    // row carries the backend's ordering and counts.
+                    self.load_forum_topics(forum_id, epoch);
+                    if self.is_current(forum_id, epoch) && self.forum_list_open.get() {
+                        self.clone().open_chat(topic.chat_id);
+                    }
+                }
+                Err(error) => {
+                    shell_log!("create_topic({forum_id}): {error}");
+                    if self.is_current(forum_id, epoch) {
+                        self.messages.show_error(&error);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Header breadcrumb "Forum › Topic" plus the back button (§6.3). The
+    /// topic list is usually already loaded; when the topic was opened
+    /// directly (a restored session) its title is fetched.
+    fn set_topic_breadcrumb(self: &Rc<Self>, forum_id: i64, topic_id: i32, epoch: u64) {
+        let forum_title = self.title_for(forum_id);
+        let topic_title = self
+            .forum_topics
+            .borrow()
+            .iter()
+            .find(|topic| topic.forum_id == forum_id && topic.id == topic_id)
+            .map(|topic| topic.title.clone());
+        match topic_title {
+            Some(topic_title) => self
+                .messages
+                .set_topic_header(&format!("{forum_title} › {topic_title}")),
+            None => {
+                self.messages.set_topic_header(&forum_title);
+                let chat_id = topic_chat_id(forum_id, topic_id);
+                let tg = self.tg.clone();
+                let weak = Rc::downgrade(self);
+                glib::MainContext::default().spawn_local(async move {
+                    let Ok(topics) = tg.get_topics(forum_id).await else {
+                        return;
+                    };
+                    let Some(this) = weak.upgrade() else {
+                        return;
+                    };
+                    *this.forum_topics.borrow_mut() = topics.clone();
+                    if !this.is_current(chat_id, epoch) {
+                        return;
+                    }
+                    if let Some(topic) = topics.iter().find(|topic| topic.id == topic_id) {
+                        this.messages
+                            .set_topic_header(&format!("{forum_title} › {}", topic.title));
+                    }
+                });
+            }
+        }
     }
 
     fn open_virtual_chat(self: Rc<Self>, chat_id: i64) {
@@ -4534,6 +4742,14 @@ impl ShellInner {
             MessageAction::RedownloadMedia(msg_id) => {
                 self.start_media_download(msg_id, false);
             }
+            MessageAction::PressButton { msg_id, data } => self.press_callback_button(msg_id, data),
+            MessageAction::Start => self.send_start(),
+            MessageAction::Back => self.go_back_from_topic(),
+            MessageAction::SwitchInline {
+                query,
+                same_chat,
+                bot_username,
+            } => self.switch_inline(query, same_chat, bot_username),
             MessageAction::UnpinMessage(msg_id) => self.unpin_message(msg_id),
             MessageAction::RetryPinned => {
                 if let Some(chat_id) = self.open_chat.get() {
@@ -5033,8 +5249,8 @@ impl ShellInner {
         // The probe must never reach the user's browser: count the launch
         // instead (same rule as launch_media / open_in_browser).
         if self.probe {
-            self.probe_uri_launches
-                .set(self.probe_uri_launches.get().wrapping_add(1));
+            self.probe_media_launches
+                .set(self.probe_media_launches.get().wrapping_add(1));
             return;
         }
         if let Some(window) = self.window() {
@@ -5063,6 +5279,89 @@ impl ShellInner {
                 _ => {}
             }
         });
+    }
+
+    /// Bot inline-keyboard callback button (wave 6E §6.1).
+    fn press_callback_button(self: Rc<Self>, msg_id: i32, data: Vec<u8>) {
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        glib::MainContext::default().spawn_local(async move {
+            let result = self.tg.press_button(chat_id, msg_id, data).await;
+            if !self.is_current(chat_id, epoch) {
+                return;
+            }
+            // The button showed "…" while in flight: rebuild it either way.
+            self.messages.refresh_keyboard(msg_id);
+            match result {
+                // Some(text) = the bot answered with a toast/alert (§6.1).
+                Ok(Some(text)) => self.messages.show_info(&text),
+                Ok(None) => {}
+                Err(error) => {
+                    shell_log!("press_button({chat_id}, {msg_id}): {error}");
+                    self.messages.show_error(&error);
+                }
+            }
+        });
+    }
+
+    /// Bot Start button (wave 6E §6.2): sends `/start`.
+    fn send_start(self: Rc<Self>) {
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+            return;
+        };
+        let epoch = self.epoch.get();
+        let title = self.title_for(chat_id);
+        glib::MainContext::default().spawn_local(async move {
+            let result = self.tg.send_text(chat_id, "/start", None).await;
+            match result {
+                Ok(message) => {
+                    let message = self.apply_tombstone(message);
+                    self.remember_last(&message);
+                    self.dialog_upsert(
+                        chat_id,
+                        &title,
+                        &message_preview(&message),
+                        Some(message.ts),
+                        UnreadUpdate::Delta(0),
+                    );
+                    if self.is_current(chat_id, epoch) {
+                        // merge_event restores the composer in place of Start.
+                        let inserted = self.messages.merge_event(message);
+                        self.post_render(inserted);
+                        self.messages.set_start_mode(false);
+                    }
+                }
+                Err(error) => {
+                    shell_log!("send_text({chat_id}, /start): {error}");
+                    if self.is_current(chat_id, epoch) {
+                        self.messages.show_error(&error);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Back button from an open topic to the forum's topic list.
+    fn go_back_from_topic(self: Rc<Self>) {
+        let Some((forum_id, _)) = self.open_chat.get().and_then(split_topic_chat_id) else {
+            return;
+        };
+        self.open_chat(forum_id);
+    }
+
+    /// Bot SwitchInline keyboard button (wave 6E §6.1): "@bot query" into the
+    /// composer of this chat, or of the chat picked in the switcher.
+    fn switch_inline(self: Rc<Self>, query: String, same_chat: bool, bot_username: String) {
+        let text = format!("@{bot_username} {query}").trim_end().to_string();
+        if same_chat {
+            self.messages.set_composer_text(&text);
+            self.messages.focus_composer();
+            return;
+        }
+        *self.pending_inline_query.borrow_mut() = Some(text);
+        self.open_switcher();
     }
 
     fn reply_last(&self) {
@@ -7397,6 +7696,12 @@ impl ShellInner {
             && !self.anti_reload_pending.get()
     }
 
+    /// True when `chat_id` (a plain dialog id, as chat-scoped events carry)
+    /// addresses the open chat — including an open topic of that forum.
+    fn open_chat_is(&self, chat_id: i64) -> bool {
+        self.open_chat.get().map(dialog_id) == Some(chat_id)
+    }
+
     fn is_current(&self, chat_id: i64, epoch: u64) -> bool {
         self.session_ready.get()
             && self.open_chat.get() == Some(chat_id)
@@ -7404,6 +7709,7 @@ impl ShellInner {
     }
 
     fn title_for(&self, chat_id: i64) -> String {
+        let chat_id = dialog_id(chat_id);
         self.chatlist
             .ordered()
             .into_iter()
@@ -9892,6 +10198,389 @@ impl ShellInner {
             return;
         }
 
+        // ---- wave 6E: bots and forums (specs/spec-wave6.md §6, §1.11) ----
+        let chat_by_title = |wanted: &str| {
+            self.chatlist
+                .ordered()
+                .into_iter()
+                .find_map(|(id, title)| (title == wanted).then_some(id))
+        };
+        let (Some(bot_id), Some(helper_id), Some(forum_id)) = (
+            chat_by_title("Omarchy Bot"),
+            chat_by_title("Helper Bot"),
+            chat_by_title("Omarchy Forum"),
+        ) else {
+            probe_fail("6E fixtures missing");
+            return;
+        };
+
+        self.clone().open_chat(bot_id);
+        if !poll_until(4000, || {
+            self.open_chat.get() == Some(bot_id)
+                && !self.messages.is_loading()
+                && self.chat_info.borrow().contains_key(&bot_id)
+        })
+        .await
+        {
+            probe_fail("open Omarchy Bot");
+            return;
+        }
+        let keyboard_id = self
+            .messages
+            .messages()
+            .into_iter()
+            .find(|message| message.keyboard.is_some())
+            .map(|message| message.id);
+        let Some(keyboard_id) = keyboard_id else {
+            probe_fail("bot keyboard message");
+            return;
+        };
+        let first_button = |this: &Rc<Self>| {
+            this.messages
+                .keyboard_button_labels(keyboard_id)
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        };
+        if first_button(&self) != "Next theme" {
+            probe_fail("bot keyboard render");
+            return;
+        }
+
+        // A Callback button: the answer renames the button (MessageChanged).
+        probe_step("bot keyboard callback");
+        if !self
+            .messages
+            .click_keyboard_button(keyboard_id, "Next theme")
+        {
+            probe_fail("bot keyboard next-theme button");
+            return;
+        }
+        if !poll_until(4000, || {
+            first_button(&self) == "Next theme ✓"
+                && self
+                    .messages
+                    .message(keyboard_id)
+                    .and_then(|message| message.keyboard)
+                    .and_then(|keyboard| keyboard.rows.first().and_then(|row| row.first()).cloned())
+                    .is_some_and(|button| button.text == "Next theme ✓")
+        })
+        .await
+        {
+            probe_fail("bot keyboard callback label");
+            return;
+        }
+
+        // A Callback button the bot answers with an alert: the info bar.
+        probe_step("bot keyboard alert");
+        if !self.messages.click_keyboard_button(keyboard_id, "Lock") {
+            probe_fail("bot keyboard lock button");
+            return;
+        }
+        if !poll_until(4000, || {
+            self.messages.info_visible()
+                && self.messages.error_text() == "Locked (mock)"
+                && self.messages.keyboard_button_ready(keyboard_id, "Lock")
+        })
+        .await
+        {
+            probe_fail("bot keyboard alert info bar");
+            return;
+        }
+
+        // A Url button: counted, never launched (the probe owns no browser).
+        probe_step("bot keyboard url");
+        let launches_before = self.probe_media_launches.get();
+        if !self.messages.click_keyboard_button(keyboard_id, "Docs") {
+            probe_fail("bot keyboard docs button");
+            return;
+        }
+        if !poll_until(2000, || {
+            self.probe_media_launches.get() == launches_before.wrapping_add(1)
+        })
+        .await
+        {
+            probe_fail("bot keyboard url launch");
+            return;
+        }
+        glib::timeout_future(Duration::from_millis(200)).await;
+        if self.probe_media_launches.get() != launches_before.wrapping_add(1) {
+            probe_fail("bot keyboard url launched twice");
+            return;
+        }
+
+        // A SwitchInline button: "@bot query" into this chat's composer.
+        probe_step("bot keyboard switch inline");
+        if !self.messages.click_keyboard_button(keyboard_id, "Search") {
+            probe_fail("bot keyboard search button");
+            return;
+        }
+        if !poll_until(2000, || {
+            self.messages.composer_text() == "@omarchy_bot omarchy"
+        })
+        .await
+        {
+            probe_fail("bot keyboard switch inline composer");
+            return;
+        }
+
+        // "/" lists the bot's commands; Enter fills the selected one.
+        probe_step("bot command autocomplete");
+        self.messages.set_composer_text("/");
+        if !poll_until(2000, || {
+            self.messages.command_popover_open() && self.messages.command_popover_rows() == 4
+        })
+        .await
+        {
+            probe_fail("bot command popover");
+            return;
+        }
+        self.messages.set_composer_text("/the");
+        if !poll_until(2000, || {
+            self.messages.command_popover_rows() == 1
+                && self.messages.command_popover_selected().as_deref() == Some("/theme")
+        })
+        .await
+        {
+            probe_fail("bot command filter");
+            return;
+        }
+        self.messages.command_popover_activate();
+        if !poll_until(2000, || {
+            self.messages.composer_text() == "/theme " && !self.messages.command_popover_open()
+        })
+        .await
+        {
+            probe_fail("bot command fill");
+            return;
+        }
+        self.messages.set_composer_text("");
+
+        // An empty bot chat shows Start in place of the composer.
+        self.clone().open_chat(helper_id);
+        if !poll_until(4000, || {
+            self.open_chat.get() == Some(helper_id) && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("open Helper Bot");
+            return;
+        }
+        probe_step("bot start");
+        if !poll_until(3000, || {
+            self.messages.start_button_visible() && !self.messages.composer_visible()
+        })
+        .await
+        {
+            probe_fail("bot start button");
+            return;
+        }
+        self.messages.click_start();
+        if !poll_until(5000, || {
+            self.messages
+                .messages()
+                .iter()
+                .any(|message| message.outgoing && message.text == "/start")
+                && !self.messages.start_button_visible()
+                && self.messages.composer_visible()
+        })
+        .await
+        {
+            probe_fail("bot start sends /start");
+            return;
+        }
+
+        // A forum opens its topic list, pinned first.
+        self.clone().open_chat(forum_id);
+        probe_step("forum topics list");
+        if !poll_until(5000, || {
+            self.open_chat.get() == Some(forum_id)
+                && self.content_area.visible_child_name().as_deref() == Some("topics")
+                && self.topics.topic_titles().len() == 4
+        })
+        .await
+        {
+            probe_fail("forum topic list");
+            return;
+        }
+        if self.topics.topic_titles().first().map(String::as_str) != Some("Bugs") {
+            probe_fail("forum pinned topic first");
+            return;
+        }
+
+        // Opening a topic: history of that topic only, in a message pane.
+        let themes_row = self
+            .topics
+            .topic_titles()
+            .iter()
+            .position(|title| title == "Themes");
+        let Some(themes_row) = themes_row else {
+            probe_fail("forum Themes topic missing");
+            return;
+        };
+        let themes_chat = self
+            .forum_topics
+            .borrow()
+            .iter()
+            .find(|topic| topic.title == "Themes")
+            .map(|topic| topic.chat_id);
+        let Some(themes_chat) = themes_chat else {
+            probe_fail("forum Themes chat id");
+            return;
+        };
+        self.topics.open_index(themes_row as i32);
+        probe_step("forum open topic");
+        if !poll_until(5000, || {
+            self.open_chat.get() == Some(themes_chat)
+                && self.content_area.visible_child_name().as_deref() == Some("messages")
+                && !self.messages.is_loading()
+                && self.messages.len() == 8
+        })
+        .await
+        {
+            probe_fail("forum open topic");
+            return;
+        }
+
+        probe_step("forum topic header");
+        if self.messages.header_title() != "Omarchy Forum › Themes" {
+            probe_fail("forum topic breadcrumb");
+            return;
+        }
+        if !self.messages.back_button_visible() || self.chatlist.selected() != Some(forum_id) {
+            probe_fail("forum topic header chrome");
+            return;
+        }
+        self.messages.click_back();
+        if !poll_until(4000, || {
+            self.open_chat.get() == Some(forum_id)
+                && self.content_area.visible_child_name().as_deref() == Some("topics")
+                && self.topics.topic_titles().len() == 4
+        })
+        .await
+        {
+            probe_fail("forum back to topic list");
+            return;
+        }
+
+        // New topic: the dialog creates it, the list grows, it opens.
+        probe_step("forum create topic");
+        self.topics.open_dialog();
+        if !self.topics.dialog_is_open() {
+            probe_fail("new topic dialog");
+            return;
+        }
+        self.topics.set_dialog_title("Probe Topic");
+        self.topics.submit_dialog();
+        if !poll_until(5000, || {
+            self.open_chat
+                .get()
+                .and_then(split_topic_chat_id)
+                .is_some_and(|(forum, _)| forum == forum_id)
+                && self.messages.header_title() == "Omarchy Forum › Probe Topic"
+        })
+        .await
+        {
+            probe_fail("forum create topic opens it");
+            return;
+        }
+        self.messages.click_back();
+        if !poll_until(5000, || {
+            self.content_area.visible_child_name().as_deref() == Some("topics")
+                && self.topics.topic_titles().len() == 5
+                && self
+                    .topics
+                    .topic_titles()
+                    .iter()
+                    .any(|title| title == "Probe Topic")
+        })
+        .await
+        {
+            probe_fail("forum create topic row");
+            return;
+        }
+
+        // A message sent in a topic is answered in that topic only.
+        let themes_row = self
+            .topics
+            .topic_titles()
+            .iter()
+            .position(|title| title == "Themes");
+        let Some(themes_row) = themes_row else {
+            probe_fail("forum Themes topic after create");
+            return;
+        };
+        self.topics.open_index(themes_row as i32);
+        if !poll_until(5000, || {
+            self.open_chat.get() == Some(themes_chat) && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("reopen forum topic");
+            return;
+        }
+        probe_step("forum topic new message");
+        let known_ids: Vec<i32> = self
+            .messages
+            .messages()
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        self.messages.set_composer_text("ping from probe");
+        self.clone().submit_composer();
+        if !poll_until(9000, || {
+            self.messages.messages().iter().any(|message| {
+                !message.outgoing
+                    && !known_ids.contains(&message.id)
+                    && message.topic_id == Some(20)
+            })
+        })
+        .await
+        {
+            probe_fail("forum topic reply");
+            return;
+        }
+        let reply_id = self
+            .messages
+            .messages()
+            .into_iter()
+            .filter(|message| !message.outgoing && !known_ids.contains(&message.id))
+            .map(|message| message.id)
+            .max();
+        let Some(reply_id) = reply_id else {
+            probe_fail("forum topic reply id");
+            return;
+        };
+        let general_chat = self
+            .forum_topics
+            .borrow()
+            .iter()
+            .find(|topic| topic.title == "General")
+            .map(|topic| topic.chat_id);
+        let Some(general_chat) = general_chat else {
+            probe_fail("forum General topic missing");
+            return;
+        };
+        self.clone().open_chat(general_chat);
+        if !poll_until(5000, || {
+            self.open_chat.get() == Some(general_chat)
+                && !self.messages.is_loading()
+                && self.messages.len() >= 5
+        })
+        .await
+        {
+            probe_fail("open General topic");
+            return;
+        }
+        if self.messages.message(reply_id).is_some() {
+            probe_fail("forum topic reply leaked into General");
+            return;
+        }
+        if self.messages.header_title() != "Omarchy Forum › General" {
+            probe_fail("forum General breadcrumb");
+            return;
+        }
+
         if !self.settings_open() {
             self.toggle_settings();
         }
@@ -9942,6 +10631,7 @@ impl ShellInner {
             probe_fail("find application window");
             return;
         };
+
         let Some(application) = window.application() else {
             probe_fail("find application");
             return;
@@ -11412,6 +12102,14 @@ fn time_has_seconds(text: &str) -> bool {
         && [0usize, 1, 3, 4, 6, 7]
             .into_iter()
             .all(|index| bytes[index].is_ascii_digit())
+}
+
+/// The chat-list identity of a chat id: a forum topic belongs to its forum
+/// row (spec §6.3 — the sidebar keeps showing the forum, never a topic).
+fn dialog_id(chat_id: i64) -> i64 {
+    split_topic_chat_id(chat_id)
+        .map(|(forum_id, _)| forum_id)
+        .unwrap_or(chat_id)
 }
 
 fn chat_title(message: &Msg) -> String {

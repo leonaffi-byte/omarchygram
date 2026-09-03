@@ -2,6 +2,7 @@ pub mod anim;
 pub mod auth;
 pub mod cards;
 pub mod avatar;
+pub mod bots;
 pub mod chatlist;
 pub mod contacts;
 pub mod forward;
@@ -25,6 +26,7 @@ pub mod settings_view;
 pub mod shell;
 pub mod stickers;
 pub mod switcher;
+pub mod topics;
 pub mod viewer;
 pub mod virtual_chat;
 /// Wave 6D rasterizer (orchestrator-owned; see specs/spec-wave6.md §5.1).
