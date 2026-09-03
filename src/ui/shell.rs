@@ -5484,7 +5484,10 @@ impl ShellInner {
                 }
             }
             MessageAction::Delete(msg_id) => self.delete_message(msg_id),
-            MessageAction::Media(msg_id) => self.media_action(msg_id),
+            MessageAction::Media(msg_id) => self.media_action(msg_id, player::OpenIntent::Manual),
+            MessageAction::MediaAutoplay(msg_id) => {
+                self.media_action(msg_id, player::OpenIntent::AutoplayMuted)
+            }
             MessageAction::MediaSeek(msg_id, fraction) => {
                 self.messages.player_seek(msg_id, fraction);
             }
@@ -8065,7 +8068,7 @@ impl ShellInner {
         }
     }
 
-    fn media_action(self: Rc<Self>, msg_id: i32) {
+    fn media_action(self: Rc<Self>, msg_id: i32, intent: player::OpenIntent) {
         if self.messages.media_kind(msg_id) == Some(MediaKind::Photo) {
             match self.messages.media_state(msg_id) {
                 Some(MediaState::Done(_)) => self.open_viewer(msg_id),
@@ -8098,7 +8101,11 @@ impl ShellInner {
             Some(
                 MediaKind::Voice | MediaKind::Audio | MediaKind::Video | MediaKind::VideoNote | MediaKind::Gif,
             ) => {
-                self.play_inline(msg_id);
+                self.play_inline(msg_id, intent);
+                return;
+            }
+            Some(MediaKind::Sticker) if self.messages.player_exists(msg_id) => {
+                self.play_inline(msg_id, intent);
                 return;
             }
             _ => {}
@@ -8127,43 +8134,64 @@ impl ShellInner {
 
     /// In-app playback for voice/audio/video/video-note/gif (§2). Nothing here
     /// ever launches an external player — `launch_media` is for documents.
-    fn play_inline(self: Rc<Self>, msg_id: i32) {
+    fn play_inline(self: Rc<Self>, msg_id: i32, intent: player::OpenIntent) {
         match self.messages.media_state(msg_id) {
             Some(MediaState::Done(path)) => match self.messages.player_state(msg_id) {
                 // A live pipeline: the button is a play/pause toggle.
                 player::PlayerState::Playing | player::PlayerState::Paused => {
-                    self.messages.toggle_media(msg_id);
+                    if intent == player::OpenIntent::Manual {
+                        self.messages.toggle_media(msg_id);
+                    }
                 }
-                _ => self
-                    .messages
-                    .play_media(msg_id, path, self.autoplay_kind(msg_id)),
+                _ => self.messages.play_media(msg_id, path, intent),
             },
             Some(MediaState::NotStarted | MediaState::Failed) => {
-                self.clone().play_when_ready(msg_id);
+                self.clone().play_when_ready(msg_id, intent);
                 self.start_media_download(msg_id, false);
             }
             // A download the autoplay pass (or an earlier click) already
             // started: just make sure it plays when it lands.
-            Some(MediaState::InFlight) => self.play_when_ready(msg_id),
+            Some(MediaState::InFlight) => self.play_when_ready(msg_id, intent),
             None => {}
         }
     }
 
-    /// Gifs and circles start muted; voice, music and video start with sound.
-    fn autoplay_kind(&self, msg_id: i32) -> bool {
-        matches!(
-            self.messages.media_kind(msg_id),
-            Some(MediaKind::Gif | MediaKind::VideoNote)
-        )
-    }
-
-    fn play_when_ready(self: Rc<Self>, msg_id: i32) {
+    fn play_when_ready(self: Rc<Self>, msg_id: i32, intent: player::OpenIntent) {
         let epoch = self.epoch.get();
         let weak = Rc::downgrade(&self);
         self.messages.on_media_ready(msg_id, move |path| {
             if let Some(this) = weak.upgrade().filter(|this| this.epoch.get() == epoch) {
-                let autoplay = this.autoplay_kind(msg_id);
-                this.messages.play_media(msg_id, path, autoplay);
+                // A late completion (a second download, a stale callback) must
+                // not re-open a player that is already open: re-opening calls
+                // activate(), which would pause whatever the user started since
+                // (seen in the gate: the voice re-opened and paused the music).
+                if this.messages.player_exists(msg_id)
+                    && this.messages.player_state(msg_id) != player::PlayerState::None
+                {
+                    return;
+                }
+                let intent = if intent == player::OpenIntent::AutoplayMuted {
+                    let settings = this.settings.get();
+                    let allowed = match this.messages.media_kind(msg_id) {
+                        Some(MediaKind::Gif | MediaKind::Sticker) => {
+                            settings.media.autoplay_gifs
+                                && player::animations_on()
+                                && this.messages.row_visible(msg_id)
+                        }
+                        Some(MediaKind::VideoNote) => {
+                            settings.media.autoplay_video_notes && this.messages.row_visible(msg_id)
+                        }
+                        _ => false,
+                    };
+                    if allowed {
+                        player::OpenIntent::AutoplayMuted
+                    } else {
+                        player::OpenIntent::Poster
+                    }
+                } else {
+                    intent
+                };
+                this.messages.play_media(msg_id, path, intent);
             }
         });
     }
@@ -8185,6 +8213,19 @@ impl ShellInner {
                         return;
                     }
                     self.messages.finish_lottie(msg_id, media_generation, path);
+                }
+                // A video sticker must bypass texture decoding and enter the
+                // retained muted-loop MediaFile path (§2.2).
+                Ok(Some(path))
+                    if kind == MediaKind::Sticker
+                        && path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("webm")) =>
+                {
+                    if !self.is_current(chat_id, epoch) || !self.messages.contains(msg_id) {
+                        return;
+                    }
+                    self.messages.finish_media_path(msg_id, path);
                 }
                 Ok(Some(path)) if matches!(kind, MediaKind::Photo | MediaKind::Sticker | MediaKind::Location | MediaKind::Venue) => {
                     let decode_path = path.clone();
@@ -8923,7 +8964,8 @@ impl ShellInner {
                 probe_fail("media download error shown");
                 return;
             }
-            self.clone().media_action(failed_id);
+            self.clone()
+                .media_action(failed_id, player::OpenIntent::Manual);
             if !poll_until(3500, || {
                 matches!(
                     self.messages.media_state(failed_id),
@@ -9555,7 +9597,12 @@ impl ShellInner {
 
         probe_step("player voice play");
         let _ = self.scroll_into_view(800).await;
-        if !self.messages.trigger_media(800)
+        // A transient download error on an inline player must leave a usable
+        // retry action, not a disabled/hidden play button.
+        if !self.messages.fail_media(800, true)
+            || !self.messages.media_retryable(800)
+            || !self.messages.player_retry_available(800)
+            || !self.messages.trigger_media(800)
             || !poll_until(5000, || {
                 matches!(
                     self.messages.player_state(800),
@@ -9578,6 +9625,10 @@ impl ShellInner {
             // seek both ways on the 3 s fixture (§1.10).
             self.messages.toggle_media(800);
             glib::timeout_future(Duration::from_millis(300)).await;
+            if self.messages.player_tick_active(800) {
+                probe_fail("voice progress tick survived pause");
+                return;
+            }
             self.messages.player_seek(800, 0.0);
             if !poll_until(2000, || self.messages.player_position(800) <= 0.4).await {
                 probe_fail(&format!(
@@ -9598,6 +9649,7 @@ impl ShellInner {
             self.messages.toggle_media(800);
             if !poll_until(3000, || {
                 self.messages.player_state(800) == player::PlayerState::Playing
+                    && self.messages.player_tick_active(800)
             })
             .await
             {
@@ -9634,7 +9686,7 @@ impl ShellInner {
         probe_step("player music");
         let _ = self.scroll_into_view(801).await;
         if !self.messages.trigger_media(801)
-            || !poll_until(5000, || {
+            || !poll_until(10_000, || {
                 matches!(
                     self.messages.player_state(801),
                     player::PlayerState::Playing | player::PlayerState::Error
@@ -9642,7 +9694,14 @@ impl ShellInner {
             })
             .await
         {
-            probe_fail("music did not reach playing/error");
+            probe_fail(&format!(
+                "music did not reach playing/error (state {:?}, media {:?}, exists {}, visible {}, active sound {})",
+                self.messages.player_state(801),
+                self.messages.media_state(801),
+                self.messages.player_exists(801),
+                self.messages.row_visible(801),
+                self.messages.active_player_count()
+            ));
             return;
         }
         let music_plays = self.messages.player_state(801) == player::PlayerState::Playing;
@@ -9680,14 +9739,30 @@ impl ShellInner {
             probe_fail("video did not reach playing/error");
             return;
         }
+        if self.messages.player_state(802) == player::PlayerState::Playing
+            && !self.messages.player_manual_sound_requested(802)
+        {
+            probe_fail("manual video open did not request playback with sound");
+            return;
+        }
 
         probe_step("player video fullscreen");
         let video_plays = self.messages.player_state(802) == player::PlayerState::Playing;
-        self.messages.player_fullscreen(802);
-        glib::timeout_future(Duration::from_millis(300)).await;
         if video_plays {
-            if !self.messages.player_fullscreen_open() {
-                probe_fail("video fullscreen did not open");
+            // Drive the gesture's logical callback directly (no synthetic
+            // desktop input): the delayed single press must be cancelled by
+            // the second press, leaving playback running in fullscreen.
+            self.messages.probe_player_picture_press(802, 1);
+            self.messages.probe_player_picture_press(802, 2);
+            glib::timeout_future(Duration::from_millis(350)).await;
+            // Without mp4 decoders on the machine the pipeline errors a
+            // moment after play(): that closes fullscreen by design and is an
+            // accepted terminal state (§1.7), not a paused player.
+            let state = self.messages.player_state(802);
+            if state != player::PlayerState::Error
+                && (!self.messages.player_fullscreen_open() || state != player::PlayerState::Playing)
+            {
+                probe_fail("video double click paused playback or missed fullscreen");
                 return;
             }
             self.messages.player_close_fullscreen();
@@ -9696,14 +9771,22 @@ impl ShellInner {
                 probe_fail("video fullscreen did not close");
                 return;
             }
-        } else if self.messages.player_fullscreen_open() {
-            // A card showing the inline error has nothing to show fullscreen.
-            probe_fail("fullscreen opened for a video that cannot play");
-            return;
+        } else {
+            self.messages.player_fullscreen(802);
+            glib::timeout_future(Duration::from_millis(300)).await;
+            if self.messages.player_fullscreen_open() {
+                // A card showing the inline error has nothing to show fullscreen.
+                probe_fail("fullscreen opened for a video that cannot play");
+                return;
+            }
         }
 
         // No click on the circle: it autoplays muted while its row is visible.
         probe_step("player video note");
+        let gtk_settings = gtk::Settings::default();
+        if let Some(settings) = gtk_settings.as_ref() {
+            settings.set_gtk_enable_animations(false);
+        }
         if !self.scroll_into_view(803).await {
             probe_fail("video note row never became visible");
             return;
@@ -9718,6 +9801,24 @@ impl ShellInner {
         {
             probe_fail("video note did not autoplay (or fail) while visible");
             return;
+        }
+        if self.messages.player_state(803) == player::PlayerState::Playing {
+            // Video-note autoplay is independent of the animations master. A
+            // user click then becomes an explicit with-sound restart (the
+            // probe sink itself remains muted).
+            if !self.messages.trigger_media(803)
+                || !self.messages.player_manual_sound_requested(803)
+                || self.messages.player_state(803) != player::PlayerState::Playing
+            {
+                if let Some(settings) = gtk_settings.as_ref() {
+                    settings.set_gtk_enable_animations(true);
+                }
+                probe_fail("manual video-note click did not request sound");
+                return;
+            }
+        }
+        if let Some(settings) = gtk_settings.as_ref() {
+            settings.set_gtk_enable_animations(true);
         }
 
         // Same for the GIF: settings.media.autoplay_gifs plus the animations
@@ -9739,6 +9840,50 @@ impl ShellInner {
             probe_fail("gif did not autoplay (or fail) while visible");
             return;
         }
+        if self.messages.player_state(804) == player::PlayerState::Playing {
+            self.settings
+                .update(|settings| settings.media.autoplay_gifs = false);
+            if !poll_until(2000, || {
+                self.messages.player_state(804) == player::PlayerState::Paused
+                    && !self.messages.player_tick_active(804)
+            })
+            .await
+            {
+                probe_fail("autoplay_gifs off did not pause the live GIF");
+                return;
+            }
+            self.settings
+                .update(|settings| settings.media.autoplay_gifs = true);
+            if !poll_until(2000, || {
+                self.messages.player_state(804) == player::PlayerState::Playing
+            })
+            .await
+            {
+                probe_fail("autoplay_gifs on did not resume the visible GIF");
+                return;
+            }
+            if let Some(settings) = gtk::Settings::default() {
+                settings.set_gtk_enable_animations(false);
+                if !poll_until(2000, || {
+                    self.messages.player_state(804) == player::PlayerState::Paused
+                })
+                .await
+                {
+                    settings.set_gtk_enable_animations(true);
+                    probe_fail("animations master off did not pause the live GIF");
+                    return;
+                }
+                settings.set_gtk_enable_animations(true);
+                if !poll_until(2000, || {
+                    self.messages.player_state(804) == player::PlayerState::Playing
+                })
+                .await
+                {
+                    probe_fail("animations master on did not resume the visible GIF");
+                    return;
+                }
+            }
+        }
         if self.probe_media_launches.get() != launches_before_players {
             probe_fail("an inline player launched an external application");
             return;
@@ -9750,7 +9895,11 @@ impl ShellInner {
             return;
         }
         if music_plays {
-            if !self.messages.trigger_media(801)
+            // The 3 s clip may still be playing or may have rewound to Paused
+            // by now (latency variant): only click when it is not playing,
+            // a click on a playing player would pause it.
+            let needs_click = self.messages.player_state(801) != player::PlayerState::Playing;
+            if (needs_click && !self.messages.trigger_media(801))
                 || !poll_until(4000, || {
                     self.messages.player_state(801) == player::PlayerState::Playing
                 })
@@ -9789,6 +9938,54 @@ impl ShellInner {
         .await
         {
             probe_fail("players not stopped / Marta not restored");
+            return;
+        }
+
+        probe_step("player retained stream reuse");
+        self.clone().open_chat(media_lab);
+        if !poll_until(5000, || {
+            self.open_chat.get() == Some(media_lab)
+                && !self.messages.is_loading()
+                && self.messages.player_exists(802)
+        })
+        .await
+            || !self.scroll_into_view(802).await
+            || !self.messages.trigger_media(802)
+            || !poll_until(8000, || {
+                matches!(
+                    self.messages.player_state(802),
+                    player::PlayerState::Playing | player::PlayerState::Error
+                )
+            })
+            .await
+            || !self.messages.player_reused_retained_stream(802)
+        {
+            probe_fail("rebuilt video row did not reuse its retained stream");
+            return;
+        }
+
+        probe_step("player row removal");
+        if self.messages.remove(802).is_none() || self.messages.player_exists(802) {
+            probe_fail("removed row left a player handle behind");
+            return;
+        }
+
+        probe_step("player history reset");
+        let history_epoch = self.bump_epoch();
+        self.messages.reset_history(media_lab, history_epoch);
+        if !self.messages.player_registry_empty() {
+            probe_fail("same-chat history reset left player handles behind");
+            return;
+        }
+        self.clone().open_chat(marta);
+        if !poll_until(5000, || {
+            self.open_chat.get() == Some(marta)
+                && !self.messages.is_loading()
+                && self.messages.contains(104)
+        })
+        .await
+        {
+            probe_fail("Marta not restored after player history-reset probe");
             return;
         }
 
