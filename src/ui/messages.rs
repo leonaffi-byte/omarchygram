@@ -11,7 +11,7 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 
 use crate::tg::{
-    ChatInfo, ChatKind, ChatSummary, MediaKind, Msg, MsgVersion, Presence, SpanKind, Tg,
+    ChatInfo, ChatKind, ChatSummary, MediaKind, Msg, MsgVersion, Poll, Presence, SpanKind, Tg,
 };
 
 use super::anim::Effects;
@@ -278,6 +278,12 @@ pub enum MessageAction {
     },
     OpenLink(String),
     OpenMention(i64),
+    Vote { msg_id: i32, options: Vec<usize> },
+    RetractVote(i32),
+    AddContact(i32),
+    OpenInBrowser(String),
+    StopLive(i32),
+    RedownloadMedia(i32),
     UnpinMessage(i32),
     RetryPinned,
     Delete(i32),
@@ -331,6 +337,9 @@ struct MessageRow {
     /// Wave 6D: the animated (.tgs) sticker in this row, if any. Dropping the
     /// row stops its render-thread animation.
     lottie: Rc<RefCell<Option<lottie::Sticker>>>,
+    /// The geo card's map slot, so `finish_image` can drop the downloaded
+    /// OpenStreetMap texture into it (6B location/venue).
+    geo_map_slot: Rc<RefCell<Option<gtk::Box>>>,
 }
 
 struct MessageEntry {
@@ -345,6 +354,8 @@ struct MessageStore {
     chat_id: Option<i64>,
     order: Vec<i32>,
     entries: HashMap<i32, MessageEntry>,
+    /// `poll.id` -> message id, so `Event::PollChanged` can find the row.
+    poll_index: HashMap<i64, i32>,
 }
 
 struct EditMode {
@@ -492,6 +503,10 @@ struct MessagesInner {
     available_reactions_error: RefCell<Option<String>>,
     darker_background: RefCell<String>,
     effects: Rc<Effects>,
+    /// `settings.media.map_tiles` — gates the map download for 6B geo cards.
+    map_tiles: Cell<bool>,
+    /// Message ids whose contact has been added to the address book (6B).
+    added_contacts: RefCell<HashSet<i32>>,
 }
 
 pub struct MessagesView {
@@ -1000,6 +1015,8 @@ impl MessagesView {
                     .unwrap_or_default(),
             ),
             effects,
+            map_tiles: Cell::new(true),
+            added_contacts: RefCell::new(HashSet::new()),
         });
         let view = Self { widget, inner };
         {
@@ -2145,6 +2162,7 @@ impl MessagesView {
 
         let mut media_button = None;
         let mut transcribe_button = None;
+        let geo_map_slot: Rc<RefCell<Option<gtk::Box>>> = Rc::new(RefCell::new(None));
         match message.media {
             Some(MediaKind::Photo | MediaKind::Sticker) => {
                 let placeholder = gtk::Label::new(Some("loading image…"));
@@ -2154,6 +2172,43 @@ impl MessagesView {
                     *media_loading_source.borrow_mut() = Some(source);
                 }
             }
+            Some(MediaKind::Location | MediaKind::Venue) => {
+                use crate::ui::cards;
+                let (card, slot) = cards::build_geo(
+                    message,
+                    self.inner.action.clone(),
+                    animation_sources.clone(),
+                    self.inner.map_tiles.get(),
+                );
+                media_slot.append(&card);
+                *geo_map_slot.borrow_mut() = slot;
+            }
+            Some(MediaKind::Contact) => {
+                use crate::ui::cards;
+                let card = cards::build_contact(
+                    message,
+                    self.inner.action.clone(),
+                    self.inner.added_contacts.borrow().contains(&message.id),
+                );
+                media_slot.append(&card);
+            }
+            Some(MediaKind::Dice) => {
+                use crate::ui::cards;
+                let card = cards::build_dice(message);
+                media_slot.append(&card);
+            }
+            Some(MediaKind::Poll) => {
+                use crate::ui::poll;
+                let card = poll::build(message, self.inner.action.clone());
+                media_slot.append(&card);
+                if let Some(poll) = &message.poll {
+                    self.inner
+                        .store
+                        .borrow_mut()
+                        .poll_index
+                        .insert(poll.id, message.id);
+                }
+            }
             Some(
                 MediaKind::Document
                 | MediaKind::Voice
@@ -2161,11 +2216,6 @@ impl MessagesView {
                 | MediaKind::Gif
                 | MediaKind::Audio
                 | MediaKind::VideoNote
-                | MediaKind::Location
-                | MediaKind::Venue
-                | MediaKind::Contact
-                | MediaKind::Dice
-                | MediaKind::Poll
                 | MediaKind::Unsupported,
             ) => {
                 let button = media_card(message);
@@ -2350,6 +2400,7 @@ impl MessagesView {
             animation_sources,
             media_loading_source,
             lottie: Rc::new(RefCell::new(None)),
+            geo_map_slot,
         };
         set_deleted_rendering(&row, message.deleted);
         row.selection.set_sensitive(!message.deleted);
@@ -2372,7 +2423,7 @@ impl MessagesView {
     }
 
     fn update_existing(&self, message: Msg, is_live: bool) {
-        let (row, was_edited, old_text, old_spans, old_webpage) = {
+        let (row, was_edited, old_text, old_spans, old_webpage, old_point) = {
             let mut store = self.inner.store.borrow_mut();
             let Some(entry) = store.entries.get_mut(&message.id) else {
                 return;
@@ -2381,6 +2432,11 @@ impl MessagesView {
             let old_text = entry.msg.text.clone();
             let old_spans = entry.msg.spans.clone();
             let old_webpage = entry.msg.webpage.clone();
+            let old_point = entry
+                .msg
+                .location
+                .as_ref()
+                .map(|location| location.point);
             entry.msg = message.clone();
             (
                 entry.row.clone(),
@@ -2388,6 +2444,7 @@ impl MessagesView {
                 old_text,
                 old_spans,
                 old_webpage,
+                old_point,
             )
         };
         row.forwarded.set_label(
@@ -2471,6 +2528,45 @@ impl MessagesView {
         );
         if message.edited && (!was_edited || old_text != message.text) {
             self.inner.effects.message_edited(row.widget.upcast_ref());
+        }
+        // 6B: live location point moves / dice value resolves / poll edits via
+        // `MessageChanged` — rebuild the inline card (live location point
+        // move / dice value resolves / poll closed or edited).
+        if matches!(
+            message.media,
+            Some(
+                MediaKind::Location
+                    | MediaKind::Venue
+                    | MediaKind::Contact
+                    | MediaKind::Dice
+                    | MediaKind::Poll
+            )
+        ) {
+            self.rebuild_card(&message);
+            if matches!(message.media, Some(MediaKind::Location | MediaKind::Venue))
+                && message.location.as_ref().and_then(|l| l.live.as_ref()).is_some()
+            {
+                let moved = message
+                    .location
+                    .as_ref()
+                    .map(|l| l.point)
+                    != old_point;
+                if moved {
+                    // Restart the map download with the new point.
+                    if let Some(entry) = self
+                        .inner
+                        .store
+                        .borrow_mut()
+                        .entries
+                        .get_mut(&message.id)
+                    {
+                        entry.media_state = MediaState::NotStarted;
+                    }
+                    if let Some(callback) = self.inner.action.borrow().as_ref().cloned() {
+                        callback(MessageAction::RedownloadMedia(message.id));
+                    }
+                }
+            }
         }
     }
 
@@ -4024,7 +4120,7 @@ impl MessagesView {
         if should_stick {
             self.inner.suppress_paging.set(true);
         }
-        let (media_slot, outgoing, media_loading_source) = {
+        let (media_slot, outgoing, media_loading_source, geo_map_slot, kind) = {
             let mut store = self.inner.store.borrow_mut();
             let Some(entry) = store.entries.get_mut(&msg_id) else {
                 if should_stick {
@@ -4037,10 +4133,29 @@ impl MessagesView {
                 entry.row.media_slot.clone(),
                 entry.msg.outgoing,
                 entry.row.media_loading_source.clone(),
+                entry.row.geo_map_slot.borrow().clone(),
+                entry.msg.media,
             )
         };
         if let Some(source) = media_loading_source.borrow_mut().take() {
             remove_source_if_present(source);
+        }
+        // 6B: location/venue map goes into the card's map slot, leaving the
+        // title/coordinates/open-in-browser rows untouched. A stopped/expired
+        // live location has no map slot, so just leave the card as-is.
+        if matches!(kind, Some(MediaKind::Location | MediaKind::Venue)) {
+            if let Some(map_slot) = geo_map_slot {
+                while let Some(child) = map_slot.first_child() {
+                    map_slot.remove(&child);
+                }
+                let picture = gtk::Picture::for_paintable(texture);
+                picture.set_can_shrink(true);
+                picture.set_hexpand(true);
+                picture.set_vexpand(true);
+                picture.set_content_fit(gtk::ContentFit::Cover);
+                map_slot.append(&picture);
+            }
+            return true;
         }
         self.move_focus_before_removal(&media_slot);
         while let Some(child) = media_slot.first_child() {
@@ -4287,6 +4402,24 @@ impl MessagesView {
                     media_slot.append(&label);
                 }
             }
+            Some(MediaKind::Location | MediaKind::Venue) => {
+                if let Some(map_slot) = self
+                    .inner
+                    .store
+                    .borrow()
+                    .entries
+                    .get(&msg_id)
+                    .and_then(|entry| entry.row.geo_map_slot.borrow().clone())
+                {
+                    self.move_focus_before_removal(&map_slot);
+                    while let Some(child) = map_slot.first_child() {
+                        map_slot.remove(&child);
+                    }
+                    let label = gtk::Label::new(Some("map unavailable"));
+                    label.add_css_class("omg-media-placeholder");
+                    map_slot.append(&label);
+                }
+            }
             Some(
                 MediaKind::Document
                 | MediaKind::Voice
@@ -4294,8 +4427,6 @@ impl MessagesView {
                 | MediaKind::Gif
                 | MediaKind::Audio
                 | MediaKind::VideoNote
-                | MediaKind::Location
-                | MediaKind::Venue
                 | MediaKind::Contact
                 | MediaKind::Dice
                 | MediaKind::Poll
@@ -4315,6 +4446,179 @@ impl MessagesView {
             None => {}
         }
         true
+    }
+
+    /// The card widget for `msg_id` (first child of the media slot), used by the
+    /// poll/geo update paths and the probe.
+    pub fn card_widget(&self, msg_id: i32) -> Option<gtk::Widget> {
+        self.inner
+            .store
+            .borrow()
+            .entries
+            .get(&msg_id)
+            .and_then(|entry| entry.row.media_slot.first_child())
+    }
+
+    /// Find the message id that owns `poll_id` (6B `Event::PollChanged`).
+    pub fn msg_id_for_poll(&self, poll_id: i64) -> Option<i32> {
+        self.inner.store.borrow().poll_index.get(&poll_id).copied()
+    }
+
+    /// Apply a fresh `Poll` from `Event::PollChanged` to the right row.
+    pub fn update_poll(&self, poll_id: i64, poll: Poll) {
+        let Some(msg_id) = self.msg_id_for_poll(poll_id) else {
+            return;
+        };
+        let Some(widget) = self.card_widget(msg_id) else {
+            return;
+        };
+        self.move_focus_before_removal(&widget);
+        crate::ui::poll::update(&widget, &poll, msg_id, &self.inner.action.clone());
+    }
+
+    /// All label text of a card, concatenated — used by the probe to assert
+    /// card content without per-widget accessors.
+    pub fn card_text(&self, msg_id: i32) -> Option<String> {
+        let widget = self.card_widget(msg_id)?;
+        Some(collect_label_text(&widget))
+    }
+
+    /// True once a location/venue map texture has been placed into the slot.
+    pub fn geo_map_loaded(&self, msg_id: i32) -> bool {
+        let slot = {
+            let store = self.inner.store.borrow();
+            let Some(entry) = store.entries.get(&msg_id) else {
+                return false;
+            };
+            entry.row.geo_map_slot.borrow().clone()
+        };
+        let Some(slot) = slot else {
+            return false;
+        };
+        let mut child = slot.first_child();
+        while let Some(w) = child {
+            if w.downcast_ref::<gtk::Picture>().is_some() {
+                return true;
+            }
+            child = w.next_sibling();
+        }
+        false
+    }
+
+    /// The Nth option's `gtk::CheckButton` inside a poll card (probe helper).
+    pub fn poll_option_check(&self, msg_id: i32, index: usize) -> Option<gtk::CheckButton> {
+        let widget = self.card_widget(msg_id)?;
+        let options = descendant_named(&widget, "omg-poll-options")?;
+        let row = child_at_index(&options, index)?;
+        row.first_child()?.downcast::<gtk::CheckButton>().ok()
+    }
+
+    /// The poll card's "Vote" button (multiple-choice), if present.
+    pub fn poll_vote_button(&self, msg_id: i32) -> Option<gtk::Button> {
+        let widget = self.card_widget(msg_id)?;
+        descendant_named(&widget, "omg-poll-vote")?.downcast::<gtk::Button>().ok()
+    }
+
+    /// Whether the poll card's inline error label is currently visible.
+    pub fn poll_error_visible(&self, msg_id: i32) -> bool {
+        let Some(widget) = self.card_widget(msg_id) else {
+            return false;
+        };
+        if let Some(card) = widget.downcast_ref::<gtk::Box>() {
+            let mut child = card.first_child();
+            while let Some(label) = child {
+                if label.has_css_class("omg-poll-error") && label.is_visible() {
+                    return true;
+                }
+                child = label.next_sibling();
+            }
+        }
+        false
+    }
+
+    /// A location/venue card only needs a map download while its live share is
+    /// active (defect 5). Stopped/expired live locations have no map slot.
+    pub fn geo_needs_map(&self, msg_id: i32) -> bool {
+        let store = self.inner.store.borrow();
+        let Some(entry) = store.entries.get(&msg_id) else {
+            return true;
+        };
+        match &entry.msg.location {
+            Some(location) => match &location.live {
+                Some(live) => !live.stopped && Local::now() <= live.expires,
+                None => true,
+            },
+            None => true,
+        }
+    }
+
+    /// Rebuild the inline card for a message whose content changed (6B live
+    /// location / dice / contact / poll updates via `MessageChanged`).
+    fn rebuild_card(&self, message: &Msg) {
+        let (media_slot, geo_map_slot, animation_sources) = {
+            let store = self.inner.store.borrow();
+            let Some(entry) = store.entries.get(&message.id) else {
+                return;
+            };
+            (
+                entry.row.media_slot.clone(),
+                entry.row.geo_map_slot.clone(),
+                entry.row.animation_sources.clone(),
+            )
+        };
+        self.move_focus_before_removal(&media_slot);
+        while let Some(child) = media_slot.first_child() {
+            media_slot.remove(&child);
+        }
+        match message.media {
+            Some(MediaKind::Location | MediaKind::Venue) => {
+                let (card, slot) = crate::ui::cards::build_geo(
+                    message,
+                    self.inner.action.clone(),
+                    animation_sources,
+                    self.inner.map_tiles.get(),
+                );
+                media_slot.append(&card);
+                *geo_map_slot.borrow_mut() = slot;
+            }
+            Some(MediaKind::Contact) => {
+                let card = crate::ui::cards::build_contact(
+                    message,
+                    self.inner.action.clone(),
+                    self.inner.added_contacts.borrow().contains(&message.id),
+                );
+                media_slot.append(&card);
+            }
+            Some(MediaKind::Dice) => {
+                let card = crate::ui::cards::build_dice(message);
+                media_slot.append(&card);
+            }
+            Some(MediaKind::Poll) => {
+                let card = crate::ui::poll::build(message, self.inner.action.clone());
+                media_slot.append(&card);
+                if let Some(poll) = &message.poll {
+                    self.inner
+                        .store
+                        .borrow_mut()
+                        .poll_index
+                        .insert(poll.id, message.id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mark a contact as added and rebuild its card (6B `AddContact`).
+    pub fn mark_contact_added(&self, msg_id: i32) {
+        self.inner.added_contacts.borrow_mut().insert(msg_id);
+        if let Some(message) = self.message(msg_id) {
+            self.rebuild_card(&message);
+        }
+    }
+
+    /// Setter for `settings.media.map_tiles` (gates the 6B map download).
+    pub fn set_map_tiles(&self, enabled: bool) {
+        self.inner.map_tiles.set(enabled);
     }
 
     pub fn set_typing(&self, name: &str) -> u64 {
@@ -5473,6 +5777,53 @@ fn media_details(message: &Msg) -> String {
         });
     }
     details.join(" · ")
+}
+
+/// Recursively collect the text of every `gtk::Label` under `widget` — used by
+/// the probe to assert 6B card content.
+/// Recursively collect the text of every `gtk::Label` under `widget` — used by
+/// the probe to assert 6B card content.
+fn collect_label_text(widget: &gtk::Widget) -> String {
+    let mut out = String::new();
+    if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+        out.push_str(&label.label());
+        out.push(' ');
+    }
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        out.push_str(&collect_label_text(&next));
+        child = next.next_sibling();
+    }
+    out
+}
+
+/// Find a descendant widget by its GTK name (set via `set_widget_name`).
+fn descendant_named(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+    if widget.widget_name() == name {
+        return Some(widget.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        if let Some(found) = descendant_named(&next, name) {
+            return Some(found);
+        }
+        child = next.next_sibling();
+    }
+    None
+}
+
+/// The `index`-th child widget of `widget`.
+fn child_at_index(widget: &gtk::Widget, index: usize) -> Option<gtk::Widget> {
+    let mut child = widget.first_child();
+    let mut i = 0;
+    while let Some(next) = child {
+        if i == index {
+            return Some(next);
+        }
+        i += 1;
+        child = next.next_sibling();
+    }
+    None
 }
 
 pub fn search_position(index: Option<usize>, total: usize) -> String {
