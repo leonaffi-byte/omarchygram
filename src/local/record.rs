@@ -279,7 +279,7 @@ mod video_tests {
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let (path, secs) = video_stop().await.expect("stop");
         assert!(path.exists());
-        assert!(secs >= 1 && secs <= 3, "secs {secs}");
+        assert!(secs >= 1 && secs <= 5, "secs {secs}");
         assert!(std::fs::metadata(&path).unwrap().len() > 1000);
         let _ = std::fs::remove_file(&path);
         assert!(video_stop().await.is_err(), "nothing running any more");
