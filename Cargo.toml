@@ -29,7 +29,9 @@ opt-level = 3
 libc = "0.2"
 ntgcalls = { version = "=3.0.0-rc01", optional = true }
 async-channel = "2.5.0"
-chrono = "0.4.45"
+# Wave 8C: only Local::now/Utc plus Duration/format helpers are used; no chrono
+# serde. `clock` pulls the minimal std time backend, dropping wasm-bindgen/js-sys.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dirs = "6.0.0"
 flate2 = "1"
 grammers-client = { version = "0.10.0", features = ["markdown"] }
@@ -38,7 +40,11 @@ gstreamer = "0.25"
 grammers-session = "0.10.0"
 grammers-tl-types = "0.10.0"
 gtk4 = { version = "0.11.4", features = ["v4_12"] }
-image = "0.25.10"
+# Wave 8C: the `image` crate is used only to decode webp (stickers) + png (OSM
+# tiles) and encode png (stickers, maps); photos/avatars go through GdkPixbuf,
+# not this crate. Drop the ~10 unused codecs (gif/tiff/bmp/ico/tga/dds/exr/…);
+# jpeg kept as cheap insurance for any photo path that reaches `image`.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "multipart"] }
 serde = { version = "1.0.229", features = ["derive"] }
