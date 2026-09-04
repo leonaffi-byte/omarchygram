@@ -2,6 +2,21 @@
 
 A Telegram client for Omarchy that takes its colors from the active Omarchy theme.
 
+![Omarchygram re-theming live as the Omarchy theme changes](docs/themes.gif)
+
+Switch your Omarchy theme and the client follows instantly — every one of the
+bundled themes, no restart. ([video](https://github.com/leonaffi-byte/omarchygram/releases/download/v0.1.0/omarchygram-themes.mp4))
+
+![A conversation in the miasma theme](docs/hero-marta.png)
+
+![Six Omarchy themes: tokyo-night, gruvbox, catppuccin, nord, rose-pine, kanagawa](docs/themes.png)
+
+Native GTK 4 in Rust — no Electron, no web view. Keyboard-first and dense,
+closer to a terminal than to Telegram Desktop. Voice calls, inline media,
+stickers and animated stickers, polls, topics, stories, a local AI assistant
+over your own chats, anti-delete and edit history, Omarchy actions from a chat,
+and 54 optional terminal-style animations.
+
 ## Install (Omarchy / Arch)
 
 A prebuilt package is attached to each release:
@@ -12,8 +27,23 @@ sudo pacman -U https://github.com/leonaffi-byte/omarchygram/releases/download/v0
 
 It pulls in GTK 4, GStreamer (with the good and libav plugin sets), ffmpeg and
 the JetBrainsMono Nerd Font, and adds an "Omarchygram" entry to the app menu.
-An AUR package (`yay -S omarchygram`) follows once AUR account registration
-reopens; the recipe is in `packaging/PKGBUILD`.
+
+To get updates with `pacman -Syu`, enable the project's package repository
+instead (once):
+
+```
+sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
+
+[omarchygram]
+SigLevel = Optional
+Server = https://github.com/leonaffi-byte/omarchygram/releases/latest/download
+EOF
+sudo pacman -Sy omarchygram
+```
+
+(`SigLevel = Optional` because the packages are not signed yet; they are built
+from the tagged sources with `packaging/PKGBUILD`.) An AUR package
+(`yay -S omarchygram`) follows once AUR account registration reopens.
 
 ## Requirements (building from source)
 

@@ -20,6 +20,13 @@ fn main() -> glib::ExitCode {
         let tmp = base.join(format!("omarchygram-smoke-{}.toml", std::process::id()));
         // SAFETY: called before any thread is spawned (GTK/backends start below).
         unsafe { std::env::set_var("OMG_SETTINGS_PATH", &tmp) };
+        // OMG_SMOKE_SETTINGS_SEED=<toml>: start the throwaway settings from a
+        // preset (demo recordings turn animations on this way).
+        if let Some(seed) = std::env::var_os("OMG_SMOKE_SETTINGS_SEED")
+            && let Err(error) = std::fs::copy(&seed, &tmp)
+        {
+            eprintln!("omarchygram: cannot seed smoke settings: {error}");
+        }
         // Offline AI stand-ins so probes can traverse the Assistant paths.
         unsafe { std::env::set_var("OMG_MOCK_AI", "1") };
         let ui_tmp = base.join(format!("omarchygram-smoke-{}-ui.toml", std::process::id()));
@@ -121,6 +128,36 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
             }
             glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
                 attempt(window, app, path, 30);
+            });
+        }
+        // OMG_SMOKE_RECORD_DIR=<dir>: after the same delay, write frame-NNNNN.png
+        // at OMG_SMOKE_RECORD_FPS (default 20) for OMG_SMOKE_RECORD_MS (default
+        // 10000), then quit. Demo videos are assembled from the frames with
+        // ffmpeg; same offscreen render path as the single shot.
+        if let Some(dir) = std::env::var_os("OMG_SMOKE_RECORD_DIR") {
+            let delay = std::env::var("OMG_SMOKE_SHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000u64);
+            let fps: u64 = std::env::var("OMG_SMOKE_RECORD_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20).clamp(1, 60);
+            let total_ms: u64 = std::env::var("OMG_SMOKE_RECORD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000);
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let window = window.clone();
+            let app = app.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
+                let started = std::time::Instant::now();
+                let frame = std::rc::Rc::new(std::cell::Cell::new(0u32));
+                glib::timeout_add_local(std::time::Duration::from_millis(1000 / fps), move || {
+                    if started.elapsed().as_millis() as u64 >= total_ms {
+                        eprintln!("omarchygram: recorded {} frames", frame.get());
+                        app.quit();
+                        return glib::ControlFlow::Break;
+                    }
+                    let path = dir.join(format!("frame-{:05}.png", frame.get()));
+                    // An empty render node (relayout pending) just skips a tick.
+                    if snapshot_window(&window, &path) {
+                        frame.set(frame.get() + 1);
+                    }
+                    glib::ControlFlow::Continue
+                });
             });
         }
     }
