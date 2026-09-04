@@ -206,6 +206,27 @@ It builds the release binary if needed and writes
 `~/.local/share/applications/omarchygram.desktop` pointing at it. Run it again
 after moving the checkout.
 
+For a system-wide install there is a from-source Arch package recipe in
+`packaging/PKGBUILD` (its header lists what to fill in before publishing to
+the AUR).
+
+## Bar widget for Omarchy
+
+A separate Omarchy 4 shell plugin, `omarchygram-bar` (id `leoom.omarchygram`),
+puts an icon on the bar with the unread count, shows the current voice call,
+and focuses or launches the app on click. Install it like any Omarchy plugin:
+
+```
+omarchy plugin add https://github.com/leoom/omarchygram-bar.git --enable
+```
+
+Settings go through the bar, e.g. `omarchy bar set leoom.omarchygram showCount false`
+(`icon`, `showCount`, `countMuted`, `hideWhenIdle`, `appId`, `launchCommand`,
+`statusPath`). The app feeds it through
+`~/.local/state/omarchygram/status.json` (unread totals, call state, a 30 s
+heartbeat; private to your user, never message text). If the badge never
+appears, the app and the shell disagree on `XDG_STATE_HOME`: set `statusPath`.
+
 ## Voice calls (optional)
 
 Voice calls (Wave 7) use [ntgcalls](https://github.com/pytgcalls/ntgcalls), a

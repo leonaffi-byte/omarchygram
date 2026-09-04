@@ -1,0 +1,82 @@
+# Maintainer: leoom
+#
+# From-source AUR package for Omarchygram. Before publishing:
+#   1. push the repo to the `url` below and tag `v$pkgver`;
+#   2. replace the first 'SKIP' in sha256sums with the tarball checksum
+#      (`updpkgsums` does it);
+#   3. add a LICENSE file to the repo and set `license` accordingly — the
+#      project has none yet, and the AUR requires one.
+# Local check without a remote: drop `omarchygram-$pkgver.tar.gz` (from
+# `git archive --prefix=omarchygram-$pkgver/ -o … HEAD`) next to this file and
+# run `makepkg -s --skipinteg`.
+
+pkgname=omarchygram
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Telegram client for Omarchy, themed by the active Omarchy theme"
+arch=('x86_64')
+url="https://github.com/leoom/omarchygram"
+license=('custom')
+depends=(
+  'gtk4'
+  'gstreamer'
+  'gst-plugins-base'
+  'gst-plugins-good'
+  'gst-libav'
+  'ffmpeg'
+  'ttf-jetbrains-mono-nerd'
+)
+makedepends=('cargo' 'clang' 'pkgconf' 'libarchive')
+optdepends=(
+  'whisper.cpp: local voice-note transcription'
+  'ollama: local AI assistant'
+)
+# The vendored ntgcalls/WebRTC static lib makes an LTO link OOM-prone and buys
+# ~1.5 MB (see specs/wave8-report.md); the crate's own release profile is used.
+options=('!lto')
+
+_ntgcalls=3.0.0-rc01
+source=(
+  "$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
+  "ntgcalls-$_ntgcalls-linux-x86_64.zip::https://github.com/pytgcalls/ntgcalls/releases/download/v$_ntgcalls/ntgcalls.linux-x86_64-static_libs.zip"
+)
+sha256sums=(
+  'SKIP'
+  '67d63734603ecfafc9182bd31cba4736af9306023b63390a73d2ec0d18622b84'
+)
+noextract=("ntgcalls-$_ntgcalls-linux-x86_64.zip")
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  # Same layout bin/fetch-ntgcalls produces; .cargo/config.toml points
+  # NTGCALLS_LIB_DIR at vendor/ntgcalls/lib so the build never downloads.
+  local tmp
+  tmp=$(mktemp -d)
+  bsdtar -xf "$srcdir/ntgcalls-$_ntgcalls-linux-x86_64.zip" -C "$tmp"
+  install -Dm644 "$tmp/lib/libntgcalls.a" vendor/ntgcalls/lib/libntgcalls.a
+  rm -rf "$tmp"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # GUI probes need a compositor and are not run here; unit tests only.
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/omarchygram "$pkgdir/usr/bin/omarchygram"
+  install -Dm644 packaging/omarchygram.desktop "$pkgdir/usr/share/applications/omarchygram.desktop"
+  # README carries the LGPL-3 notice for the bundled ntgcalls static lib.
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
