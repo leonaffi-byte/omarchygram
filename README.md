@@ -205,3 +205,33 @@ bin/install-desktop
 It builds the release binary if needed and writes
 `~/.local/share/applications/omarchygram.desktop` pointing at it. Run it again
 after moving the checkout.
+
+## Voice calls (optional)
+
+Voice calls (Wave 7) use [ntgcalls](https://github.com/pytgcalls/ntgcalls), a
+separate library that handles the WebRTC transport, encryption and audio. It is
+built behind the `calls` cargo feature (on by default). The prebuilt library is
+not committed to this repository; fetch it once before building:
+
+```
+bin/fetch-ntgcalls
+```
+
+To build without call support (smaller binary, no ntgcalls):
+
+```
+cargo build --no-default-features
+```
+
+### NOTICE
+
+ntgcalls is licensed under the GNU Lesser General Public License v3.0
+(LGPL-3.0-only), and it bundles libwebrtc, BoringSSL and Opus under their own
+permissive licenses. Omarchygram links ntgcalls statically. Because this
+project's source is published here, anyone receiving an Omarchygram binary can
+obtain its source and rebuild it against a modified ntgcalls, satisfying the
+LGPL relinking requirement. The ntgcalls source for the exact version used is at
+its release page (the version pinned in `bin/fetch-ntgcalls`); its license text
+and copyright notices are preserved there. To build against your own ntgcalls,
+point `NTGCALLS_LIB_DIR` at your `libntgcalls.a`, or set `NTGCALLS_DYLIB=1` to
+link it dynamically.
