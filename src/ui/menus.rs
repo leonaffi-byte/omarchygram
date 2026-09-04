@@ -18,6 +18,7 @@ pub enum ChatAction {
     Search,
     JumpToDate,
     Info,
+    Call,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -1001,6 +1001,37 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
     // across an await.
     let st = Arc::new(Mutex::new(MockState::new()));
 
+    // Wave 7: OMG_MOCK_INCOMING_CALL=<seconds> makes Marta call us that many
+    // seconds after start (0 = immediately). Drives the incoming-call UI/probe.
+    if let Some(secs) = std::env::var("OMG_MOCK_INCOMING_CALL").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        let st = st.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            let info = {
+                let mut st = st.lock().unwrap();
+                if st.call.as_ref().is_some_and(|c| c.phase != CallPhase::Ended) {
+                    return;
+                }
+                st.call_gen += 1;
+                let name = st.chat_title(1);
+                st.call = Some(CallInfo {
+                    id: 7_100_000 + st.call_gen as i64,
+                    peer_id: 1,
+                    peer_name: name,
+                    outgoing: false,
+                    phase: CallPhase::Incoming,
+                    muted: false,
+                    emojis: String::new(),
+                    connected_at: None,
+                    end_reason: None,
+                });
+                st.call.clone().unwrap()
+            };
+            let _ = events.send(Event::CallChanged(info)).await;
+        });
+    }
+
     // Marta goes offline/online every 20s so presence rendering is exercised.
     {
         let st = st.clone();
@@ -2686,7 +2717,8 @@ fn spawn_call_advance(st: Arc<Mutex<MockState>>, events: async_channel::Sender<E
                 }
                 let Some(c) = st.call.as_mut() else { return };
                 c.phase = match c.phase {
-                    CallPhase::Requesting | CallPhase::Incoming | CallPhase::Exchanging => CallPhase::Connecting,
+                    CallPhase::Requesting | CallPhase::Incoming => CallPhase::Exchanging,
+                    CallPhase::Exchanging => CallPhase::Connecting,
                     CallPhase::Connecting => {
                         c.connected_at = Some(Local::now());
                         c.emojis = "\u{1f434}\u{1f34e}\u{1f697}\u{1f30d}".to_string();

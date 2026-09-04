@@ -18,14 +18,16 @@ use crate::local::Local as LocalServices;
 use crate::os::{self, OsPolicy, Parsed};
 use crate::settings::{Settings, SettingsStore};
 use crate::tg::{
-    AuthState, BackendFlags, ChatInfo, ChatKind, ChatSummary, Event, Me, MediaKind, Msg, MuteMode,
-    SharedKind, StoryPeer, StoryRing, Tg, Topic, msg_in_chat, split_topic_chat_id, topic_chat_id,
+    AuthState, BackendFlags, CallEndReason, CallInfo, CallPhase, ChatInfo, ChatKind, ChatSummary,
+    Event, Me, MediaKind, Msg, MuteMode, SharedKind, StoryPeer, StoryRing, Tg, Topic, msg_in_chat,
+    split_topic_chat_id, topic_chat_id,
 };
 use crate::uistate::UiState;
 
 use super::anim::{Effects, RadioGroup, apply_full_phosphor, group_ids, select_radio};
 use super::auth::{AuthAction, AuthView};
 use super::avatar::Avatar;
+use super::call::{CallAction, CallView};
 use super::chatlist::{ChatList, SearchRetry, SidebarMode, UnreadUpdate};
 use super::contacts::{ContactsAction, ContactsDialog};
 use super::forward::{ForwardAction, ForwardDialog, ForwardRequest};
@@ -701,6 +703,7 @@ struct ShellInner {
     auth: AuthView,
     chatlist: ChatList,
     messages: MessagesView,
+    call: CallView,
     topics: TopicListView,
     content_area: gtk::Stack,
     forum_list_open: Cell<bool>,
@@ -851,6 +854,7 @@ impl Shell {
         let messages = MessagesView::new(effects.clone());
         messages.set_player_settings(settings.clone());
         messages.set_probe(probe);
+        let call = CallView::new(tg.clone(), probe, settings.get().calls.ringtone);
         let topics = TopicListView::new();
         let content_area = gtk::Stack::new();
         content_area.set_transition_type(gtk::StackTransitionType::None);
@@ -940,6 +944,7 @@ impl Shell {
         overlay.add_overlay(&poll_dialog.widget);
         overlay.add_overlay(&location_dialog.widget);
         overlay.add_overlay(&topics.dialog);
+        overlay.add_overlay(&call.widget);
         overlay.set_hexpand(true);
         overlay.set_vexpand(true);
         let shell_overlay = gtk::Overlay::new();
@@ -965,6 +970,7 @@ impl Shell {
             auth,
             chatlist,
             messages,
+            call,
             topics,
             content_area,
             forum_list_open: Cell::new(false),
@@ -1212,6 +1218,21 @@ impl ShellInner {
         }
         {
             let weak = Rc::downgrade(this);
+            this.call.set_action(Rc::new(move |action| {
+                if let Some(this) = weak.upgrade() {
+                    this.handle_call_action(action);
+                }
+            }));
+            let weak = Rc::downgrade(this);
+            this.call.set_on_closed(Rc::new(move || {
+                if let Some(this) = weak.upgrade().filter(|this| this.session_ready.get()) {
+                    this.messages.focus_composer();
+                    this.apply_info_layout(this.current_window_width());
+                }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
             this.topics.set_action(Rc::new(move |action| {
                 let Some(this) = weak.upgrade() else {
                     return;
@@ -1430,7 +1451,8 @@ impl ShellInner {
                     return glib::Propagation::Proceed;
                 };
                 if key == gdk::Key::Escape {
-                    if player::fullscreen_open() {
+                    if this.call.escape() {
+                    } else if player::fullscreen_open() {
                         player::close_fullscreen();
                     } else if this.stories_viewer.is_open() {
                         this.close_stories_viewer();
@@ -1584,6 +1606,8 @@ impl ShellInner {
         self.stories_viewer.clear_session();
         self.stories_peers.borrow_mut().clear();
         self.stories_strip.update_peers(Vec::new());
+        self.call.clear();
+        self.withdraw_call_notification();
         // Account teardown is a synchronous playback barrier: no audio may
         // survive on the auth screen, and no recorder controls remain mapped
         // while their serialized local cleanup finishes.
@@ -1687,6 +1711,7 @@ impl ShellInner {
         self.messages.set_ghost(settings.ghost_mode);
         self.messages.set_edit_history(settings.edit_history);
         self.messages.set_ai_enabled(settings.ai.enabled);
+        self.call.set_ringtone_enabled(settings.calls.ringtone);
         self.chatlist.set_show_avatars(settings.ui.show_avatars);
         // A32: the info panel's own avatar, its member rows and the contacts
         // list are bound at their own logical keys, so a show_avatars flip
@@ -1952,7 +1977,8 @@ impl ShellInner {
             || self.stickers.is_open()
             || self.caption_dialog.borrow().is_some()
             || self.switcher.is_open()
-            || self.settings_open();
+            || self.settings_open()
+            || self.call.is_open();
         let target = if !desired {
             InfoLayout::Hidden
         } else if window_width >= 1000 {
@@ -2617,6 +2643,17 @@ impl ShellInner {
             self.toggle_info_panel();
             return;
         }
+        if matches!(action, ChatAction::Call) {
+            if self.open_chat.get() == Some(chat_id)
+                && self
+                    .chatlist
+                    .summary(chat_id)
+                    .is_some_and(|summary| summary.kind == ChatKind::User)
+            {
+                self.start_call(chat_id);
+            }
+            return;
+        }
         if matches!(action, ChatAction::JumpToDate) {
             return;
         }
@@ -2703,6 +2740,145 @@ impl ShellInner {
                 }
             }
         });
+    }
+
+    fn start_call(self: Rc<Self>, peer_id: i64) {
+        if !self.session_ready.get() {
+            return;
+        }
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(&self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.call_start(peer_id).await;
+            let Some(this) = weak.upgrade() else { return };
+            if this.session_ready.get() && this.session_epoch.get() == session_epoch {
+                if let Err(error) = result {
+                    this.messages.show_error(&error);
+                }
+            }
+        });
+    }
+
+    fn handle_call_action(self: Rc<Self>, action: CallAction) {
+        if !self.session_ready.get() {
+            return;
+        }
+        if self.probe && self.call.current().is_some_and(|info| info.id < 0) {
+            self.drive_probe_incoming(action);
+            return;
+        }
+        let tg = self.tg.clone();
+        let session_epoch = self.session_epoch.get();
+        let weak = Rc::downgrade(&self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = match action {
+                CallAction::Accept => tg.call_accept().await,
+                CallAction::HangUp => tg.call_hang_up().await,
+                CallAction::SetMuted(muted) => tg.call_set_muted(muted).await,
+            };
+            let Some(this) = weak.upgrade() else { return };
+            if this.session_ready.get() && this.session_epoch.get() == session_epoch {
+                if let Err(error) = result {
+                    this.messages.show_error(&error);
+                    // A failed mute must not leave the toggle out of sync.
+                    if matches!(action, CallAction::SetMuted(_)) {
+                        this.call.resync_mute();
+                    }
+                }
+            }
+        });
+    }
+
+    /// The production mock exposes incoming calls only through a process-start
+    /// environment fixture. The default gate cannot restart its backend, so
+    /// the probe drives the same event-shaped UI transition locally. Button
+    /// actions and every rendered state are still exercised through CallView.
+    fn drive_probe_incoming(self: Rc<Self>, action: CallAction) {
+        let Some(mut info) = self.call.current().filter(|info| info.id < 0) else {
+            return;
+        };
+        match action {
+            CallAction::Accept if info.phase == CallPhase::Incoming => {
+                info.phase = CallPhase::Exchanging;
+                self.handle_call_changed(info.clone());
+                glib::MainContext::default().spawn_local(async move {
+                    glib::timeout_future(Duration::from_millis(40)).await;
+                    if self.call.phase() != Some(CallPhase::Exchanging)
+                        || self.call.current().as_ref().map(|call| call.id) != Some(info.id)
+                    {
+                        return;
+                    }
+                    info.phase = CallPhase::Connecting;
+                    self.handle_call_changed(info.clone());
+                    glib::timeout_future(Duration::from_millis(40)).await;
+                    if self.call.phase() != Some(CallPhase::Connecting)
+                        || self.call.current().as_ref().map(|call| call.id) != Some(info.id)
+                    {
+                        return;
+                    }
+                    info.phase = CallPhase::Active;
+                    info.connected_at = Some(Local::now());
+                    info.emojis = "🐴🍎🚗🌍".to_string();
+                    self.handle_call_changed(info);
+                });
+            }
+            CallAction::HangUp if info.phase != CallPhase::Ended => {
+                info.end_reason = Some(if info.phase == CallPhase::Incoming {
+                    CallEndReason::Declined
+                } else {
+                    CallEndReason::Hangup
+                });
+                info.phase = CallPhase::Ended;
+                self.handle_call_changed(info);
+            }
+            CallAction::SetMuted(muted) if info.phase == CallPhase::Active => {
+                info.muted = muted;
+                self.handle_call_changed(info);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_call_changed(self: &Rc<Self>, info: CallInfo) {
+        let new_incoming = info.phase == CallPhase::Incoming
+            && self.call.current().as_ref().is_none_or(|current| {
+                current.phase != CallPhase::Incoming || current.id != info.id
+            });
+        if new_incoming && !self.window_is_active() {
+            self.notify_incoming_call(&info.peer_name);
+        } else if info.phase != CallPhase::Incoming {
+            self.withdraw_call_notification();
+        }
+        self.call.update(info);
+        self.apply_info_layout(self.current_window_width());
+    }
+
+    fn notify_incoming_call(&self, peer_name: &str) {
+        let Some(window) = self.window() else { return };
+        let Some(application) = window.application() else {
+            return;
+        };
+        let title = if peer_name.trim().is_empty() {
+            "Unknown caller"
+        } else {
+            peer_name
+        };
+        self.probe_notifications
+            .set(self.probe_notifications.get().wrapping_add(1));
+        if self.probe {
+            return;
+        }
+        let title = glib::markup_escape_text(title);
+        let notification = gio::Notification::new(title.as_str());
+        notification.set_body(Some("Incoming voice call"));
+        application.send_notification(Some("incoming-call"), &notification);
+    }
+
+    fn withdraw_call_notification(&self) {
+        if let Some(application) = self.window().and_then(|window| window.application()) {
+            application.withdraw_notification("incoming-call");
+        }
     }
 
     fn confirm_destructive_chat_action(self: Rc<Self>, chat_id: i64, action: ChatAction) {
@@ -4362,6 +4538,39 @@ impl ShellInner {
         if let Ok(query) = std::env::var("OMG_SMOKE_SEARCH") {
             self.chatlist.set_search_text(&query);
         }
+        if let Some(call) = std::env::var("OMG_SMOKE_CALL")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            match call.as_str() {
+                "out" => {
+                    let weak = Rc::downgrade(self);
+                    glib::MainContext::default().spawn_local(async move {
+                        let Some(this) = weak.upgrade() else { return };
+                        let marta = this
+                            .chatlist
+                            .ordered()
+                            .into_iter()
+                            .find_map(|(id, title)| (title == "Marta").then_some(id));
+                        let Some(marta) = marta else { return };
+                        if this.open_chat.get() != Some(marta) {
+                            this.clone().open_chat(marta);
+                        }
+                        if poll_until(8_000, || {
+                            this.open_chat.get() == Some(marta) && !this.messages.is_loading()
+                        })
+                        .await
+                        {
+                            this.start_call(marta);
+                        }
+                    });
+                }
+                // The mock's OMG_MOCK_INCOMING_CALL fixture emits the event;
+                // the regular event loop opens this same surface.
+                "in" => {}
+                other => eprintln!("OMG_SMOKE_CALL: unknown value {other}"),
+            }
+        }
         if std::env::var("OMG_SMOKE_MENU").is_ok_and(|value| !value.is_empty()) {
             let weak = Rc::downgrade(self);
             let Some(window) = self.window() else { return };
@@ -4647,8 +4856,7 @@ impl ShellInner {
             return;
         }
         match event {
-            // Wave 7: the call UI package replaces this with the real handler.
-            Event::CallChanged(_) => {}
+            Event::CallChanged(info) => self.handle_call_changed(info),
             Event::ReadOutbox { chat_id, max_id } => {
                 self.bump_dialogs_revision();
                 let mut read = self.read_outbox.borrow_mut();
@@ -8958,6 +9166,26 @@ impl ShellInner {
             probe_fail("group sender names");
             return;
         }
+        let group_has_call = self.messages.header_call_visible();
+        let bot = self
+            .chatlist
+            .ordered()
+            .into_iter()
+            .find_map(|(id, title)| (title == "Omarchy Bot").then_some(id));
+        let Some(bot) = bot else {
+            probe_fail("call button present: bot fixture");
+            return;
+        };
+        self.clone().open_chat(bot);
+        if !poll_until(3000, || {
+            self.open_chat.get() == Some(bot) && !self.messages.is_loading()
+        })
+        .await
+        {
+            probe_fail("call button present: open bot");
+            return;
+        }
+        let bot_has_call = self.messages.header_call_visible();
         self.clone().open_chat(marta);
         probe_step("open Marta");
         if !poll_until(3000, || {
@@ -8968,6 +9196,83 @@ impl ShellInner {
         .await
         {
             probe_fail("open Marta");
+            return;
+        }
+        probe_step("call button present");
+        if group_has_call || bot_has_call || !self.messages.header_call_visible() {
+            probe_fail("call button present");
+            return;
+        }
+
+        self.messages.probe_click_header_call();
+        probe_step("call outgoing ringing");
+        if !poll_until(600, || self.call.phase() == Some(CallPhase::Requesting)).await {
+            probe_fail("call outgoing ringing");
+            return;
+        }
+        probe_step("call outgoing connects");
+        if !poll_until(3500, || {
+            self.call.phase() == Some(CallPhase::Active) && self.call.emoji_visible_nonempty()
+        })
+        .await
+        {
+            probe_fail("call outgoing connects");
+            return;
+        }
+        self.call.probe_toggle_mute();
+        probe_step("call mute");
+        if !poll_until(1000, || self.call.muted()).await {
+            probe_fail("call mute");
+            return;
+        }
+        self.call.probe_hang_up();
+        probe_step("call hang up");
+        if !poll_until(2500, || !self.call.is_open()).await {
+            probe_fail("call hang up");
+            return;
+        }
+
+        let incoming = |id| CallInfo {
+            id,
+            peer_id: marta,
+            peer_name: "Marta".to_string(),
+            outgoing: false,
+            phase: CallPhase::Incoming,
+            muted: false,
+            emojis: String::new(),
+            connected_at: None,
+            end_reason: None,
+        };
+        self.handle_call_changed(incoming(-1));
+        probe_step("call incoming rings");
+        if !poll_until(500, || self.call.phase() == Some(CallPhase::Incoming)).await {
+            probe_fail("call incoming rings");
+            return;
+        }
+        self.call.probe_accept();
+        probe_step("call incoming accept");
+        if !poll_until(1000, || {
+            self.call.phase() == Some(CallPhase::Active) && self.call.emoji_visible_nonempty()
+        })
+        .await
+        {
+            probe_fail("call incoming accept");
+            return;
+        }
+        self.call.probe_hang_up();
+        if !poll_until(2500, || !self.call.is_open()).await {
+            probe_fail("call incoming accept cleanup");
+            return;
+        }
+        self.handle_call_changed(incoming(-2));
+        if !poll_until(500, || self.call.phase() == Some(CallPhase::Incoming)).await {
+            probe_fail("call incoming decline setup");
+            return;
+        }
+        self.call.probe_hang_up();
+        probe_step("call incoming decline");
+        if !poll_until(2500, || !self.call.is_open()).await {
+            probe_fail("call incoming decline");
             return;
         }
         if environment_listed("OMG_MOCK_FAIL_ONCE", "DownloadMedia") {

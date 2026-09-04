@@ -1983,3 +1983,83 @@ button.omg-story-item:focus-visible {
   font-size: 22px;
   margin-top: -22px; /* the glyph's tip marks the point */
 }
+
+/* ---- wave 7 ---- */
+.omg-call {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+  border-radius: 4px;
+  padding: 24px;
+}
+
+.omg-call-name {
+  color: var(--fg);
+  font-size: 15pt;
+  font-weight: bold;
+}
+
+.omg-call-status,
+.omg-call-caption {
+  color: var(--muted);
+}
+
+.omg-call-caption {
+  font-size: 9pt;
+}
+
+.omg-call-timer {
+  color: var(--fg);
+  font-size: 14pt;
+  font-weight: bold;
+}
+
+.omg-call-emojis {
+  color: var(--fg);
+  font-size: 24pt;
+  letter-spacing: 4px;
+}
+
+button.omg-call-accept,
+button.omg-call-danger,
+button.omg-call-control {
+  background-image: none;
+  border-radius: 4px;
+  min-height: 40px;
+  padding: 0 16px;
+  font-weight: bold;
+}
+
+button.omg-call-accept {
+  background-color: var(--accent);
+  color: var(--bg-darker);
+  border: 1px solid var(--accent);
+}
+
+button.omg-call-danger {
+  background-color: var(--red);
+  color: var(--bg-darker);
+  border: 1px solid var(--red);
+}
+
+button.omg-call-control {
+  background-color: var(--bg-lighter);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+}
+
+button.omg-call-control:checked {
+  background-color: var(--selection);
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+button.omg-call-accept:hover,
+button.omg-call-accept:focus-visible,
+button.omg-call-danger:hover,
+button.omg-call-danger:focus-visible,
+button.omg-call-control:hover,
+button.omg-call-control:focus-visible {
+  opacity: 0.9;
+}
+/* ---- end 7 ---- */
