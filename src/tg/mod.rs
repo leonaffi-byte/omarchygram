@@ -1020,7 +1020,14 @@ impl Tg {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = async_channel::unbounded();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            // Wave 8B: a personal 1:1 client is network-bound, not CPU-bound —
+            // 2 workers instead of one-per-core (was 16 here) saves ~14 idle
+            // threads with no throughput loss (data commands still spawn freely).
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
             if mock {
                 rt.block_on(mock::run(cmd_rx, event_tx));
             } else {

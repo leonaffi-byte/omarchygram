@@ -52,7 +52,14 @@ impl Local {
     pub fn spawn() -> Local {
         let (tx, mut rx) = mpsc::unbounded_channel::<Cmd>();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime (local services)");
+            // Wave 8B: local services mostly await subprocesses (AI, whisper,
+            // OS actions) — 2 workers instead of one-per-core (was 16) saves
+            // ~14 idle threads; commands still each spawn a concurrent task.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("tokio runtime (local services)");
             rt.block_on(async move {
                 while let Some(cmd) = rx.recv().await {
                     // Every command runs concurrently; a slow transcription
