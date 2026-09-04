@@ -167,9 +167,12 @@ Extends `BarWidget` (`qs.Ui`), `moduleName: "leoom.omarchygram"`. Imports:
   2. `stateDirWatch` on `…/omarchygram` (the file's directory) and
   3. `stateParentWatch` on its parent (`…/.local/state` or `$XDG_STATE_HOME`),
      both `watchChanges: true`, `printErrors: false`,
-     `onFileChanged: statusFile.reload()`. This catches the file's first
-     creation, the directory's first creation, and every atomic replacement
-     (a rename swaps the inode under a bare file watch).
+     `onFileChanged: Qt.callLater(statusFile.reload)`. This catches the
+     file's first creation, the directory's first creation, and every atomic
+     replacement (a rename swaps the inode under a bare file watch).
+     `Qt.callLater` coalesces bursts: the parent directory sees other apps'
+     state writes, and an uncoalesced reload storm was measured to push the
+     shell's IPC past its 2 s timeout during testing.
 - **Model:** all parsing and state derivation live in `Model.js`; QML only
   binds to its result. `property double nowMs` is set on every apply and by
   the timer; the view binding depends on it.
@@ -184,14 +187,24 @@ Extends `BarWidget` (`qs.Ui`), `moduleName: "leoom.omarchygram"`. Imports:
   `BarIconButton` (`bar: root.bar`, `slotSize: Style.bar.statusSlot`,
   `fontSize: Style.font.caption`, `text: model.glyph`,
   `tooltipText: model.tooltip`, `onPressed: root.activateOrLaunch()`) and a
-  badge `Text` (`font.pixelSize: Style.font.caption`, visible when
-  `model.badge !== ""`, color from the `Color` singleton — read
-  `Commons/Color.qml` and use its foreground token; the in-call glyph uses
-  its accent token). No literal colors, shadows, animation or custom fonts.
-  Vertical bars (`root.vertical`): icon only.
-- **Click → `activateOrLaunch()`:** iterate `ToplevelManager.toplevels`
-  (`Quickshell.Wayland`, as `plugins/bar/widgets/ActiveWindow.qml` does) and
-  call `.activate()` on the first toplevel whose `appId === setting("appId")`.
+  badge `Text` (`font.pixelSize: Style.bar.iconFont` — the size the workspace
+  digits and the agents badge use; NOT the smaller caption size — visible
+  when `model.badge !== ""`, `color: Color.foreground`). The in-call glyph is
+  tinted with `active: model.inCall` and `activeColor: Color.accent` — the
+  shell's highlight token (it drives menu selection, popup borders and
+  notification countdowns). Not the button's default `activeColor`
+  (`bar.urgent` = the theme's red, an alarm colour), and not "the green the
+  agents badge uses": the shell has no green token and that badge belongs to
+  a third-party plugin (herdr) with its own colour — a UI review compared
+  against it by mistake. Not running / stale:
+  `opacity: model.live ? 1 : 0.5` on the button, the same dimming Workspaces
+  applies to unoccupied slots, so a dead app is visibly different from idle.
+  No literal colors, shadows, animation or custom fonts. Vertical bars
+  (`root.vertical`): icon only.
+- **Click → `activateOrLaunch()`:** iterate `ToplevelManager.toplevels.values`
+  (`Quickshell.Wayland`, as `plugins/bar/widgets/ActiveWindow.qml` does),
+  null-guarding the model and each slot, and call `.activate()` on the first
+  toplevel whose `appId === setting("appId")`.
   If none matches, `root.bar.run(setting("launchCommand"))` — the setting is
   a shell command line (arguments allowed, it is the user's own config, same
   trust as first-party widgets' `bar.run` strings). This is the ONLY
@@ -204,9 +217,17 @@ Extends `BarWidget` (`qs.Ui`), `moduleName: "leoom.omarchygram"`. Imports:
 
 ```
 parse(text)                    → normalized status | null
-view(status, settings, nowMs)  → { live, visible, glyph, badge, tooltip, callActive }
+view(status, settings, nowMs)  → { live, visible, glyph, badge, tooltip, inCall, callActive }
 formatElapsed(connectedAtIso, nowMs) → "MM:SS" ("H:MM:SS" past an hour) | ""
 ```
+
+`inCall` is true for any non-null call (drives the tint: `active: model.inCall`);
+`callActive` only for `active` with a parseable `connected_at` (drives the 1 s
+tick). Boolean settings arrive as JSON **strings** when set with
+`omarchy bar set <id> <key> true` (no `--json`), so `showCount`, `countMuted`
+and `hideWhenIdle` go through one `toBool(value, fallback)` helper
+(`true/"true"/1/"1"` → true, `false/"false"/0/"0"` → false, else fallback).
+An empty `icon` setting falls back to the paper plane.
 
 `parse` returns `null` for invalid JSON, `version !== 1`, or a missing/
 non-boolean `running`. Counts: finite, non-negative integers, else 0.
@@ -232,13 +253,19 @@ States (`view`):
 
 `tests/run.js` (plain Node, no dependencies) loads every fixture, calls
 `parse` + `view` with fixed `nowMs` and settings, and asserts exact
-`live/visible/glyph/badge/tooltip/callActive`. Fixtures: absent (empty
-text), invalid-json, wrong-version, not-running, stale (old `updated_at`),
-idle, idle+hideWhenIdle, unread, unread-hidden-count, unread-count-muted,
-malformed-counts, incoming, outgoing, active, active-muted,
-active-no-connected-at, active-future-connected-at, unknown-phase (→ no
-call), empty-peer. Plus `formatElapsed` edge cases (0 s, 59 s, 3599 s,
-3600 s, null, garbage). Exit 0 on success, non-zero with the failing case.
+`live/visible/glyph/badge/tooltip/inCall/callActive`. Fixtures: absent
+(empty text), invalid-json, wrong-version (a full live-looking document
+that must still read as not running; `parse` must return `null` for these
+three), not-running, stale (old `updated_at`), live-45s (45 s old, live),
+stale-90s-plus (90 s + 1 ms, not running — checks the ×1000 units), idle,
+idle+hideWhenIdle, absent/not-running+hideWhenIdle (must stay visible),
+unread, unread-hidden-count, unread-count-muted, malformed-counts (string
+counts on `unread` and `unread_with_muted` with `countMuted` → badge ""),
+boolean settings given as strings, incoming, outgoing, connecting-incoming
+("Connecting to PEER…"), active, active-muted, active-no-connected-at,
+active-future-connected-at, unknown-phase (→ no call), empty-peer. Plus
+`formatElapsed` edge cases (0 s, 59 s, 3599 s, 3600 s, null, garbage).
+Exit 0 on success, non-zero with the failing case.
 
 ### 3.5 README.md (user-facing)
 
