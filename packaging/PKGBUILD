@@ -15,8 +15,8 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="Telegram client for Omarchy, themed by the active Omarchy theme"
 arch=('x86_64')
-url="https://github.com/leoom/omarchygram"
-license=('custom')
+url="https://github.com/leonaffi-byte/omarchygram"
+license=('GPL-3.0-or-later')
 depends=(
   'gtk4'
   'gstreamer'

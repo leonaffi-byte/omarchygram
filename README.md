@@ -217,7 +217,7 @@ puts an icon on the bar with the unread count, shows the current voice call,
 and focuses or launches the app on click. Install it like any Omarchy plugin:
 
 ```
-omarchy plugin add https://github.com/leoom/omarchygram-bar.git --enable
+omarchy plugin add https://github.com/leonaffi-byte/omarchygram-bar.git --enable
 ```
 
 Settings go through the bar, e.g. `omarchy bar set leoom.omarchygram showCount false`

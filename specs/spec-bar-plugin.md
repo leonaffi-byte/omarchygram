@@ -269,7 +269,7 @@ Exit 0 on success, non-zero with the failing case.
 
 ### 3.5 README.md (user-facing)
 
-Install: `omarchy plugin add https://github.com/leoom/omarchygram-bar.git --enable`
+Install: `omarchy plugin add https://github.com/leonaffi-byte/omarchygram-bar.git --enable`
 (placement prompt; or `omarchy bar put leoom.omarchygram --after omarchy.clock`).
 Requirements: Omarchy 4 shell; Omarchygram with the status file (link to the
 app). Settings with `omarchy bar set leoom.omarchygram <key> <value>` and the
