@@ -8,7 +8,10 @@ transcription, AI draft/translate/summarize, ticketed shell gate). Wave 4
 MERGED. Wave 5 (Telegram parity: layout/chrome, in-app configuration, daily-use and regular-use functions — specs/spec-wave5.md) is IN PROGRESS: backend contract + real implementation merged 2026-09-02; all four UI packages (5A layout/chrome, 5B in-app configuration, 5C daily-use functions, 5D regular-use functions) MERGED 2026-09-02. Wave 5 is complete. Wave 6 (Telegram media parity: playback,
 location, polls, remaining media kinds, scheduling, bots, topics, stories, calls) is
 COMPLETE 2026-09-04 except calls: backend contract + real implementation + video-note recorder, 6A (in-app playback), 6B (cards, polls), 6C (poll/location dialogs, send later, scheduled), 6D (animated stickers), 6E (bots, forums), 6F (video notes, live location, stories) are on main; every package went through a fresh-context acceptance check, a codex line review with a fix round, a grok review of the fix rounds with a final fix round, and a UI screenshot review; the 12-run gate is green (212-step traversal). 6G/Wave 7 calls: voice calls COMPLETE 2026-09-04 (ntgcalls single-owner call actor + mock flow + call button/overlay/settings on main; 12-run gate green, verifier PASS, codex line review + grok fix-round review both applied); video calls remain a later spike; original spike notes below (see the Wave 6 section at the end). Secret chats are
-deliberately left out.
+deliberately left out. Wave 8 (optimization) COMPLETE 2026-09-04: release profile
++ tokio worker caps + dependency-feature diet cut the shipped binary 73.9 MB →
+53.0 MB, the dependency graph 359 → 295 crates, and idle threads 64 → 22, with the
+12-run gate still green; see specs/wave8-report.md.
 
 ## Design decisions (orchestrator-owned)
 
