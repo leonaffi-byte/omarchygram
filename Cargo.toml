@@ -9,6 +9,22 @@ edition = "2024"
 default = ["calls"]
 calls = ["dep:ntgcalls"]
 
+# Wave 8A optimization (specs/spec-wave8.md): smaller + faster release binary.
+# codegen-units = 1 + opt-level = 3 optimize the whole crate as a unit; strip
+# ships without symbols. Measured on this tree: 73.9 MB default → 60.8 MB.
+# NOT set, and why (both were tried and reverted 2026-09-04):
+#   - lto: the thin-LTO link over the vendored 128 MB ntgcalls/WebRTC static lib
+#     is RAM-heavy and OOM-killed the linker repeatedly; net size win was ~1.5 MB
+#     (the binary is dominated by that prebuilt blob, which LTO cannot touch).
+#   - panic = "abort": in a release build it made GTK abort at startup with a
+#     GObject bind_property CRITICAL (fatal under the gate's G_DEBUG); the debug
+#     build and the default-profile release build are both clean. Not worth the
+#     tiny unwind-table saving. The app still treats panics as fatal by design.
+[profile.release]
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+
 [dependencies]
 libc = "0.2"
 ntgcalls = { version = "=3.0.0-rc01", optional = true }
