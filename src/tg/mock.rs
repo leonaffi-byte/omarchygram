@@ -2717,7 +2717,8 @@ fn spawn_call_advance(st: Arc<Mutex<MockState>>, events: async_channel::Sender<E
                 }
                 let Some(c) = st.call.as_mut() else { return };
                 c.phase = match c.phase {
-                    CallPhase::Requesting | CallPhase::Incoming | CallPhase::Exchanging => CallPhase::Connecting,
+                    CallPhase::Requesting | CallPhase::Incoming => CallPhase::Exchanging,
+                    CallPhase::Exchanging => CallPhase::Connecting,
                     CallPhase::Connecting => {
                         c.connected_at = Some(Local::now());
                         c.emojis = "\u{1f434}\u{1f34e}\u{1f697}\u{1f30d}".to_string();
