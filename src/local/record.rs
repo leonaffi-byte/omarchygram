@@ -273,13 +273,18 @@ mod video_tests {
             return;
         }
         unsafe { std::env::set_var("OMG_CAMERA", "test") };
+        let started = std::time::Instant::now();
         let rx = video_start(120).await.expect("start");
         let first = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.expect("a frame in time").expect("frame");
         assert_eq!(first.len(), 120 * 120 * 4);
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let (path, secs) = video_stop().await.expect("stop");
         assert!(path.exists());
-        assert!(secs >= 1 && secs <= 5, "secs {secs}");
+        // `secs` is wall-clock since spawn (ceil'd). ffmpeg's startup latency
+        // is inside that window and swings with machine load, so compare
+        // against this test's own clock rather than a fixed upper bound.
+        let wall = started.elapsed().as_secs_f64();
+        assert!(secs >= 1 && f64::from(secs) <= wall.ceil() + 1.0, "secs {secs} vs wall {wall:.1}s");
         assert!(std::fs::metadata(&path).unwrap().len() > 1000);
         let _ = std::fs::remove_file(&path);
         assert!(video_stop().await.is_err(), "nothing running any more");

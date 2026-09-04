@@ -1608,6 +1608,7 @@ impl ShellInner {
         self.stories_strip.update_peers(Vec::new());
         self.call.clear();
         self.withdraw_call_notification();
+        crate::status::set_call(None);
         // Account teardown is a synchronous playback barrier: no audio may
         // survive on the auth screen, and no recorder controls remain mapped
         // while their serialized local cleanup finishes.
@@ -1670,6 +1671,9 @@ impl ShellInner {
                 self.me.borrow_mut().take();
                 self.chat_info.borrow_mut().clear();
                 self.drafts.borrow_mut().clear();
+                // Only a logout that succeeded zeroes the bar badge; a failed
+                // one keeps the signed-in snapshot.
+                crate::status::reset_session();
             }
             match result {
                 Ok(AuthState::NeedPhone) => {
@@ -2851,6 +2855,9 @@ impl ShellInner {
             self.withdraw_call_notification();
         }
         self.call.update(info);
+        // Mirror what the view accepted: its generation/late-Ended rules
+        // decide identity, the status file never second-guesses them.
+        crate::status::set_call(self.call.current().as_ref());
         self.apply_info_layout(self.current_window_width());
     }
 
@@ -9198,6 +9205,31 @@ impl ShellInner {
             probe_fail("open Marta");
             return;
         }
+        probe_step("status file written");
+        let expected = self.chatlist.unread_totals();
+        let writes_before = crate::status::writes();
+        if !poll_until(1500, || {
+            crate::status::probe_snapshot().is_some_and(|s| {
+                s["version"] == 1
+                    && s["running"] == true
+                    && s["unread"] == expected.unread
+                    && s["unread_chats"] == expected.unread_chats
+                    && s["unread_with_muted"] == expected.unread_with_muted
+                    && s["unread_chats_with_muted"] == expected.unread_chats_with_muted
+                    && s["call"].is_null()
+            })
+        })
+        .await
+        {
+            probe_fail("status file written");
+            return;
+        }
+        // The fixture has unread chats, so the exact match above is not a
+        // vacuous all-zeros comparison; and the writer must have written.
+        if expected.unread_with_muted == 0 || writes_before == 0 {
+            probe_fail("status file written (fixture has no unread or no write happened)");
+            return;
+        }
         probe_step("call button present");
         if group_has_call || bot_has_call || !self.messages.header_call_visible() {
             probe_fail("call button present");
@@ -9219,6 +9251,22 @@ impl ShellInner {
             probe_fail("call outgoing connects");
             return;
         }
+        probe_step("status file reports active call");
+        let writes_before_call = crate::status::writes();
+        if !poll_until(1500, || {
+            crate::status::probe_snapshot().is_some_and(|s| {
+                s["call"]["phase"] == "active"
+                    && s["call"]["peer"] == "Marta"
+                    && s["call"]["outgoing"] == true
+                    && s["call"]["muted"] == false
+                    && s["call"]["connected_at"].is_string()
+            }) && crate::status::writes() > writes_before_call
+        })
+        .await
+        {
+            probe_fail("status file reports active call");
+            return;
+        }
         self.call.probe_toggle_mute();
         probe_step("call mute");
         if !poll_until(1000, || self.call.muted()).await {
@@ -9229,6 +9277,15 @@ impl ShellInner {
         probe_step("call hang up");
         if !poll_until(2500, || !self.call.is_open()).await {
             probe_fail("call hang up");
+            return;
+        }
+        probe_step("status file clears call");
+        if !poll_until(1500, || {
+            crate::status::probe_snapshot().is_some_and(|s| s["call"].is_null())
+        })
+        .await
+        {
+            probe_fail("status file clears call");
             return;
         }
 

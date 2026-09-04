@@ -205,6 +205,12 @@ impl ChatList {
 
         let rows = Rc::new(RefCell::new(HashMap::<i64, ChatRow>::new()));
         let summaries = Rc::new(RefCell::new(HashMap::<i64, ChatSummary>::new()));
+        // The bar plugin's status file pulls its unread totals from here at
+        // write time, so every mutation below only has to say "changed".
+        crate::status::set_unread_provider(Box::new({
+            let summaries = summaries.clone();
+            move || Self::totals_of(&summaries.borrow())
+        }));
         let order = Rc::new(RefCell::new(Vec::<i64>::new()));
         let virtual_order = Rc::new(RefCell::new(Vec::<i64>::new()));
         let folders = Rc::new(RefCell::new(Vec::<Folder>::new()));
@@ -403,6 +409,7 @@ impl ChatList {
     }
 
     pub fn set_chats(&self, chats: Vec<ChatSummary>) {
+        crate::status::unread_changed();
         let old_value = self.scroll.vadjustment().value();
         let virtual_ids: HashSet<i64> = self.virtual_order.borrow().iter().copied().collect();
         let supplied: HashSet<i64> = chats.iter().map(|chat| chat.id).collect();
@@ -558,6 +565,36 @@ impl ChatList {
         );
     }
 
+    /// Totals for the status file (`specs/spec-bar-plugin.md` §1). Unlike the
+    /// sidebar's "All" badge (`folder_unread`, which counts everything), the
+    /// bar badge follows Telegram's tray convention: archived chats never
+    /// count, muted ones only in the `with_muted` variants. Same per-chat
+    /// `max(unread, unread_mark)` rule.
+    pub fn unread_totals(&self) -> crate::status::UnreadTotals {
+        Self::totals_of(&self.summaries.borrow())
+    }
+
+    fn totals_of(summaries: &HashMap<i64, ChatSummary>) -> crate::status::UnreadTotals {
+        let mut t = crate::status::UnreadTotals::default();
+        for chat in summaries.values() {
+            if chat.archived {
+                continue;
+            }
+            let n = chat.unread.max(i32::from(chat.unread_mark));
+            t.unread_with_muted = t.unread_with_muted.saturating_add(n);
+            if n > 0 {
+                t.unread_chats_with_muted += 1;
+            }
+            if !chat.muted {
+                t.unread = t.unread.saturating_add(n);
+                if n > 0 {
+                    t.unread_chats += 1;
+                }
+            }
+        }
+        t
+    }
+
     fn folder_unread(&self, folder: &Folder) -> i32 {
         self.summaries
             .borrow()
@@ -575,6 +612,7 @@ impl ChatList {
         time: Option<DateTime<Local>>,
         unread: UnreadUpdate,
     ) {
+        crate::status::unread_changed();
         self.ensure_row(chat_id, title);
         {
             let mut summaries = self.summaries.borrow_mut();
@@ -635,6 +673,7 @@ impl ChatList {
     }
 
     pub fn set_summary(&self, summary: ChatSummary) {
+        crate::status::unread_changed();
         self.ensure_row(summary.id, &summary.title);
         self.summaries
             .borrow_mut()
@@ -655,6 +694,7 @@ impl ChatList {
     }
 
     pub fn remove_chat(&self, chat_id: i64) {
+        crate::status::unread_changed();
         if self.selected.get() == Some(chat_id) {
             self.selected.set(None);
             self.list.unselect_all();
@@ -680,6 +720,7 @@ impl ChatList {
     }
 
     pub fn clear_unread(&self, chat_id: i64) {
+        crate::status::unread_changed();
         if let Some(summary) = self.summaries.borrow_mut().get_mut(&chat_id) {
             summary.unread = 0;
             summary.unread_mark = false;
@@ -688,6 +729,7 @@ impl ChatList {
     }
 
     pub fn set_unread_mark(&self, chat_id: i64, unread: bool) {
+        crate::status::unread_changed();
         if let Some(summary) = self.summaries.borrow_mut().get_mut(&chat_id) {
             summary.unread_mark = unread;
             if !unread {

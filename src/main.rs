@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use omarchygram::{config, theme, tg, ui, uistate};
+use omarchygram::{config, status, theme, tg, ui, uistate};
 
 use gtk4 as gtk;
 use gtk4::glib;
@@ -24,6 +24,9 @@ fn main() -> glib::ExitCode {
         unsafe { std::env::set_var("OMG_MOCK_AI", "1") };
         let ui_tmp = base.join(format!("omarchygram-smoke-{}-ui.toml", std::process::id()));
         unsafe { std::env::set_var("OMG_UISTATE_PATH", &ui_tmp) };
+        // The bar-plugin status file too: probes must never touch the real one.
+        let status_tmp = base.join(format!("omarchygram-smoke-{}-status.json", std::process::id()));
+        unsafe { std::env::set_var("OMG_STATUS_PATH", &status_tmp) };
     }
     config::enforce_permissions();
 
@@ -32,7 +35,13 @@ fn main() -> glib::ExitCode {
     // anything), so they register as non-unique.
     let flags = if smoke { gtk::gio::ApplicationFlags::NON_UNIQUE } else { gtk::gio::ApplicationFlags::default() };
     let app = gtk::Application::builder().application_id(APP_ID).flags(flags).build();
-    app.connect_activate(move |app| build(app, smoke, probe));
+    app.connect_activate(move |app| {
+        // The Omarchy bar plugin's status file (specs/spec-bar-plugin.md §1):
+        // "up" once GTK owns the main loop, "gone" on every normal exit path.
+        status::set_running(true);
+        build(app, smoke, probe);
+    });
+    app.connect_shutdown(|_| status::shutdown());
     // GTK must not see our flags.
     app.run_with_args::<&str>(&[])
 }
