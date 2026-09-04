@@ -232,8 +232,18 @@ impl TopicListView {
     }
 
     pub fn open_dialog(&self) {
-        self.create_pending.set(false);
         self.dialog_card.set_sensitive(true);
+        if self.create_pending.get() {
+            // The request continues in the background, but the dialog may be
+            // dismissed and reopened while it is in flight. Keep Cancel and
+            // the title-bar close button interactive.
+            self.entry.set_sensitive(false);
+            self.create.set_label("Creating…");
+            self.create.set_sensitive(false);
+            self.dialog.set_visible(true);
+            return;
+        }
+        self.entry.set_sensitive(true);
         self.entry.set_text("");
         self.dialog_error.set_label("");
         self.dialog_error.set_visible(false);
@@ -244,11 +254,10 @@ impl TopicListView {
     }
 
     pub fn close_dialog(&self) {
-        if self.create_pending.get() {
-            return;
-        }
         self.dialog.set_visible(false);
-        self.entry.set_text("");
+        if !self.create_pending.get() {
+            self.entry.set_text("");
+        }
         self.dialog_error.set_label("");
         self.dialog_error.set_visible(false);
     }
@@ -270,7 +279,8 @@ impl TopicListView {
         self.dialog_error.set_label("");
         self.dialog_error.set_visible(false);
         self.create.set_label("Creating…");
-        self.dialog_card.set_sensitive(false);
+        self.entry.set_sensitive(false);
+        self.create.set_sensitive(false);
         let callback = self.action.borrow().clone();
         if let Some(callback) = callback {
             callback(TopicAction::CreateTopic(title));
@@ -280,20 +290,25 @@ impl TopicListView {
     /// Complete a successful create. The dialog remains visible and locked
     /// until the backend has confirmed the topic exists.
     pub fn finish_create(&self) {
+        self.finish_create_pending();
+        self.close_dialog();
+    }
+
+    /// Release an in-flight create without presenting a result. This is used
+    /// when its completion belongs to an old chat/session generation.
+    pub fn finish_create_pending(&self) {
         self.create_pending.set(false);
         self.dialog_card.set_sensitive(true);
+        self.entry.set_sensitive(true);
         self.create.set_label("Create");
-        self.close_dialog();
+        self.create
+            .set_sensitive(!self.entry.text().trim().is_empty());
     }
 
     /// Keep the title available for a retry and surface the backend failure
     /// in the dialog the user is still looking at.
     pub fn show_create_error(&self, message: &str) {
-        self.create_pending.set(false);
-        self.dialog_card.set_sensitive(true);
-        self.create.set_label("Create");
-        self.create
-            .set_sensitive(!self.entry.text().trim().is_empty());
+        self.finish_create_pending();
         self.dialog_error.set_label(message);
         self.dialog_error.set_visible(true);
         self.entry.grab_focus();
@@ -357,7 +372,7 @@ impl TopicListView {
     }
 
     pub fn create_is_pending(&self) -> bool {
-        self.create_pending.get() && !self.dialog_card.is_sensitive()
+        self.create_pending.get() && !self.entry.is_sensitive() && !self.create.is_sensitive()
     }
 
     pub fn create_retry_visible(&self) -> bool {
@@ -373,6 +388,14 @@ impl TopicListView {
 
     pub fn cancel_visible(&self) -> bool {
         self.cancel.is_visible()
+    }
+
+    pub fn cancel_usable(&self) -> bool {
+        self.dialog_card.is_sensitive() && self.cancel.is_sensitive()
+    }
+
+    pub fn probe_cancel(&self) {
+        self.cancel.emit_clicked();
     }
 }
 

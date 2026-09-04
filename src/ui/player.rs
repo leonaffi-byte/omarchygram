@@ -60,9 +60,20 @@ thread_local! {
     static REGISTRY: RefCell<HashMap<i32, PlayerHandle>> = RefCell::new(HashMap::new());
     // GTK 4.22 can deadlock while finalizing its GStreamer MediaFile backend.
     // Keep one deliberately leaked stream per stable row/media identity, and
-    // reuse that stream when history rebuilds the same message row.
-    static MEDIA_POOL: RefCell<HashMap<(i64, i32, PathBuf), gtk::MediaFile>> = RefCell::new(HashMap::new());
+    // reuse that stream when history rebuilds the same message row. The path
+    // is data on the entry, not part of its identity: a re-download retargets
+    // the retained stream instead of allocating another pipeline.
+    static MEDIA_POOL: RefCell<HashMap<(i64, i32), RetainedMedia>> = RefCell::new(HashMap::new());
+    // Logout rotates the active identity map without unref'ing its entries.
+    // This prevents cross-account reuse while preserving the GTK finalize
+    // workaround documented in CLAUDE.md.
+    static RETIRED_MEDIA: RefCell<Vec<RetainedMedia>> = const { RefCell::new(Vec::new()) };
     static FULLSCREEN: RefCell<Option<Rc<Fullscreen>>> = const { RefCell::new(None) };
+}
+
+struct RetainedMedia {
+    path: PathBuf,
+    media: gtk::MediaFile,
 }
 
 /// One-time, panic-free GStreamer init.
@@ -115,6 +126,19 @@ pub fn stop_all() {
     }
 }
 
+/// End an account's media-pool namespace without finalizing GTK media.
+/// `stop_all()` must run first so no row still has handlers or a paintable
+/// attached to these streams.
+pub fn retire_media_session() {
+    let retained: Vec<RetainedMedia> = MEDIA_POOL
+        .try_with(|pool| pool.borrow_mut().drain().map(|(_, entry)| entry).collect())
+        .unwrap_or_default();
+    for entry in &retained {
+        entry.media.pause();
+    }
+    let _ = RETIRED_MEDIA.try_with(|retired| retired.borrow_mut().extend(retained));
+}
+
 /// Pause every *other* player that produces sound. Muted autoplaying loops
 /// (gifs, video circles) are untouched — they only pause off-screen (§2.3).
 pub fn activate(msg_id: i32) {
@@ -123,14 +147,6 @@ pub fn activate(msg_id: i32) {
             handle.pause();
         }
     }
-}
-
-/// Called from the throttled scroll handler and after a history page lands.
-/// A player that started this recently is not paused by the viewport pass.
-const START_GRACE: std::time::Duration = std::time::Duration::from_millis(1_500);
-
-fn within_start_grace(started: Option<std::time::Instant>) -> bool {
-    started.is_some_and(|t| t.elapsed() < START_GRACE)
 }
 
 pub fn visibility_tick(is_visible: &dyn Fn(i32) -> bool) {
@@ -199,20 +215,31 @@ fn drop_source(slot: &RefCell<Option<glib::SourceId>>) {
     }
 }
 
-/// Fetch the retained GTK stream for a stable chat/message/path identity.
+/// Fetch the retained GTK stream for a stable chat/message identity.
 /// The extra forgotten reference is intentional: it prevents GTK's known
-/// finalize deadlock, while the map makes the leak bounded to one per path.
+/// finalize deadlock, while the map makes the leak bounded to one per row.
 fn pooled_media(chat_id: i64, msg_id: i32, path: &Path) -> (gtk::MediaFile, bool) {
     MEDIA_POOL
         .try_with(|pool| {
             let mut pool = pool.borrow_mut();
-            let identity = (chat_id, msg_id, path.to_path_buf());
-            if let Some(media) = pool.get(&identity) {
-                return (media.clone(), true);
+            let identity = (chat_id, msg_id);
+            if let Some(entry) = pool.get_mut(&identity) {
+                if entry.path != path {
+                    entry.media.pause();
+                    entry.media.set_filename(Some(path));
+                    entry.path = path.to_path_buf();
+                }
+                return (entry.media.clone(), true);
             }
             let media = gtk::MediaFile::for_filename(path);
             std::mem::forget(media.clone());
-            pool.insert(identity, media.clone());
+            pool.insert(
+                identity,
+                RetainedMedia {
+                    path: path.to_path_buf(),
+                    media: media.clone(),
+                },
+            );
             (media, false)
         })
         .unwrap_or_else(|_| {
@@ -303,9 +330,10 @@ struct AudioPlayer {
     /// before preroll can end the stream immediately (seen as an instant
     /// EOS on ogg/opus under the gate).
     pending_rate: Cell<Option<f64>>,
-    /// When playback last started: the viewport pass leaves a just-started
-    /// player alone for a moment (its row may still be settling into view).
-    started: Cell<Option<std::time::Instant>>,
+    /// Swapping a player into a row can move it just outside the viewport for
+    /// one layout frame. Skip exactly the first visibility pass after open;
+    /// MessagesView schedules a second settled pass 200 ms later.
+    skip_visibility_once: Cell<bool>,
 }
 
 impl AudioPlayer {
@@ -416,7 +444,7 @@ impl AudioPlayer {
             duration: Cell::new(duration),
             position: Cell::new(0.0),
             pending_rate: Cell::new(None),
-            started: Cell::new(None),
+            skip_visibility_once: Cell::new(false),
         })
     }
 
@@ -556,7 +584,7 @@ impl AudioPlayer {
         *self.pipeline.borrow_mut() = Some(pipeline);
         self.play.set_sensitive(true);
         self.set_playing(true);
-        self.started.set(Some(std::time::Instant::now()));
+        self.skip_visibility_once.set(true);
         let rate = SPEEDS[self.speed_idx.get()];
         self.pending_rate.set((rate != 1.0).then_some(rate));
         self.start_tick();
@@ -726,12 +754,18 @@ impl AudioPlayer {
 
     fn on_hidden(&self) {
         // Voice/music never auto-resumes when its row scrolls back in (§2.3),
-        // so never pause one that started under START_GRACE ago: swapping the
-        // player into the row changes its height and the row may sit just
-        // outside the viewport for a frame.
-        if self.playing.get() && !within_start_grace(self.started.get()) {
+        // but swapping the player into the row can leave it outside the
+        // viewport for its first layout frame.
+        if self.skip_visibility_once.replace(false) {
+            return;
+        }
+        if self.playing.get() {
             self.pause();
         }
+    }
+
+    fn on_visible(&self) {
+        self.skip_visibility_once.set(false);
     }
 }
 
@@ -778,7 +812,7 @@ struct VideoPlayer {
     policy_paused: Cell<bool>,
     reused_stream: Cell<bool>,
     resume_on_visible: Cell<bool>,
-    started: Cell<Option<std::time::Instant>>,
+    skip_visibility_once: Cell<bool>,
     duration: Cell<f64>,
 }
 
@@ -908,7 +942,7 @@ impl VideoPlayer {
             policy_paused: Cell::new(false),
             reused_stream: Cell::new(false),
             resume_on_visible: Cell::new(false),
-            started: Cell::new(None),
+            skip_visibility_once: Cell::new(false),
             duration: Cell::new(message.duration.map(f64::from).unwrap_or(0.0)),
         });
 
@@ -1058,6 +1092,7 @@ impl VideoPlayer {
 
     fn open_path(self: &Rc<Self>, path: &Path, intent: OpenIntent) {
         self.stop();
+        self.skip_visibility_once.set(true);
         self.resume_on_visible.set(false);
         self.policy_paused.set(false);
         self.intent.set(intent);
@@ -1093,7 +1128,6 @@ impl VideoPlayer {
             OpenIntent::Manual | OpenIntent::AutoplayMuted => {
                 media.play();
                 self.playing.set(true);
-                self.started.set(Some(std::time::Instant::now()));
                 self.start_tick();
             }
             OpenIntent::Poster => {
@@ -1213,7 +1247,6 @@ impl VideoPlayer {
         }
         media.play();
         self.playing.set(true);
-        self.started.set(Some(std::time::Instant::now()));
         self.update_glyphs();
         self.start_tick();
         if self.has_sound() {
@@ -1236,7 +1269,6 @@ impl VideoPlayer {
                 media.play();
             }
             self.playing.set(true);
-            self.started.set(Some(std::time::Instant::now()));
             self.update_glyphs();
             activate(self.msg_id);
             return;
@@ -1249,6 +1281,9 @@ impl VideoPlayer {
         } else {
             self.intent.set(OpenIntent::Manual);
             self.policy_paused.set(false);
+            if matches!(self.kind, MediaKind::Video | MediaKind::VideoNote) {
+                self.set_muted(false);
+            }
             self.resume();
         }
     }
@@ -1264,7 +1299,10 @@ impl VideoPlayer {
     }
 
     fn on_hidden(&self) {
-        if self.playing.get() && !within_start_grace(self.started.get()) {
+        if self.skip_visibility_once.replace(false) {
+            return;
+        }
+        if self.playing.get() {
             // Muted loops come back when the row does; sound does not (§2.3).
             self.resume_on_visible.set(
                 matches!(self.kind, MediaKind::Gif | MediaKind::Sticker)
@@ -1275,9 +1313,22 @@ impl VideoPlayer {
     }
 
     fn on_visible(self: &Rc<Self>) {
+        if self.skip_visibility_once.replace(false) {
+            return;
+        }
         if self.resume_on_visible.get() && !self.failed.get() {
             self.resume_on_visible.set(false);
             self.resume();
+        }
+    }
+
+    fn defer_autoplay(self: &Rc<Self>) {
+        if matches!(self.kind, MediaKind::Gif | MediaKind::Sticker | MediaKind::VideoNote)
+            && !self.failed.get()
+        {
+            self.intent.set(OpenIntent::AutoplayMuted);
+            self.policy_paused.set(false);
+            self.resume_on_visible.set(true);
         }
     }
 
@@ -1530,8 +1581,9 @@ impl PlayerHandle {
     }
 
     fn on_visible(&self) {
-        if let PlayerInner::Video(video) = &self.inner {
-            video.on_visible();
+        match &self.inner {
+            PlayerInner::Audio(audio) => audio.on_visible(),
+            PlayerInner::Video(video) => video.on_visible(),
         }
     }
 
@@ -1602,6 +1654,15 @@ pub fn open_path(msg_id: i32, path: &Path, intent: OpenIntent) {
 pub fn toggle(msg_id: i32) {
     if let Some(handle) = get_handle(msg_id) {
         handle.toggle();
+    }
+}
+
+/// Mark a policy-enabled muted loop that was opened as a poster while
+/// off-screen. The next settled visible pass starts it; disabled autoplay
+/// never sets this flag.
+pub fn defer_autoplay(msg_id: i32) {
+    if let Some(PlayerInner::Video(video)) = get_handle(msg_id).map(|h| h.inner) {
+        video.defer_autoplay();
     }
 }
 
@@ -1684,6 +1745,13 @@ pub fn reused_retained_stream(msg_id: i32) -> bool {
     matches!(
         get_handle(msg_id).map(|h| h.inner),
         Some(PlayerInner::Video(video)) if video.reused_stream.get()
+    )
+}
+
+pub fn resumes_when_visible(msg_id: i32) -> bool {
+    matches!(
+        get_handle(msg_id).map(|h| h.inner),
+        Some(PlayerInner::Video(video)) if video.resume_on_visible.get()
     )
 }
 

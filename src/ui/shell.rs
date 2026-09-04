@@ -1584,6 +1584,12 @@ impl ShellInner {
         self.stories_viewer.clear_session();
         self.stories_peers.borrow_mut().clear();
         self.stories_strip.update_peers(Vec::new());
+        // Account teardown is a synchronous playback barrier: no audio may
+        // survive on the auth screen, and no recorder controls remain mapped
+        // while their serialized local cleanup finishes.
+        self.messages.reset_players();
+        self.messages.hide_video_note();
+        self.topics.close_dialog();
         self.cancel_recording();
         self.close_forward();
         self.close_viewer();
@@ -1633,6 +1639,10 @@ impl ShellInner {
             self.messages.set_busy(false);
             self.widget.set_sensitive(true);
             if result.is_ok() {
+                // Active media identities are account-scoped. Retire rather
+                // than finalize them: GTK 4.22 can deadlock when its media
+                // backend loses the final reference.
+                self.messages.retire_player_media_session();
                 self.me.borrow_mut().take();
                 self.chat_info.borrow_mut().clear();
                 self.drafts.borrow_mut().clear();
@@ -1651,6 +1661,7 @@ impl ShellInner {
                 Ok(state) => self.handle_auth_state(state),
                 Err(error) => {
                     self.session_ready.set(true);
+                    self.messages.restore_players_after_logout_failure();
                     self.apply_settings(&self.settings.get());
                     self.reload_stories();
                     self.settings_view.account_error(&error);
@@ -3882,7 +3893,9 @@ impl ShellInner {
                 }
                 Err(error) => {
                     shell_log!("send_video_note({chat_id}): {error}");
-                    this.messages.show_error(&error);
+                    if this.is_current(chat_id, epoch) {
+                        this.messages.show_error(&error);
+                    }
                 }
             }
         });
@@ -5107,10 +5120,14 @@ impl ShellInner {
             return;
         };
         let epoch = self.epoch.get();
+        let session_epoch = self.session_epoch.get();
         glib::MainContext::default().spawn_local(async move {
             match self.tg.create_topic(forum_id, &title).await {
                 Ok(topic) => {
                     self.topics.finish_create();
+                    if !self.is_session_current(session_epoch) {
+                        return;
+                    }
                     // The backend also emits TopicsChanged; refetch so the new
                     // row carries the backend's ordering and counts.
                     self.load_forum_topics(forum_id, epoch);
@@ -5120,8 +5137,16 @@ impl ShellInner {
                 }
                 Err(error) => {
                     shell_log!("create_topic({forum_id}): {error}");
-                    if self.is_current(forum_id, epoch) && self.forum_list_open.get() {
+                    if self.is_session_current(session_epoch)
+                        && self.is_current(forum_id, epoch)
+                        && self.forum_list_open.get()
+                    {
                         self.topics.show_create_error(&error);
+                    } else {
+                        // Completion always releases the pending UI state,
+                        // even after a chat/session generation made the error
+                        // stale and therefore ineligible for display.
+                        self.topics.finish_create_pending();
                     }
                 }
             }
@@ -5155,7 +5180,6 @@ impl ShellInner {
                     let Some(this) = weak.upgrade() else {
                         return;
                     };
-                    *this.forum_topics.borrow_mut() = topics.clone();
                     if !this.is_current(chat_id, epoch) {
                         return;
                     }
@@ -8168,30 +8192,35 @@ impl ShellInner {
                 if this.messages.player_exists(msg_id)
                     && this.messages.player_state(msg_id) != player::PlayerState::None
                 {
+                    if intent == player::OpenIntent::Manual {
+                        // A real click queued behind autoplay owns the now-open
+                        // player. In particular, a muted video note restarts
+                        // with manual/sound intent instead of losing the click.
+                        this.messages.toggle_media(msg_id);
+                    }
                     return;
                 }
-                let intent = if intent == player::OpenIntent::AutoplayMuted {
+                let (intent, resume_on_visible) = if intent == player::OpenIntent::AutoplayMuted {
                     let settings = this.settings.get();
-                    let allowed = match this.messages.media_kind(msg_id) {
+                    let enabled = match this.messages.media_kind(msg_id) {
                         Some(MediaKind::Gif | MediaKind::Sticker) => {
-                            settings.media.autoplay_gifs
-                                && player::animations_on()
-                                && this.messages.row_visible(msg_id)
+                            settings.media.autoplay_gifs && player::animations_on()
                         }
-                        Some(MediaKind::VideoNote) => {
-                            settings.media.autoplay_video_notes && this.messages.row_visible(msg_id)
-                        }
+                        Some(MediaKind::VideoNote) => settings.media.autoplay_video_notes,
                         _ => false,
                     };
-                    if allowed {
-                        player::OpenIntent::AutoplayMuted
+                    if enabled && this.messages.row_visible(msg_id) {
+                        (player::OpenIntent::AutoplayMuted, false)
                     } else {
-                        player::OpenIntent::Poster
+                        (player::OpenIntent::Poster, enabled)
                     }
                 } else {
-                    intent
+                    (intent, false)
                 };
                 this.messages.play_media(msg_id, path, intent);
+                if resume_on_visible {
+                    this.messages.defer_media_autoplay(msg_id);
+                }
             }
         });
     }
@@ -9595,6 +9624,36 @@ impl ShellInner {
         }
         let launches_before_players = self.probe_media_launches.get();
 
+        // Finish a policy-enabled loop while it is off-screen. It must stay a
+        // poster now, remember that it may resume, and start only after its
+        // row later enters the viewport.
+        probe_step("player offscreen autoplay poster");
+        self.messages.scroll_to_bottom();
+        if !poll_until(2_000, || !self.messages.row_visible(804)).await {
+            probe_fail("GIF row was not off-screen for deferred autoplay");
+            return;
+        }
+        self.clone()
+            .play_when_ready(804, player::OpenIntent::AutoplayMuted);
+        self.clone().start_media_download(804, false);
+        if !poll_until(8_000, || {
+            matches!(
+                self.messages.player_state(804),
+                player::PlayerState::Paused | player::PlayerState::Error
+            )
+        })
+        .await
+        {
+            probe_fail("off-screen GIF did not settle as a poster/error");
+            return;
+        }
+        if self.messages.player_state(804) == player::PlayerState::Paused
+            && !self.messages.player_resumes_when_visible(804)
+        {
+            probe_fail("off-screen GIF poster forgot deferred autoplay");
+            return;
+        }
+
         probe_step("player voice play");
         let _ = self.scroll_into_view(800).await;
         // A transient download error on an inline player must leave a usable
@@ -9727,10 +9786,16 @@ impl ShellInner {
             return;
         }
 
-        probe_step("player video");
+        probe_step("player pending manual intent");
         let _ = self.scroll_into_view(802).await;
-        if !self.messages.trigger_media(802)
-            || !poll_until(8000, || {
+        // Model the exact race: autoplay registered first, then the user's
+        // click while the download is pending. The late manual continuation
+        // must operate on the player opened by the first continuation.
+        self.clone()
+            .play_when_ready(802, player::OpenIntent::AutoplayMuted);
+        self.clone()
+            .media_action(802, player::OpenIntent::Manual);
+        if !poll_until(8000, || {
                 matches!(
                     self.messages.player_state(802),
                     player::PlayerState::Playing | player::PlayerState::Error
@@ -9738,13 +9803,22 @@ impl ShellInner {
             })
             .await
         {
-            probe_fail("video did not reach playing/error");
+            probe_fail("pending manual video intent did not reach playing/error");
             return;
         }
         if self.messages.player_state(802) == player::PlayerState::Playing
             && !self.messages.player_manual_sound_requested(802)
         {
-            probe_fail("manual video open did not request playback with sound");
+            probe_fail("pending manual video intent did not request sound");
+            return;
+        }
+
+        probe_step("player video");
+        if !matches!(
+            self.messages.player_state(802),
+            player::PlayerState::Playing | player::PlayerState::Error
+        ) {
+            probe_fail("video did not remain playing/error after pending manual intent");
             return;
         }
 
@@ -11669,12 +11743,24 @@ impl ShellInner {
             probe_fail("new topic dialog closed while pending");
             return;
         }
+        probe_step("forum topic cancel while pending");
+        if !self.topics.cancel_usable() {
+            probe_fail("Cancel became insensitive during topic creation");
+            return;
+        }
+        self.topics.probe_cancel();
+        if self.topics.dialog_is_open() || !self.topics.create_is_pending() {
+            probe_fail("Cancel did not dismiss an in-flight topic dialog");
+            return;
+        }
         if environment_listed("OMG_MOCK_FAIL_ONCE", "CreateTopic") {
             probe_step("forum create topic backend retry");
-            if !poll_until(4000, || self.topics.create_retry_visible()).await {
-                probe_fail("new topic backend retry affordance");
+            if !poll_until(4000, || !self.topics.create_is_pending()).await {
+                probe_fail("stale topic error left create pending");
                 return;
             }
+            self.topics.open_dialog();
+            self.topics.set_dialog_title("Probe Topic");
             self.topics.submit_dialog();
         }
         if !poll_until(5000, || {
@@ -11787,6 +11873,32 @@ impl ShellInner {
             return;
         }
 
+        probe_step("logout stops active player");
+        self.clone().open_chat(media_lab);
+        if !poll_until(5_000, || {
+            self.open_chat.get() == Some(media_lab)
+                && !self.messages.is_loading()
+                && self.messages.player_exists(800)
+        })
+        .await
+        {
+            probe_fail("open Media Lab before logout playback check");
+            return;
+        }
+        let _ = self.scroll_into_view(800).await;
+        if !self.messages.trigger_media(800)
+            || !poll_until(5_000, || {
+                matches!(
+                    self.messages.player_state(800),
+                    player::PlayerState::Playing | player::PlayerState::Error
+                )
+            })
+            .await
+        {
+            probe_fail("player did not settle before logout");
+            return;
+        }
+
         probe_step("logout clears stories");
         self.open_stories_for_peer(1);
         if !poll_until(4_000, || self.stories_viewer.is_open()).await {
@@ -11807,8 +11919,11 @@ impl ShellInner {
         if self.stories_viewer.is_open()
             || !self.stories_viewer.probe_state_is_clear()
             || self.stories_strip.peer_count() != 0
+            || !self.messages.player_registry_empty()
+            || self.messages.active_player_count() != 0
+            || self.messages.video_recorder_visible()
         {
-            probe_fail("log out left account-scoped story state visible");
+            probe_fail("log out left account-scoped story/player state active");
             return;
         }
         let fail_once = std::env::var("OMG_MOCK_FAIL_ONCE")

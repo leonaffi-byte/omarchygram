@@ -5647,20 +5647,24 @@ impl MessagesView {
         }
         // A .webm sticker is a muted loop: autoplay only under the same gates
         // as GIFs (§2.2) — otherwise poster + PLAY.
-        let intent = if self
+        let autoplay_enabled = self
             .inner
             .settings
             .borrow()
             .clone()
             .is_some_and(|settings| settings.get().media.autoplay_gifs)
-            && player::animations_on()
-            && self.row_visible(message.id)
-        {
+            && player::animations_on();
+        let visible = self.row_visible(message.id);
+        let intent = if autoplay_enabled && visible {
             player::OpenIntent::AutoplayMuted
         } else {
             player::OpenIntent::Poster
         };
         player::open_path(message.id, path, intent);
+        if autoplay_enabled && !visible {
+            player::defer_autoplay(message.id);
+        }
+        self.schedule_player_visibility_after_open();
     }
 
     /// The inline player for one media row (§2.1/§2.2).
@@ -5694,10 +5698,15 @@ impl MessagesView {
     /// Hand a downloaded file to the row's inline player and start it.
     pub fn play_media(&self, msg_id: i32, path: PathBuf, intent: player::OpenIntent) {
         player::open_path(msg_id, &path, intent);
+        self.schedule_player_visibility_after_open();
     }
 
     pub fn toggle_media(&self, msg_id: i32) {
         player::toggle(msg_id);
+    }
+
+    pub fn defer_media_autoplay(&self, msg_id: i32) {
+        player::defer_autoplay(msg_id);
     }
 
     pub fn player_seek(&self, msg_id: i32, fraction: f64) {
@@ -5734,6 +5743,10 @@ impl MessagesView {
 
     pub fn player_reused_retained_stream(&self, msg_id: i32) -> bool {
         player::reused_retained_stream(msg_id)
+    }
+
+    pub fn player_resumes_when_visible(&self, msg_id: i32) -> bool {
+        player::resumes_when_visible(msg_id)
     }
 
     pub fn probe_player_picture_press(&self, msg_id: i32, count: i32) {
@@ -5777,6 +5790,101 @@ impl MessagesView {
 
     pub fn reset_players(&self) {
         player::stop_all();
+    }
+
+    /// A failed logout keeps this account and its rows alive. `reset_players`
+    /// has already removed the old handles, so rebuild inert controls in
+    /// place; audio remains paused and policy-enabled visible loops resume.
+    pub fn restore_players_after_logout_failure(&self) {
+        let rows: Vec<(Msg, PathBuf)> = {
+            let store = self.inner.store.borrow();
+            store
+                .entries
+                .values()
+                .filter_map(|entry| {
+                    let path = match &entry.media_state {
+                        MediaState::Done(path) => path.clone(),
+                        _ => return None,
+                    };
+                    let playable = matches!(
+                        entry.msg.media,
+                        Some(
+                            MediaKind::Voice
+                                | MediaKind::Audio
+                                | MediaKind::Video
+                                | MediaKind::VideoNote
+                                | MediaKind::Gif
+                        )
+                    ) || entry.msg.media == Some(MediaKind::Sticker)
+                        && path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("webm"));
+                    playable.then(|| (entry.msg.clone(), path))
+                })
+                .collect()
+        };
+
+        let media_settings = self
+            .inner
+            .settings
+            .borrow()
+            .clone()
+            .map(|settings| settings.get().media);
+        let mut opened_video = false;
+        for (message, path) in rows {
+            let slot = self
+                .inner
+                .store
+                .borrow()
+                .entries
+                .get(&message.id)
+                .map(|entry| entry.row.media_slot.clone());
+            let Some(slot) = slot else { continue };
+            self.move_focus_before_removal(&slot);
+            while let Some(child) = slot.first_child() {
+                slot.remove(&child);
+            }
+            let row = self.build_player(&message);
+            slot.append(&row.widget);
+            if let Some(entry) = self.inner.store.borrow_mut().entries.get_mut(&message.id) {
+                entry.row.media_button = Some(row.play_button);
+            }
+
+            let Some(kind) = message.media else { continue };
+            if matches!(kind, MediaKind::Voice | MediaKind::Audio) {
+                continue;
+            }
+            opened_video = true;
+            let autoplay_enabled = match kind {
+                MediaKind::Gif | MediaKind::Sticker => media_settings
+                    .as_ref()
+                    .is_some_and(|media| media.autoplay_gifs)
+                    && player::animations_on(),
+                MediaKind::VideoNote => media_settings
+                    .as_ref()
+                    .is_some_and(|media| media.autoplay_video_notes),
+                _ => false,
+            };
+            let visible = self.row_visible(message.id);
+            let intent = if autoplay_enabled && visible {
+                player::OpenIntent::AutoplayMuted
+            } else {
+                player::OpenIntent::Poster
+            };
+            player::open_path(message.id, &path, intent);
+            if autoplay_enabled && !visible {
+                player::defer_autoplay(message.id);
+            }
+        }
+        if opened_video {
+            self.schedule_player_visibility_after_open();
+        }
+    }
+
+    /// Rotate retained GTK media at the account boundary. The old streams
+    /// remain deliberately retained, but cannot be reused by the next login.
+    pub fn retire_player_media_session(&self) {
+        player::retire_media_session();
     }
 
     pub fn scroll_to_bottom(&self) {
@@ -5837,6 +5945,20 @@ impl MessagesView {
         }
     }
 
+    /// Opening a player changes the row's height. Run one ordinary throttled
+    /// pass, then one settled pass: players skip only the first, so an
+    /// actually off-screen sound source is paused within 200 ms.
+    fn schedule_player_visibility_after_open(&self) {
+        self.player_visibility_throttled();
+        let weak = Rc::downgrade(&self.inner);
+        let epoch = self.inner.scroll_epoch.get();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+            if let Some(inner) = weak.upgrade().filter(|inner| inner.scroll_epoch.get() == epoch) {
+                MessagesView::of(&inner).player_visibility();
+            }
+        });
+    }
+
     /// Re-wrap the shared inner state (signal handlers only hold the `Rc`).
     fn of(inner: &Rc<MessagesInner>) -> Self {
         MessagesView {
@@ -5852,8 +5974,12 @@ impl MessagesView {
             remove_source_if_present(source);
         }
         let inner = self.inner.clone();
+        let epoch = inner.scroll_epoch.get();
         let source = glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
             let _ = inner.player_throttle.borrow_mut().take();
+            if inner.scroll_epoch.get() != epoch {
+                return;
+            }
             sync_lottie_visibility(&inner);
             MessagesView::of(&inner).player_visibility();
         });

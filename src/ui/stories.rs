@@ -1,4 +1,6 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +18,62 @@ use super::avatar::Avatar;
 use super::icons;
 
 const DECODE_ERROR: &str = "can't play this: install gst-plugins-good gst-libav";
+
+struct RetainedStoryMedia {
+    path: PathBuf,
+    media: gtk::MediaFile,
+}
+
+thread_local! {
+    // One retained GTK pipeline per story identity, mirroring player.rs. A
+    // revisited story reuses the stream, and a changed cache path retargets
+    // it instead of leaking another GstPlay pipeline.
+    static STORY_MEDIA_POOL: RefCell<HashMap<(i64, i32), RetainedStoryMedia>> = RefCell::new(HashMap::new());
+    static RETIRED_STORY_MEDIA: RefCell<Vec<RetainedStoryMedia>> = const { RefCell::new(Vec::new()) };
+}
+
+fn pooled_story_media(chat_id: i64, story_id: i32, path: &Path) -> gtk::MediaFile {
+    STORY_MEDIA_POOL
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            let identity = (chat_id, story_id);
+            if let Some(entry) = pool.get_mut(&identity) {
+                if entry.path != path {
+                    entry.media.pause();
+                    entry.media.set_filename(Some(path));
+                    entry.path = path.to_path_buf();
+                }
+                return entry.media.clone();
+            }
+            let media = gtk::MediaFile::for_filename(path);
+            // See CLAUDE.md: the extra reference prevents GTK 4.22's media
+            // backend from finalizing inside a GStreamer dispatch.
+            std::mem::forget(media.clone());
+            pool.insert(
+                identity,
+                RetainedStoryMedia {
+                    path: path.to_path_buf(),
+                    media: media.clone(),
+                },
+            );
+            media
+        })
+        .unwrap_or_else(|_| {
+            let media = gtk::MediaFile::for_filename(path);
+            std::mem::forget(media.clone());
+            media
+        })
+}
+
+fn retire_story_media_session() {
+    let retained: Vec<RetainedStoryMedia> = STORY_MEDIA_POOL
+        .try_with(|pool| pool.borrow_mut().drain().map(|(_, entry)| entry).collect())
+        .unwrap_or_default();
+    for entry in &retained {
+        entry.media.pause();
+    }
+    let _ = RETIRED_STORY_MEDIA.try_with(|retired| retired.borrow_mut().extend(retained));
+}
 
 /// Keep story-video errors consistent with the wave-6A inline player. GTK's
 /// media backend reports missing decoders through several error domains (and,
@@ -218,6 +276,7 @@ pub struct StoryViewer {
     header_time: gtk::Label,
     picture: gtk::Picture,
     media_file: Rc<RefCell<Option<gtk::MediaFile>>>,
+    media_error_handler: Rc<RefCell<Option<glib::SignalHandlerId>>>,
     error_label: gtk::Label,
     caption: gtk::Label,
     tg: Tg,
@@ -341,6 +400,7 @@ impl StoryViewer {
             header_time,
             picture,
             media_file: Rc::new(RefCell::new(None)),
+            media_error_handler: Rc::new(RefCell::new(None)),
             error_label,
             caption,
             tg,
@@ -592,15 +652,9 @@ impl StoryViewer {
                         return;
                     }
                     if is_video {
-                        let file = gio::File::for_path(&path);
-                        let media = gtk::MediaFile::for_file(&file);
-                        // Match wave 6A's GTK/GStreamer lifetime workaround:
-                        // finalizing the last MediaFile reference can deadlock
-                        // in libgstplay, so retain one leaked reference and only
-                        // pause/detach the stream during navigation or teardown.
-                        std::mem::forget(media.clone());
+                        let media = pooled_story_media(chat_id, story_id, &path);
                         let weak = Rc::downgrade(&this);
-                        media.connect_error_notify(move |m| {
+                        let handler = media.connect_error_notify(move |m| {
                             let Some(this) = weak.upgrade().filter(|viewer| {
                                 viewer.visible.get() && viewer.epoch.get() == epoch
                             }) else {
@@ -611,6 +665,7 @@ impl StoryViewer {
                                 this.error_label.set_visible(true);
                             }
                         });
+                        *this.media_error_handler.borrow_mut() = Some(handler);
                         media.set_playing(true);
                         this.picture.set_paintable(Some(&media));
                         *this.media_file.borrow_mut() = Some(media.clone());
@@ -775,6 +830,7 @@ impl StoryViewer {
         self.caption.set_visible(false);
         self.error_label.set_label("");
         self.error_label.set_visible(false);
+        retire_story_media_session();
     }
 
     fn stop_playback(&self) {
@@ -784,10 +840,17 @@ impl StoryViewer {
         *self.story_started.borrow_mut() = None;
         self.story_elapsed.set(Duration::ZERO);
         self.paused.set(false);
-        if let Some(media) = self.media_file.borrow_mut().take() {
-            media.set_playing(false);
+        let media = self.media_file.borrow().clone();
+        if let Some(media) = media.as_ref()
+            && let Some(handler) = self.media_error_handler.borrow_mut().take()
+        {
+            media.disconnect(handler);
         }
         self.picture.set_paintable(None::<&gdk::Paintable>);
+        if let Some(media) = media {
+            media.pause();
+        }
+        self.media_file.borrow_mut().take();
     }
 
     // ----- probe helpers -----
