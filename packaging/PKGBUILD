@@ -40,10 +40,8 @@ source=(
   "$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
   "ntgcalls-$_ntgcalls-linux-x86_64.zip::https://github.com/pytgcalls/ntgcalls/releases/download/v$_ntgcalls/ntgcalls.linux-x86_64-static_libs.zip"
 )
-sha256sums=(
-  'SKIP'
-  '67d63734603ecfafc9182bd31cba4736af9306023b63390a73d2ec0d18622b84'
-)
+sha256sums=('cd4407c1de0d587d60fb717a39415cd2736256822a8d22e52c59c464d23140d7'
+            '67d63734603ecfafc9182bd31cba4736af9306023b63390a73d2ec0d18622b84')
 noextract=("ntgcalls-$_ntgcalls-linux-x86_64.zip")
 
 prepare() {
