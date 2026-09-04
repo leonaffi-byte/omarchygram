@@ -2,7 +2,20 @@
 
 A Telegram client for Omarchy that takes its colors from the active Omarchy theme.
 
-## Requirements
+## Install (Omarchy / Arch)
+
+A prebuilt package is attached to each release:
+
+```
+sudo pacman -U https://github.com/leonaffi-byte/omarchygram/releases/download/v0.1.0/omarchygram-0.1.0-1-x86_64.pkg.tar.zst
+```
+
+It pulls in GTK 4, GStreamer (with the good and libav plugin sets), ffmpeg and
+the JetBrainsMono Nerd Font, and adds an "Omarchygram" entry to the app menu.
+An AUR package (`yay -S omarchygram`) follows once AUR account registration
+reopens; the recipe is in `packaging/PKGBUILD`.
+
+## Requirements (building from source)
 
 Arch Linux with:
 
