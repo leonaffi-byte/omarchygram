@@ -4542,6 +4542,26 @@ impl ShellInner {
                 self.clone().open_chat(chat_id);
             }
         }
+        // OMG_SMOKE_OPEN_SEQUENCE="Title@ms,Title@ms": open chats at those
+        // offsets (demo recordings: exercises the chat-switch animations).
+        if let Ok(sequence) = std::env::var("OMG_SMOKE_OPEN_SEQUENCE") {
+            for entry in sequence.split(',') {
+                let Some((title, ms)) = entry.rsplit_once('@') else { continue };
+                let Ok(ms) = ms.trim().parse::<u64>() else { continue };
+                let title = title.trim().to_string();
+                let this = self.clone();
+                glib::timeout_add_local_once(Duration::from_millis(ms), move || {
+                    if let Some(chat_id) = this
+                        .chatlist
+                        .ordered()
+                        .into_iter()
+                        .find_map(|(id, candidate)| (candidate == title).then_some(id))
+                    {
+                        this.clone().open_chat(chat_id);
+                    }
+                });
+            }
+        }
         if let Ok(query) = std::env::var("OMG_SMOKE_SEARCH") {
             self.chatlist.set_search_text(&query);
         }

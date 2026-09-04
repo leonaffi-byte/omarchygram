@@ -2,10 +2,13 @@
 
 A Telegram client for Omarchy that takes its colors from the active Omarchy theme.
 
-![Omarchygram re-theming live as the Omarchy theme changes](docs/themes.gif)
+![Omarchygram: boot log, typing indicator, typewriter message reveal, chat-switch cascade, unread badges, and live re-theming as the Omarchy theme changes](docs/themes.gif)
 
-Switch your Omarchy theme and the client follows instantly — every one of the
-bundled themes, no restart. ([video](https://github.com/leonaffi-byte/omarchygram/releases/download/v0.1.0/omarchygram-themes.mp4))
+Switch your Omarchy theme and the client follows instantly — every bundled
+theme, no restart. The clip also shows a few of the optional terminal-style
+animations: the boot log, the typing indicator, typewriter message reveal with
+phosphor burn-in, the chat-switch cascade, badge pops and scanlines.
+([video](https://github.com/leonaffi-byte/omarchygram/releases/download/v0.1.0/omarchygram-demo.mp4))
 
 ![A conversation in the miasma theme](docs/hero-marta.png)
 

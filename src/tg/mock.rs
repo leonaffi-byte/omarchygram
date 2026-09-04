@@ -1001,6 +1001,43 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
     // across an await.
     let st = Arc::new(Mutex::new(MockState::new()));
 
+    // OMG_MOCK_LIVE_MS=<ms>: after a 4 s grace period, Marta types for ~1.4 s
+    // and sends a short message every <ms> — demo recordings use it to show
+    // the typing indicator, message-reveal and badge animations.
+    if let Some(every) = std::env::var("OMG_MOCK_LIVE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|ms| *ms >= 500) {
+        let st = st.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            const LINES: [&str; 6] = [
+                "fog lifted, the ridge is clear now",
+                "sending the photos in a minute",
+                "does the new theme look right on your side?",
+                "ok — switching to gruvbox then",
+                "see you at six",
+                "bring the wide lens",
+            ];
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            for (i, line) in LINES.iter().cycle().enumerate() {
+                if events.send(Event::Typing { chat_id: 1, name: "Marta".to_string() }).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+                let m = {
+                    let mut st = st.lock().unwrap();
+                    st.next_id += 1;
+                    let id = st.next_id;
+                    let m = msg(id, 1, "Marta", "Marta", line, Local::now(), false);
+                    st.push(1, m)
+                };
+                if events.send(Event::NewMessage(m)).await.is_err() {
+                    return;
+                }
+                let _ = i;
+                tokio::time::sleep(std::time::Duration::from_millis(every.saturating_sub(1400).max(200))).await;
+            }
+        });
+    }
+
     // Wave 7: OMG_MOCK_INCOMING_CALL=<seconds> makes Marta call us that many
     // seconds after start (0 = immediately). Drives the incoming-call UI/probe.
     if let Some(secs) = std::env::var("OMG_MOCK_INCOMING_CALL").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
