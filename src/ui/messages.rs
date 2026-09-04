@@ -443,6 +443,7 @@ struct MessagesInner {
     ghost: gtk::Label,
     clock: gtk::Label,
     header_search: gtk::Button,
+    header_call: gtk::Button,
     header_info: gtk::Button,
     header_more: gtk::Button,
     header_actions: gtk::Box,
@@ -639,6 +640,11 @@ impl MessagesView {
         header_search.add_css_class("omg-icon-button");
         header_search.set_tooltip_text(Some("Search in chat"));
         header_actions.append(&header_search);
+        let header_call = gtk::Button::with_label(icons::PHONE);
+        header_call.add_css_class("omg-icon-button");
+        header_call.set_tooltip_text(Some("Start voice call"));
+        header_call.set_visible(false);
+        header_actions.append(&header_call);
         let header_info = gtk::Button::with_label(icons::INFO);
         header_info.add_css_class("omg-icon-button");
         header_info.set_tooltip_text(Some("Chat info"));
@@ -1010,6 +1016,7 @@ impl MessagesView {
             ghost,
             clock,
             header_search,
+            header_call,
             header_info,
             header_more,
             header_actions,
@@ -1401,6 +1408,14 @@ impl MessagesView {
             button.connect_clicked(move |_| {
                 if let Some(callback) = action.borrow().as_ref().cloned() {
                     callback(message_action.clone());
+                }
+            });
+        }
+        {
+            let action = self.inner.action.clone();
+            self.inner.header_call.connect_clicked(move |_| {
+                if let Some(callback) = action.borrow().as_ref().cloned() {
+                    callback(MessageAction::Header(ChatAction::Call));
                 }
             });
         }
@@ -2230,6 +2245,7 @@ impl MessagesView {
         };
         self.inner.header_title.set_label(title);
         self.inner.header_actions.set_visible(true);
+        self.inner.header_call.set_visible(false);
         self.inner.header_summary.borrow_mut().take();
         self.inner.base_status.borrow_mut().clear();
         self.inner.typing.set_label("");
@@ -2280,6 +2296,7 @@ impl MessagesView {
         *self.inner.store.borrow_mut() = MessageStore::default();
         self.inner.header_title.set_label("Select a chat");
         self.inner.header_actions.set_visible(false);
+        self.inner.header_call.set_visible(false);
         self.inner.header_summary.borrow_mut().take();
         self.inner.base_status.borrow_mut().clear();
         self.inner.loading.set_label("Select a chat");
@@ -6158,6 +6175,9 @@ impl MessagesView {
             .header_avatar
             .bind(tg, summary.id, &summary.title, summary.has_photo);
         self.inner.chat_kind.set(summary.kind);
+        self.inner
+            .header_call
+            .set_visible(!self.inner.virtual_mode.get() && summary.kind == ChatKind::User);
         // History rows can arrive before ChatInfo. Seed SwitchInline keyboards
         // synchronously so a newly opened bot never inherits the prior bot.
         *self.inner.bot_username.borrow_mut() = summary.username.clone();
@@ -6203,6 +6223,7 @@ impl MessagesView {
             .header_avatar
             .bind(tg, chat_id, initials_name, false);
         self.inner.chat_kind.set(ChatKind::Bot);
+        self.inner.header_call.set_visible(false);
         self.inner.header_summary.borrow_mut().take();
         self.set_base_status("local", false);
     }
@@ -6297,6 +6318,16 @@ impl MessagesView {
 
     pub fn header_avatar_key(&self) -> i64 {
         self.inner.header_avatar.key()
+    }
+
+    pub fn header_call_visible(&self) -> bool {
+        self.inner.header_call.is_visible()
+    }
+
+    pub fn probe_click_header_call(&self) {
+        if self.inner.header_call.is_visible() {
+            self.inner.header_call.emit_clicked();
+        }
     }
 
     pub fn bubble_metrics(&self) -> (i32, i32) {

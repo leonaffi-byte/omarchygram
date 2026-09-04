@@ -13,7 +13,7 @@ use crate::ai::Prefs;
 use crate::config;
 use crate::local::Local as LocalServices;
 use crate::settings::{Settings, SettingsStore};
-use crate::tg::Tg;
+use crate::tg::{CallDevice, Tg};
 
 use super::anim::{
     EFFECTS, Effects, RadioGroup, apply_full_phosphor, apply_purist, apply_subtle, group_ids,
@@ -29,6 +29,7 @@ pub const PAGE_NAMES: &[&str] = &[
     "appearance",
     "timestamps",
     "privacy",
+    "calls",
     "ai",
     "omarchy",
     "keyboard",
@@ -94,6 +95,13 @@ pub struct SettingsView {
     test_result: gtk::Label,
     test_busy: Rc<Cell<bool>>,
     ai_gen: Rc<Cell<u64>>,
+    // Calls page (device ids are discovered at runtime).
+    call_input: gtk::DropDown,
+    call_output: gtk::DropDown,
+    call_input_values: Rc<RefCell<Vec<String>>>,
+    call_output_values: Rc<RefCell<Vec<String>>>,
+    call_devices_status: gtk::Label,
+    call_devices_gen: Rc<Cell<u64>>,
 }
 
 impl SettingsView {
@@ -166,6 +174,12 @@ impl SettingsView {
             test_result: gtk::Label::new(None),
             test_busy: Rc::new(Cell::new(false)),
             ai_gen: Rc::new(Cell::new(0)),
+            call_input: gtk::DropDown::from_strings(&["System default"]),
+            call_output: gtk::DropDown::from_strings(&["System default"]),
+            call_input_values: Rc::new(RefCell::new(vec![String::new()])),
+            call_output_values: Rc::new(RefCell::new(vec![String::new()])),
+            call_devices_status: gtk::Label::new(None),
+            call_devices_gen: Rc::new(Cell::new(0)),
         };
 
         let initial = store.get();
@@ -174,6 +188,7 @@ impl SettingsView {
         view.build_appearance_page(&store, &initial);
         view.build_timestamps_page(&store, &initial);
         view.build_privacy_page(&store, &initial);
+        view.build_calls_page(&store, &initial);
         view.build_ai_page(&store, &initial);
         view.build_omarchy_page(&store, &initial);
         view.build_keyboard_page();
@@ -195,6 +210,10 @@ impl SettingsView {
             let switches = view.switches.clone();
             let entries = view.entries.clone();
             let dropdowns = view.dropdowns.clone();
+            let call_input = view.call_input.clone();
+            let call_output = view.call_output.clone();
+            let call_input_values = view.call_input_values.clone();
+            let call_output_values = view.call_output_values.clone();
             store.on_change(move |settings| {
                 syncing.set(true);
                 for (switch, get) in switches.borrow().iter() {
@@ -216,6 +235,16 @@ impl SettingsView {
                         dropdown.set_selected(index);
                     }
                 }
+                select_call_device(
+                    &call_input,
+                    &call_input_values.borrow(),
+                    &settings.calls.input_device,
+                );
+                select_call_device(
+                    &call_output,
+                    &call_output_values.borrow(),
+                    &settings.calls.output_device,
+                );
                 syncing.set(false);
             });
         }
@@ -407,6 +436,92 @@ impl SettingsView {
             |s, v| s.timestamp_format = v,
             |s| s.timestamp_format.clone(),
         );
+    }
+
+    fn build_calls_page(&self, store: &Rc<SettingsStore>, initial: &Settings) {
+        let page = self.add_page("calls", "Calls");
+        let calls = self.add_section(&page, "CALLS");
+
+        let input_row = Self::add_row(&calls, "Input device", "Microphone used for voice calls.");
+        self.call_input.set_valign(gtk::Align::Center);
+        self.call_input.set_selected(0);
+        input_row.append(&self.call_input);
+
+        let output_row = Self::add_row(
+            &calls,
+            "Output device",
+            "Speaker or headset used for voice calls.",
+        );
+        self.call_output.set_valign(gtk::Align::Center);
+        self.call_output.set_selected(0);
+        output_row.append(&self.call_output);
+
+        self.add_switch(
+            store,
+            &calls,
+            "Ringtone for incoming calls",
+            "Play a ringtone while an incoming call is waiting.",
+            initial.calls.ringtone,
+            |settings, value| settings.calls.ringtone = value,
+            |settings| settings.calls.ringtone,
+        );
+
+        self.call_devices_status.add_css_class("omg-auth-hint");
+        self.call_devices_status.set_halign(gtk::Align::Start);
+        self.call_devices_status.set_wrap(true);
+        calls.append(&self.call_devices_status);
+
+        {
+            let store = Rc::downgrade(store);
+            let syncing = self.syncing.clone();
+            let values = self.call_input_values.clone();
+            self.call_input.connect_selected_notify(move |dropdown| {
+                if syncing.get() {
+                    return;
+                }
+                let Some(store) = store.upgrade() else { return };
+                if let Some(value) = values.borrow().get(dropdown.selected() as usize) {
+                    store.update(|settings| settings.calls.input_device = value.clone());
+                }
+            });
+        }
+        {
+            let store = Rc::downgrade(store);
+            let syncing = self.syncing.clone();
+            let values = self.call_output_values.clone();
+            self.call_output.connect_selected_notify(move |dropdown| {
+                if syncing.get() {
+                    return;
+                }
+                let Some(store) = store.upgrade() else { return };
+                if let Some(value) = values.borrow().get(dropdown.selected() as usize) {
+                    store.update(|settings| settings.calls.output_device = value.clone());
+                }
+            });
+        }
+
+        let tg = self.tg.clone();
+        let store = store.clone();
+        let syncing = self.syncing.clone();
+        let input = self.call_input.clone();
+        let output = self.call_output.clone();
+        let input_values = self.call_input_values.clone();
+        let output_values = self.call_output_values.clone();
+        let status = self.call_devices_status.clone();
+        let generation = self.call_devices_gen.clone();
+        page.connect_map(move |_| {
+            refresh_call_devices(
+                tg.clone(),
+                store.clone(),
+                syncing.clone(),
+                input.clone(),
+                output.clone(),
+                input_values.clone(),
+                output_values.clone(),
+                status.clone(),
+                generation.clone(),
+            );
+        });
     }
 
     fn build_privacy_page(&self, store: &Rc<SettingsStore>, initial: &Settings) {
@@ -1133,6 +1248,91 @@ impl SettingsView {
                 settings.animation(id) || id == "liveclock" && settings.header_clock
             }),
         ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_call_devices(
+    tg: Rc<RefCell<Option<Tg>>>,
+    store: Rc<SettingsStore>,
+    syncing: Rc<Cell<bool>>,
+    input: gtk::DropDown,
+    output: gtk::DropDown,
+    input_values: Rc<RefCell<Vec<String>>>,
+    output_values: Rc<RefCell<Vec<String>>>,
+    status: gtk::Label,
+    generation: Rc<Cell<u64>>,
+) {
+    let request = generation.get().wrapping_add(1);
+    generation.set(request);
+    status.remove_css_class("omg-error");
+    status.add_css_class("omg-auth-hint");
+    status.set_label("Loading audio devices…");
+    let Some(tg) = tg.borrow().clone() else {
+        status.set_label("Audio devices are available after connecting.");
+        return;
+    };
+    glib::MainContext::default().spawn_local(async move {
+        let result = tg.call_devices().await;
+        if generation.get() != request {
+            return;
+        }
+        match result {
+            Ok(devices) => {
+                syncing.set(true);
+                let settings = store.get();
+                replace_call_devices(
+                    &input,
+                    &input_values,
+                    devices.input,
+                    &settings.calls.input_device,
+                );
+                replace_call_devices(
+                    &output,
+                    &output_values,
+                    devices.output,
+                    &settings.calls.output_device,
+                );
+                syncing.set(false);
+                status.set_label("");
+                status.remove_css_class("omg-error");
+                status.add_css_class("omg-auth-hint");
+            }
+            Err(error) => {
+                status.remove_css_class("omg-auth-hint");
+                status.add_css_class("omg-error");
+                status.set_label(&error);
+            }
+        }
+    });
+}
+
+fn replace_call_devices(
+    dropdown: &gtk::DropDown,
+    values: &Rc<RefCell<Vec<String>>>,
+    devices: Vec<CallDevice>,
+    selected: &str,
+) {
+    let mut labels = vec!["System default".to_string()];
+    let mut ids = vec![String::new()];
+    for device in devices.into_iter().skip(1) {
+        labels.push(device.name);
+        ids.push(device.id);
+    }
+    let refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+    let model = gtk::StringList::new(&refs);
+    dropdown.set_model(Some(&model));
+    *values.borrow_mut() = ids;
+    select_call_device(dropdown, &values.borrow(), selected);
+}
+
+fn select_call_device(dropdown: &gtk::DropDown, values: &[String], selected: &str) {
+    let index = values
+        .iter()
+        .position(|value| value == selected)
+        .unwrap_or(0) as u32;
+    if dropdown.selected() != index {
+        dropdown.set_selected(index);
     }
 }
 

@@ -3,6 +3,7 @@ pub mod auth;
 pub mod cards;
 pub mod avatar;
 pub mod bots;
+pub mod call;
 pub mod chatlist;
 pub mod contacts;
 pub mod forward;

@@ -7,6 +7,7 @@ pub const INFO: &str = "\u{f129}";
 pub const ATTACH: &str = "\u{f0c6}";
 pub const EMOJI: &str = "\u{f118}";
 pub const MIC: &str = "\u{f130}";
+pub const MIC_OFF: &str = "\u{f131}";
 pub const SEND: &str = "\u{f1d8}";
 pub const CHECK: &str = "\u{f00c}";
 pub const CHECK_DOUBLE: &str = "\u{f0139}";
@@ -71,6 +72,7 @@ mod tests {
         ATTACH,
         EMOJI,
         MIC,
+        MIC_OFF,
         SEND,
         CHECK,
         CHECK_DOUBLE,
