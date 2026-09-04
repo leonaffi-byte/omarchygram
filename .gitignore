@@ -12,3 +12,6 @@ build/
 # Added by cargo
 
 /target
+
+# Wave 7: vendored ntgcalls static lib (fetched by bin/fetch-ntgcalls, 128 MB)
+/vendor/

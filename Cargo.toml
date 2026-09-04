@@ -3,8 +3,15 @@ name = "omarchygram"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Voice/video calls via the vendored ntgcalls static lib (LGPL-3; see bin/fetch-ntgcalls).
+# Off by default so the app builds small and dependency-light without it.
+default = ["calls"]
+calls = ["dep:ntgcalls"]
+
 [dependencies]
 libc = "0.2"
+ntgcalls = { version = "=3.0.0-rc01", optional = true }
 async-channel = "2.5.0"
 chrono = "0.4.45"
 dirs = "6.0.0"

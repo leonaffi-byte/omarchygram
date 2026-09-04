@@ -10,6 +10,7 @@
 //! methods below; the UI must compile against nothing else.
 
 mod archive;
+mod calls;
 mod markdown;
 mod mock;
 mod real;
@@ -627,6 +628,71 @@ impl Default for BackendFlags {
     }
 }
 
+
+// ===================== wave 7: voice calls =====================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallPhase {
+    /// Outgoing: request sent, ringing on the other side.
+    Requesting,
+    /// Incoming: the other side is calling; we are ringing, not yet accepted.
+    Incoming,
+    /// Keys are being exchanged after accept/confirm.
+    Exchanging,
+    /// connect_p2p is running; media not yet flowing.
+    Connecting,
+    /// Connected: audio is flowing.
+    Active,
+    /// Over; see `CallInfo::end_reason`.
+    Ended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallEndReason {
+    /// One side hung up.
+    Hangup,
+    /// Never answered in time.
+    Missed,
+    /// The callee was busy or declined.
+    Declined,
+    /// A transport or crypto failure (logged, never shown raw).
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallInfo {
+    /// Telegram phone-call id; 0 before the server assigns one.
+    pub id: i64,
+    /// The other party (Bot-API user id).
+    pub peer_id: i64,
+    pub peer_name: String,
+    /// True when we placed the call.
+    pub outgoing: bool,
+    pub phase: CallPhase,
+    pub muted: bool,
+    /// The 4-emoji key verification (e.g. "🐴🍎🚗🌍"); empty until `Active`.
+    pub emojis: String,
+    /// When `Active` began (for the timer). None before that.
+    pub connected_at: Option<DateTime<Local>>,
+    /// Set only in `Ended`.
+    pub end_reason: Option<CallEndReason>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CallDevice {
+    /// Opaque id passed back in settings verbatim.
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CallDevices {
+    /// Microphones; first entry is the system default.
+    pub input: Vec<CallDevice>,
+    /// Speakers; first entry is the system default.
+    pub output: Vec<CallDevice>,
+}
+
 /// Pushed by the backend; read via `Tg::events`. Arrive on whatever context
 /// awaits them — in this app, the GLib main context, so widgets may be touched
 /// directly in the receive loop.
@@ -660,6 +726,10 @@ pub enum Event {
     TopicsChanged { forum_id: i64 },
     /// Story rings changed: refetch `get_story_peers` (and dialogs' rings).
     StoriesChanged,
+    /// The one active/ringing voice call changed (new incoming, phase advanced,
+    /// ended). The UI keeps a single call surface; on `Ended` it shows the end
+    /// state briefly then clears. No further events for a call after `Ended`.
+    CallChanged(CallInfo),
 }
 
 /// User-facing error text; show it, don't parse it.
@@ -746,6 +816,12 @@ enum Command {
     GetStories { chat_id: i64, respond: Reply<Vec<Story>> },
     DownloadStory { chat_id: i64, story_id: i32, respond: Reply<Option<PathBuf>> },
     MarkStoriesSeen { chat_id: i64, up_to_id: i32, respond: Reply<()> },
+    // ----- wave 7: voice calls -----
+    CallStart { user_id: i64, respond: Reply<()> },
+    CallAccept(Reply<()>),
+    CallHangUp(Reply<()>),
+    CallSetMuted { muted: bool, respond: Reply<()> },
+    CallDevicesList(Reply<CallDevices>),
 }
 
 impl Command {
@@ -823,6 +899,11 @@ impl Command {
             Command::GetStories { .. } => "GetStories",
             Command::DownloadStory { .. } => "DownloadStory",
             Command::MarkStoriesSeen { .. } => "MarkStoriesSeen",
+            Command::CallStart { .. } => "CallStart",
+            Command::CallAccept(_) => "CallAccept",
+            Command::CallHangUp(_) => "CallHangUp",
+            Command::CallSetMuted { .. } => "CallSetMuted",
+            Command::CallDevicesList(_) => "CallDevicesList",
         }
     }
 }
@@ -888,7 +969,11 @@ fn reject(cmd: Command, e: &str) {
         | Command::DeleteScheduled { respond, .. }
         | Command::UpdateLiveLocation { respond, .. }
         | Command::StopLiveLocation { respond, .. }
-        | Command::MarkStoriesSeen { respond, .. } => drop(respond.send(Err(e))),
+        | Command::MarkStoriesSeen { respond, .. }
+        | Command::CallStart { respond, .. }
+        | Command::CallSetMuted { respond, .. } => drop(respond.send(Err(e))),
+        Command::CallAccept(tx) | Command::CallHangUp(tx) => drop(tx.send(Err(e))),
+        Command::CallDevicesList(tx) => drop(tx.send(Err(e))),
         Command::SendPoll { respond, .. }
         | Command::SendLocation { respond, .. }
         | Command::SendVideoNote { respond, .. }
@@ -1342,6 +1427,35 @@ impl Tg {
 
     pub async fn mark_stories_seen(&self, chat_id: i64, up_to_id: i32) -> Result<(), TgError> {
         roundtrip!(self, |tx| Command::MarkStoriesSeen { chat_id, up_to_id, respond: tx })
+    }
+
+    // ----- wave 7: voice calls -----
+
+    /// Place a 1:1 voice call to a user (Bot-API id). Progress arrives as
+    /// `Event::CallChanged`. Fails if a call is active, the peer is not a user,
+    /// or calls are not built in.
+    pub async fn call_start(&self, user_id: i64) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::CallStart { user_id, respond: tx })
+    }
+
+    /// Accept the current incoming call.
+    pub async fn call_accept(&self) -> Result<(), TgError> {
+        roundtrip!(self, Command::CallAccept)
+    }
+
+    /// Decline an incoming call, or hang up an outgoing/active one. Idempotent.
+    pub async fn call_hang_up(&self) -> Result<(), TgError> {
+        roundtrip!(self, Command::CallHangUp)
+    }
+
+    pub async fn call_set_muted(&self, muted: bool) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::CallSetMuted { muted, respond: tx })
+    }
+
+    /// Audio devices for the settings page; the first entry of each list is
+    /// the system default.
+    pub async fn call_devices(&self) -> Result<CallDevices, TgError> {
+        roundtrip!(self, Command::CallDevicesList)
     }
 }
 

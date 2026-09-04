@@ -4647,6 +4647,8 @@ impl ShellInner {
             return;
         }
         match event {
+            // Wave 7: the call UI package replaces this with the real handler.
+            Event::CallChanged(_) => {}
             Event::ReadOutbox { chat_id, max_id } => {
                 self.bump_dialogs_revision();
                 let mut read = self.read_outbox.borrow_mut();

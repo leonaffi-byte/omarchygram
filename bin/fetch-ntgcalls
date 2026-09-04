@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Fetch the ntgcalls static library into vendor/ (git-ignored) so the `calls`
+# cargo feature can link it. Idempotent: verifies the checksum and skips the
+# download when the file is already present and correct.
+#   bin/fetch-ntgcalls
+set -euo pipefail
+cd "$(dirname "$0")/.."
+VERSION="3.0.0-rc01"
+ASSET="ntgcalls.linux-x86_64-static_libs.zip"
+URL="https://github.com/pytgcalls/ntgcalls/releases/download/v${VERSION}/${ASSET}"
+ZIP_SHA256="67d63734603ecfafc9182bd31cba4736af9306023b63390a73d2ec0d18622b84"
+dest="vendor/ntgcalls"
+lib="$dest/lib/libntgcalls.a"
+if [ -f "$lib" ] && [ "$(sha256sum "$dest/$ASSET" 2>/dev/null | cut -d' ' -f1)" = "$ZIP_SHA256" ]; then
+  echo "ntgcalls $VERSION already vendored at $lib"
+  exit 0
+fi
+mkdir -p "$dest/lib" "$dest/include"
+echo "Downloading $URL"
+curl -fSL --retry 3 -o "$dest/$ASSET" "$URL"
+got=$(sha256sum "$dest/$ASSET" | cut -d' ' -f1)
+if [ "$got" != "$ZIP_SHA256" ]; then
+  echo "checksum mismatch: got $got, expected $ZIP_SHA256" >&2
+  rm -f "$dest/$ASSET"; exit 1
+fi
+tmp=$(mktemp -d)
+unzip -oq "$dest/$ASSET" -d "$tmp"
+cp "$tmp"/lib/libntgcalls.a "$dest/lib/"
+cp "$tmp"/include/ntgcalls.h "$dest/include/"
+rm -rf "$tmp"
+echo "ntgcalls $VERSION vendored: $lib ($(du -h "$lib" | cut -f1))"

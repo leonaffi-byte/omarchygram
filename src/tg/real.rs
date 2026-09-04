@@ -40,7 +40,7 @@ use super::{
 };
 
 /// Shared between the command loop, spawned data tasks, and the update loop.
-struct Ctx {
+pub(in crate::tg) struct Ctx {
     peers: Mutex<HashMap<i64, PeerRef>>,
     titles: Mutex<HashMap<i64, String>>,
     media: Mutex<HashMap<(i64, i32), Media>>,
@@ -69,6 +69,8 @@ struct Ctx {
     http: reqwest::Client,
     /// Lets command handlers push events (poll results, story rings…).
     events: async_channel::Sender<Event>,
+    /// The voice-call actor handle (disabled until connected / when calls off).
+    calls: Mutex<super::calls::CallHandle>,
 }
 
 #[derive(Clone, Copy)]
@@ -88,8 +90,14 @@ impl Ctx {
         }
     }
 
+    /// Cached display name for a peer (empty when unknown).
+    #[cfg_attr(not(feature = "calls"), allow(dead_code))]
+    pub(in crate::tg) fn title_of(&self, chat_id: i64) -> String {
+        self.titles.lock().unwrap().get(&chat_id).cloned().unwrap_or_default()
+    }
+
     /// Topic ids resolve to their forum's peer.
-    fn peer(&self, chat_id: i64) -> Result<PeerRef, TgError> {
+    pub(in crate::tg) fn peer(&self, chat_id: i64) -> Result<PeerRef, TgError> {
         let (chat_id, _) = real_chat(chat_id);
         self.peers
             .lock()
@@ -176,6 +184,7 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                 .unwrap_or_default(),
             events: events.clone(),
             meta: Mutex::new(HashMap::new()),
+            calls: Mutex::new(super::calls::CallHandle::disabled()),
         }),
         events,
         update_loop_started: false,
@@ -481,6 +490,26 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
         Command::MarkStoriesSeen { chat_id, up_to_id, respond } => {
             let _ = respond.send(mark_stories_seen(&client, &ctx, chat_id, up_to_id).await);
         }
+        // ----- wave 7: voice calls (forwarded to the single-owner actor) -----
+        Command::CallStart { user_id, respond } => {
+            let handle = ctx.calls.lock().unwrap().clone();
+            let _ = respond.send(handle.command(super::calls::CallCommand::Start(user_id)).await);
+        }
+        Command::CallAccept(tx) => {
+            let handle = ctx.calls.lock().unwrap().clone();
+            let _ = tx.send(handle.command(super::calls::CallCommand::Accept).await);
+        }
+        Command::CallHangUp(tx) => {
+            let handle = ctx.calls.lock().unwrap().clone();
+            let _ = tx.send(handle.command(super::calls::CallCommand::HangUp).await);
+        }
+        Command::CallSetMuted { muted, respond } => {
+            let handle = ctx.calls.lock().unwrap().clone();
+            let _ = respond.send(handle.command(super::calls::CallCommand::SetMuted(muted)).await);
+        }
+        Command::CallDevicesList(tx) => {
+            let _ = tx.send(super::calls::devices());
+        }
         other => reject(other, "auth commands are handled serially"),
     }
 }
@@ -523,6 +552,9 @@ impl Backend {
         self.update_loop_started = true;
         let ctx = self.ctx.clone();
         let events = self.events.clone();
+        // Voice-call actor: owns all call state; the update loop feeds it.
+        let call_handle = super::calls::spawn(client.clone(), ctx.clone(), events.clone());
+        *ctx.calls.lock().unwrap() = call_handle;
         tokio::spawn(consume_updates(stream, client, ctx, events));
         Ok(())
     }
@@ -576,6 +608,12 @@ impl Backend {
     /// `start()` begins a fresh login. The old sender pool is left to die
     /// with the process (a rare action; a restart is cheap).
     async fn log_out(&mut self) -> Result<AuthState, TgError> {
+        // End any live call and await teardown before deleting the session.
+        {
+            let handle = self.ctx.calls.lock().unwrap().clone();
+            handle.shutdown().await;
+            *self.ctx.calls.lock().unwrap() = super::calls::CallHandle::disabled();
+        }
         if let Some(client) = self.client.take() {
             if let Err(e) = client.sign_out().await {
                 eprintln!("omarchygram: sign out: {e}");
@@ -1553,6 +1591,16 @@ async fn consume_updates(
                             return;
                         }
                     }
+                }
+                // Voice calls: route to the single-owner actor, don't emit directly.
+                match &raw.raw {
+                    tl::enums::Update::PhoneCall(u) => {
+                        ctx.calls.lock().unwrap().clone().feed_update(u.phone_call.clone());
+                    }
+                    tl::enums::Update::PhoneCallSignalingData(u) => {
+                        ctx.calls.lock().unwrap().clone().feed_signaling(u.phone_call_id, u.data.clone());
+                    }
+                    _ => {}
                 }
                 if let Some(ev) = event_from_raw(&ctx, &raw.raw) {
                     if events.send(ev).await.is_err() {

@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use omarchygram::tg::{topic_chat_id, AuthState, ChatKind, Event, GeoPoint, MediaKind, PollDraft, Tg};
+use omarchygram::tg::{topic_chat_id, AuthState, CallPhase, ChatKind, Event, GeoPoint, MediaKind, PollDraft, Tg};
 
 /// Generous upper bound: the mock's scripted reply lands after ~2s.
 const EVENT_WAIT: Duration = Duration::from_secs(5);
@@ -465,4 +465,54 @@ async fn stories_and_live_location() {
     assert_eq!(plain.media, Some(MediaKind::Location));
     tg.add_contact(5007, "Alex", "Petrov", "+7 900").await.expect("add_contact");
     assert!(tg.add_contact(5008, "", "", "").await.is_err());
+}
+
+#[tokio::test]
+async fn outgoing_call_rings_connects_mutes_and_hangs_up() {
+    let tg = started_mock().await;
+    tg.call_start(1).await.expect("call_start");
+    // First event is Requesting.
+    let first = wait_event(&tg, |e| match e {
+        Event::CallChanged(c) => Some(c.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(first.phase, CallPhase::Requesting);
+    assert!(first.outgoing);
+    assert_eq!(first.peer_id, 1);
+    // Advances to Active with the emoji fingerprint.
+    let active = wait_event(&tg, |e| match e {
+        Event::CallChanged(c) if c.phase == CallPhase::Active => Some(c.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(!active.emojis.is_empty());
+    assert!(active.connected_at.is_some());
+    // Mute re-emits with muted = true.
+    tg.call_set_muted(true).await.expect("mute");
+    let muted = wait_event(&tg, |e| match e {
+        Event::CallChanged(c) if c.muted => Some(c.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(muted.phase, CallPhase::Active);
+    // A second call while active is refused.
+    assert!(tg.call_start(2).await.is_err());
+    // Hang up ends the call.
+    tg.call_hang_up().await.expect("hang up");
+    let ended = wait_event(&tg, |e| match e {
+        Event::CallChanged(c) if c.phase == CallPhase::Ended => Some(c.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(ended.end_reason.is_some());
+}
+
+#[tokio::test]
+async fn calling_a_bot_is_refused_and_devices_list() {
+    let tg = started_mock().await;
+    let bot = chat_titled(&tg, "Omarchy Bot").await;
+    assert!(tg.call_start(bot).await.is_err(), "cannot call a bot");
+    let devices = tg.call_devices().await.expect("devices");
+    assert!(!devices.input.is_empty() && !devices.output.is_empty());
 }

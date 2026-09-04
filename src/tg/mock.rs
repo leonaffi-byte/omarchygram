@@ -17,7 +17,8 @@ use tokio::sync::mpsc;
 use super::{
     AuthState, BackendFlags, BotCommand, ButtonKind, ChatInfo, ChatKind, ChatSummary, Command, Contact,
     ContactCard, DiceInfo, Event, Folder, GeoPoint, Gif, KeyButton, Keyboard, LiveLocation, LocationInfo,
-    Me, MediaKind, Member, MemberRole, Msg, MsgVersion, MuteMode, Poll, PollOption, Presence, Reaction,
+    CallDevice, CallDevices, CallEndReason, CallInfo, CallPhase, Me, MediaKind, Member, MemberRole, Msg, MsgVersion,
+    MuteMode, Poll, PollOption, Presence, Reaction,
     SharedKind, Span, SpanKind, Sticker, StickerPack, Story, StoryPeer, StoryRing, Topic, WebPreview,
     parse_markdown, paths, reject, split_topic_chat_id, to_markdown, topic_chat_id,
 };
@@ -349,6 +350,11 @@ struct MockState {
     stories: HashMap<i64, Vec<Story>>,
     /// Quiz answer keys: poll id -> correct option index.
     quiz_correct: HashMap<i64, usize>,
+    // ----- wave 7 -----
+    /// The one active/ringing call, if any.
+    call: Option<CallInfo>,
+    /// Bumped on every new call so a stale advance task can't touch a newer one.
+    call_gen: u64,
 }
 
 impl MockState {
@@ -811,6 +817,8 @@ impl MockState {
             contacts,
             folders,
             failed_once: HashSet::new(),
+            call: None,
+            call_gen: 0,
             scheduled,
             topics: topics_map,
             stories,
@@ -2544,7 +2552,156 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                 let _ = events.send(Event::DialogsChanged).await;
             }
         }
+        // ===================== wave 7: voice calls =====================
+        Command::CallStart { user_id, respond } => {
+            let r = {
+                let mut st = st.lock().unwrap();
+                if st.call.as_ref().is_some_and(|c| c.phase != CallPhase::Ended) {
+                    Err("a call is already in progress".to_string())
+                } else {
+                    let (name, kind) = st
+                        .chats
+                        .get(&user_id)
+                        .map(|c| (c.title.clone(), c.kind))
+                        .or_else(|| st.contacts.iter().find(|c| c.user_id == user_id).map(|c| (c.name.clone(), ChatKind::User)))
+                        .unwrap_or(("Someone".into(), ChatKind::User));
+                    if kind == ChatKind::Bot {
+                        Err("you can't call a bot".to_string())
+                    } else {
+                        st.call_gen += 1;
+                        st.call = Some(CallInfo {
+                            id: 7_000_000 + st.call_gen as i64,
+                            peer_id: user_id,
+                            peer_name: name,
+                            outgoing: true,
+                            phase: CallPhase::Requesting,
+                            muted: false,
+                            emojis: String::new(),
+                            connected_at: None,
+                            end_reason: None,
+                        });
+                        Ok(st.call.clone().unwrap())
+                    }
+                }
+            };
+            match r {
+                Ok(info) => {
+                    let _ = respond.send(Ok(()));
+                    let generation = st.lock().unwrap().call_gen;
+                    let _ = events.send(Event::CallChanged(info)).await;
+                    spawn_call_advance(st.clone(), events.clone(), generation);
+                }
+                Err(e) => {
+                    let _ = respond.send(Err(e));
+                }
+            }
+        }
+        Command::CallAccept(tx) => {
+            let advanced = {
+                let mut st = st.lock().unwrap();
+                match st.call.as_mut() {
+                    Some(c) if c.phase == CallPhase::Incoming => {
+                        c.phase = CallPhase::Exchanging;
+                        Some((st.call_gen, st.call.clone().unwrap()))
+                    }
+                    _ => None,
+                }
+            };
+            match advanced {
+                Some((generation, info)) => {
+                    let _ = tx.send(Ok(()));
+                    let _ = events.send(Event::CallChanged(info)).await;
+                    spawn_call_advance(st.clone(), events.clone(), generation);
+                }
+                None => {
+                    let _ = tx.send(Err("no incoming call to accept".to_string()));
+                }
+            }
+        }
+        Command::CallHangUp(tx) => {
+            let ended = {
+                let mut st = st.lock().unwrap();
+                st.call_gen += 1; // invalidate any in-flight advance task
+                match st.call.as_mut() {
+                    Some(c) if c.phase != CallPhase::Ended => {
+                        c.end_reason = Some(if c.phase == CallPhase::Incoming {
+                            CallEndReason::Declined
+                        } else {
+                            CallEndReason::Hangup
+                        });
+                        c.phase = CallPhase::Ended;
+                        Some(st.call.clone().unwrap())
+                    }
+                    _ => None,
+                }
+            };
+            let _ = tx.send(Ok(()));
+            if let Some(info) = ended {
+                let _ = events.send(Event::CallChanged(info)).await;
+                st.lock().unwrap().call = None;
+            }
+        }
+        Command::CallSetMuted { muted, respond } => {
+            let changed = {
+                let mut st = st.lock().unwrap();
+                match st.call.as_mut() {
+                    Some(c) if c.phase != CallPhase::Ended => {
+                        c.muted = muted;
+                        Some(st.call.clone().unwrap())
+                    }
+                    _ => None,
+                }
+            };
+            let _ = respond.send(Ok(()));
+            if let Some(info) = changed {
+                let _ = events.send(Event::CallChanged(info)).await;
+            }
+        }
+        Command::CallDevicesList(tx) => {
+            let _ = tx.send(Ok(CallDevices {
+                input: vec![
+                    CallDevice { id: "mock-mic-default".into(), name: "System default".into() },
+                    CallDevice { id: "mock-mic-usb".into(), name: "USB microphone".into() },
+                ],
+                output: vec![
+                    CallDevice { id: "mock-out-default".into(), name: "System default".into() },
+                    CallDevice { id: "mock-out-hdmi".into(), name: "HDMI output".into() },
+                ],
+            }));
+        }
     }
+}
+
+/// Drives an outgoing/accepted call Requesting/Exchanging -> Connecting ->
+/// Active, ~700ms per step, stopping if `gen` no longer matches (hung up or a
+/// newer call started).
+fn spawn_call_advance(st: Arc<Mutex<MockState>>, events: async_channel::Sender<Event>, generation: u64) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            let info = {
+                let mut st = st.lock().unwrap();
+                if st.call_gen != generation {
+                    return;
+                }
+                let Some(c) = st.call.as_mut() else { return };
+                c.phase = match c.phase {
+                    CallPhase::Requesting | CallPhase::Incoming | CallPhase::Exchanging => CallPhase::Connecting,
+                    CallPhase::Connecting => {
+                        c.connected_at = Some(Local::now());
+                        c.emojis = "\u{1f434}\u{1f34e}\u{1f697}\u{1f30d}".to_string();
+                        CallPhase::Active
+                    }
+                    CallPhase::Active | CallPhase::Ended => return,
+                };
+                st.call.clone().unwrap()
+            };
+            let done = info.phase == CallPhase::Active;
+            if events.send(Event::CallChanged(info)).await.is_err() || done {
+                return;
+            }
+        }
+    });
 }
 
 /// Tomorrow at HH:MM local time.

@@ -38,6 +38,7 @@ pub struct Settings {
     /// Missing = the action's default; "" = unbound.
     pub keys: BTreeMap<String, String>,
     pub media: MediaSettings,
+    pub calls: CallSettings,
 }
 
 /// Wave 6 playback/rendering preferences (specs/spec-wave6.md §1.8).
@@ -54,6 +55,23 @@ pub struct MediaSettings {
     pub animated_stickers: bool,
     /// false → no map tiles are fetched; location cards show coordinates only.
     pub map_tiles: bool,
+}
+
+/// Wave 7 voice-call preferences (specs/spec-wave7.md §1.5).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CallSettings {
+    /// "" = system default; else a CallDevice.id.
+    pub input_device: String,
+    pub output_device: String,
+    /// Play a ringtone on incoming calls.
+    pub ringtone: bool,
+}
+
+impl Default for CallSettings {
+    fn default() -> Self {
+        CallSettings { input_device: String::new(), output_device: String::new(), ringtone: true }
+    }
 }
 
 impl Default for MediaSettings {
@@ -164,6 +182,7 @@ impl Default for Settings {
             ui: UiSettings::default(),
             keys: BTreeMap::new(),
             media: MediaSettings::default(),
+            calls: CallSettings::default(),
         }
     }
 }
