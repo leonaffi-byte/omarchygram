@@ -5,9 +5,7 @@
 //!
 //! The UI writes through this module only (settings pages, login form).
 
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
 
 use crate::tg::paths;
 
@@ -24,38 +22,13 @@ pub struct AiKeyStatus {
 }
 
 fn read_table() -> toml::Table {
-    std::fs::read_to_string(paths::config_file())
-        .ok()
-        .and_then(|t| t.parse::<toml::Table>().ok())
-        .unwrap_or_default()
-}
-
-fn write_table(table: &toml::Table) -> std::io::Result<()> {
-    let p = paths::config_file();
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    let text = toml::to_string_pretty(table).map_err(std::io::Error::other)?;
-    let tmp = p.with_extension("toml.tmp");
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, &p)?;
-    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    Ok(())
+    crate::storage::read_table(&paths::config_file()).unwrap_or_default()
 }
 
 /// Telegram API credentials, if configured and well-formed.
 pub fn credentials() -> Option<(i32, String)> {
     let t = read_table();
-    let id = t.get("api_id")?.as_integer()? as i32;
+    let id = i32::try_from(t.get("api_id")?.as_integer()?).ok()?;
     let hash = t.get("api_hash")?.as_str()?.to_string();
     if id <= 0 || !valid_api_hash(&hash) {
         return None;
@@ -80,10 +53,11 @@ pub fn set_credentials(api_id: i32, api_hash: &str) -> Result<(), String> {
     if !valid_api_hash(&api_hash) {
         return Err("API hash must be 32 hexadecimal characters".into());
     }
-    let mut t = read_table();
-    t.insert("api_id".into(), toml::Value::Integer(api_id as i64));
-    t.insert("api_hash".into(), toml::Value::String(api_hash));
-    write_table(&t).map_err(|e| format!("could not save config.toml: {e}"))
+    crate::storage::update_table(&paths::config_file(), |t| {
+        t.insert("api_id".into(), toml::Value::Integer(api_id as i64));
+        t.insert("api_hash".into(), toml::Value::String(api_hash));
+        Ok(())
+    }).map_err(|e| format!("could not save config.toml: {e}"))
 }
 
 pub fn ai_keys() -> AiKeyStatus {
@@ -116,17 +90,16 @@ pub fn set_ai_key(provider: &str, value: Option<&str>) -> Result<(), String> {
         other => return Err(format!("unknown provider {other}")),
     };
     let value = value.map(str::trim).filter(|v| !v.is_empty());
-    if let Some(v) = value {
-        if v.chars().any(|c| c.is_control()) {
+    if let Some(v) = value
+        && v.chars().any(|c| c.is_control()) {
             return Err("the key contains control characters".into());
         }
-    }
-    let mut t = read_table();
+    crate::storage::update_table(&paths::config_file(), |t| {
     let ai = t
         .entry("ai")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
     let Some(ai) = ai.as_table_mut() else {
-        return Err("config.toml: [ai] is not a table".into());
+        return Err(std::io::Error::other("config.toml: [ai] is not a table"));
     };
     match value {
         Some(v) => {
@@ -136,7 +109,8 @@ pub fn set_ai_key(provider: &str, value: Option<&str>) -> Result<(), String> {
             ai.remove(key);
         }
     }
-    write_table(&t).map_err(|e| format!("could not save config.toml: {e}"))
+    Ok(())
+    }).map_err(|e| format!("could not save config.toml: {e}"))
 }
 
 /// Ensure the file is private if it exists (called at startup).
@@ -146,9 +120,6 @@ pub fn enforce_permissions() {
         let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
     }
 }
-
-#[allow(dead_code)]
-fn _is_path(_p: &Path) {}
 
 #[cfg(test)]
 mod tests {

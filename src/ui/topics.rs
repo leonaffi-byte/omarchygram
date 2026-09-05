@@ -45,6 +45,12 @@ pub struct TopicListView {
     create_pending: Rc<Cell<bool>>,
 }
 
+impl Default for TopicListView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TopicListView {
     pub fn new() -> Self {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);

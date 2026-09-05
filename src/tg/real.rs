@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Local, TimeZone};
 use grammers_client::client::UpdatesConfiguration;
@@ -41,11 +42,20 @@ use super::{
 
 /// Shared between the command loop, spawned data tasks, and the update loop.
 pub(in crate::tg) struct Ctx {
+    account_id: i64,
+    active: AtomicBool,
+    background: Mutex<Vec<tokio::task::AbortHandle>>,
+    presence_update: tokio::sync::Mutex<Option<(bool, std::time::Instant)>>,
+    presence_active: AtomicBool,
+    downloads: Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    download_slots: tokio::sync::Semaphore,
+    dialogs_loaded: tokio::sync::Mutex<bool>,
     peers: Mutex<HashMap<i64, PeerRef>>,
     titles: Mutex<HashMap<i64, String>>,
     media: Mutex<HashMap<(i64, i32), Media>>,
     /// Local archive (always on; anti-delete/edit-history read from it).
     archive: Option<Archive>,
+    history_cache: Option<super::history_cache::HistoryCache>,
     flags: Mutex<BackendFlags>,
     /// chat/user id -> profile photo id (for download_avatar).
     photos: Mutex<HashMap<i64, i64>>,
@@ -59,14 +69,13 @@ pub(in crate::tg) struct Ctx {
     forums: Mutex<HashSet<i64>>,
     /// Story rings from the last stories fetch (wave 6F).
     story_rings: Mutex<HashMap<i64, StoryRing>>,
-    /// When the story rings were last fetched (refreshed with the dialogs every 5 min).
-    stories_fetched: Mutex<Option<std::time::Instant>>,
     /// Raw polls by poll id — `updateMessagePoll` may carry results only.
     polls: Mutex<HashMap<i64, tl::types::Poll>>,
     /// Story media by (peer chat id, story id), for `download_story`.
     story_media: Mutex<HashMap<(i64, i32), tl::enums::MessageMedia>>,
     /// OpenStreetMap tiles (wave 6B).
     http: reqwest::Client,
+    places: super::places::Search,
     /// Lets command handlers push events (poll results, story rings…).
     events: async_channel::Sender<Event>,
     /// The voice-call actor handle (disabled until connected / when calls off).
@@ -83,6 +92,53 @@ struct DialogMeta {
 }
 
 impl Ctx {
+    async fn new(account_id: i64, flags: BackendFlags, events: async_channel::Sender<Event>) -> Result<Arc<Self>, TgError> {
+        let archive = if account_id > 0 { Some(Archive::open(account_id).await?) } else { None };
+        Ok(Arc::new(Self {
+            account_id,
+            active: AtomicBool::new(account_id > 0),
+            background: Mutex::new(Vec::new()),
+            presence_update: tokio::sync::Mutex::new(None),
+            presence_active: AtomicBool::new(false),
+            downloads: Mutex::new(HashMap::new()),
+            download_slots: tokio::sync::Semaphore::new(4),
+            dialogs_loaded: tokio::sync::Mutex::new(false),
+            peers: Mutex::new(HashMap::new()), titles: Mutex::new(HashMap::new()),
+            media: Mutex::new(HashMap::new()), archive, flags: Mutex::new(flags),
+            history_cache: (account_id > 0).then(|| super::history_cache::HistoryCache::new(account_id)),
+            photos: Mutex::new(HashMap::new()), documents: Mutex::new(HashMap::new()),
+            sticker_sets: Mutex::new(HashMap::new()), forums: Mutex::new(HashSet::new()),
+            story_rings: Mutex::new(HashMap::new()),
+            polls: Mutex::new(HashMap::new()), story_media: Mutex::new(HashMap::new()),
+            http: reqwest::Client::builder().user_agent("omarchygram/0.1 (Telegram client for Omarchy)")
+                .timeout(std::time::Duration::from_secs(12)).build().map_err(|e| e.to_string())?,
+            places: super::places::Search::default(),
+            events, meta: Mutex::new(HashMap::new()),
+            calls: Mutex::new(super::calls::CallHandle::disabled()),
+        }))
+    }
+
+    fn media_dir(&self) -> PathBuf { paths::media_dir().join(format!("account-{}", self.account_id)) }
+    fn avatar_dir(&self) -> PathBuf { paths::avatar_dir().join(format!("account-{}", self.account_id)) }
+
+    async fn download_lock(&self, path: &std::path::Path) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut pending = self.downloads.lock().unwrap();
+            if pending.len() > 256 { pending.retain(|_, value| value.strong_count() > 0); }
+            if let Some(lock) = pending.get(path).and_then(std::sync::Weak::upgrade) { lock } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                pending.insert(path.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    fn stop_background(&self) {
+        self.active.store(false, Ordering::Release);
+        for handle in self.background.lock().unwrap().drain(..) { handle.abort(); }
+    }
+
     fn remember(&self, chat_id: i64, peer_ref: PeerRef, title: Option<&str>) {
         self.peers.lock().unwrap().insert(chat_id, peer_ref);
         if let Some(title) = title {
@@ -118,6 +174,9 @@ struct Backend {
     ctx: Arc<Ctx>,
     events: async_channel::Sender<Event>,
     update_loop_started: bool,
+    update_task: Option<tokio::task::JoinHandle<()>>,
+    sender_task: Option<tokio::task::JoinHandle<()>>,
+    data_tasks: tokio::task::JoinSet<()>,
 }
 
 fn load_credentials() -> Option<(i32, String)> {
@@ -157,43 +216,29 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
         password_token: None,
         updates_rx: None,
         session_path: paths::session_file(),
-        ctx: Arc::new(Ctx {
-            peers: Mutex::new(HashMap::new()),
-            titles: Mutex::new(HashMap::new()),
-            media: Mutex::new(HashMap::new()),
-            archive: match Archive::open().await {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    eprintln!("omarchygram: archive disabled: {e}");
-                    None
+        ctx: match Ctx::new(0, BackendFlags::default(), events.clone()).await {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                while let Some(cmd) = cmds.recv().await {
+                    if matches!(cmd, Command::Shutdown) { break; }
+                    reject(cmd, &error);
                 }
-            },
-            flags: Mutex::new(BackendFlags::default()),
-            photos: Mutex::new(HashMap::new()),
-            documents: Mutex::new(HashMap::new()),
-            sticker_sets: Mutex::new(HashMap::new()),
-            forums: Mutex::new(HashSet::new()),
-            story_rings: Mutex::new(HashMap::new()),
-            stories_fetched: Mutex::new(None),
-            polls: Mutex::new(HashMap::new()),
-            story_media: Mutex::new(HashMap::new()),
-            http: reqwest::Client::builder()
-                .user_agent("omarchygram/0.1 (Telegram client for Omarchy)")
-                .timeout(std::time::Duration::from_secs(12))
-                .build()
-                .unwrap_or_default(),
-            events: events.clone(),
-            meta: Mutex::new(HashMap::new()),
-            calls: Mutex::new(super::calls::CallHandle::disabled()),
-        }),
+                return;
+            }
+        },
         events,
         update_loop_started: false,
+        update_task: None,
+        sender_task: None,
+        data_tasks: tokio::task::JoinSet::new(),
     };
 
     while let Some(cmd) = cmds.recv().await {
+        while be.data_tasks.try_join_next().is_some() {}
         // Auth commands mutate Backend and run serially; everything else is
         // spawned with clones of (Client, Arc<Ctx>).
         match cmd {
+            Command::Shutdown => break,
             Command::Start(tx) => {
                 let _ = tx.send(be.start().await);
             }
@@ -216,31 +261,43 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
             Command::LogOut(tx) => {
                 let _ = tx.send(be.log_out().await);
             }
+            Command::SetOnline(online, tx) => {
+                be.ctx.presence_active.store(online, Ordering::Release);
+                if let Some(client) = be.client.clone() {
+                    let ctx = be.ctx.clone();
+                    be.data_tasks.spawn(async move { let _ = tx.send(apply_presence_status(&client, &ctx).await); });
+                } else { let _ = tx.send(Ok(())); }
+            }
             Command::SetFlags(flags, tx) => {
                 // Flags take effect HERE, in the serial loop, before any later
                 // MarkRead is even spawned — ghost mode can never race a
                 // receipt. The status RPC (offline on/off) runs in the background.
-                let previous = std::mem::replace(&mut *be.ctx.flags.lock().unwrap(), flags);
+                *be.ctx.flags.lock().unwrap() = flags;
                 match be.client.clone() {
                     Some(client) => {
                         let ctx = be.ctx.clone();
-                        tokio::spawn(async move {
-                            let _ = tx.send(apply_ghost_status(&client, &ctx, previous.ghost_mode, flags.ghost_mode).await);
+                        be.data_tasks.spawn(async move {
+                            let _ = tx.send(apply_presence_status(&client, &ctx).await);
                         });
                     }
                     None => drop(tx.send(Ok(()))),
                 }
             }
             data_cmd => {
+                if !be.ctx.active.load(Ordering::Acquire) {
+                    respond_not_connected(data_cmd);
+                    continue;
+                }
                 let Some(client) = be.client.clone() else {
                     respond_not_connected(data_cmd);
                     continue;
                 };
                 let ctx = be.ctx.clone();
-                tokio::spawn(handle_data(client, ctx, data_cmd));
+                be.data_tasks.spawn(handle_data(client, ctx, data_cmd));
             }
         }
     }
+    be.stop_session_tasks().await;
 }
 
 /// Answer a data command received before the backend connected.
@@ -248,28 +305,56 @@ fn respond_not_connected(cmd: Command) {
     reject(cmd, "not connected");
 }
 
+fn reply_message(ctx: &Ctx, reply: super::Reply<Msg>, result: Result<Msg, TgError>) {
+    if let Ok(message) = &result && let Some(cache) = &ctx.history_cache { cache.update(message); }
+    let _ = reply.send(result);
+}
+
+fn cache_event(ctx: &Ctx, event: &Event) {
+    if let Event::PollChanged { poll_id, poll } = event && let Some(cache) = &ctx.history_cache {
+        cache.poll(*poll_id, poll);
+    }
+}
+
 async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
     match cmd {
         Command::GetDialogs(tx) => {
-            let _ = tx.send(get_dialogs(&client, &ctx).await);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), get_dialogs(&client, &ctx))
+                .await.unwrap_or_else(|_| Err("Loading chats timed out. Please retry.".into()));
+            let _ = tx.send(result);
         }
         Command::GetHistory { chat_id, before_id, respond } => {
-            let _ = respond.send(get_history(&client, &ctx, chat_id, before_id).await);
+            let revision = if before_id.is_none() { ctx.history_cache.as_ref().map(|c| c.revision(chat_id)).unwrap_or(0) } else { 0 };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), get_history(&client, &ctx, chat_id, before_id))
+                .await.unwrap_or_else(|_| Err("Loading messages timed out. Please retry.".into()));
+            if before_id.is_none() && let Ok(messages) = &result && let Some(cache) = &ctx.history_cache {
+                cache.put(chat_id, messages.clone(), revision);
+            }
+            let _ = respond.send(result);
+        }
+        Command::GetCachedHistory { chat_id, respond } => {
+            let mut messages = if let Some(cache) = &ctx.history_cache {
+                tokio::time::timeout(std::time::Duration::from_secs(2), cache.get(chat_id)).await.unwrap_or_default()
+            } else { Vec::new() };
+            messages.retain(|m| !m.deleted || ctx.flags.lock().unwrap().anti_delete);
+            let _ = respond.send(Ok(messages));
         }
         Command::DownloadMedia { chat_id, msg_id, respond } => {
             let _ = respond.send(download_media(&client, &ctx, chat_id, msg_id).await);
         }
         Command::SendText { chat_id, text, reply_to, respond } => {
-            let _ = respond.send(send_text(&client, &ctx, chat_id, &text, reply_to).await);
+            reply_message(&ctx, respond, send_text(&client, &ctx, chat_id, &text, reply_to).await);
         }
         Command::SendFile { chat_id, path, caption, respond } => {
-            let _ = respond.send(send_file(&client, &ctx, chat_id, &path, &caption).await);
+            reply_message(&ctx, respond, send_file(&client, &ctx, chat_id, &path, &caption).await);
         }
         Command::EditText { chat_id, msg_id, text, respond } => {
-            let _ = respond.send(edit_text(&client, &ctx, chat_id, msg_id, &text).await);
+            reply_message(&ctx, respond, edit_text(&client, &ctx, chat_id, msg_id, &text).await);
         }
         Command::DeleteMessages { chat_id, ids, respond } => {
-            let _ = respond.send(delete_messages(&client, &ctx, chat_id, &ids).await);
+            let result = delete_messages(&client, &ctx, chat_id, &ids).await;
+            if result.is_ok() && let Some(cache) = &ctx.history_cache { cache.delete(real_chat(chat_id).0, &ids); }
+            let _ = respond.send(result);
         }
         Command::MarkRead { chat_id, up_to, respond } => {
             let _ = respond.send(mark_read(&client, &ctx, chat_id, up_to).await);
@@ -294,16 +379,20 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             let _ = respond.send(download_avatar(&client, &ctx, chat_id).await);
         }
         Command::SendVoice { chat_id, path, duration, respond } => {
-            let _ = respond.send(send_voice(&client, &ctx, chat_id, &path, duration).await);
+            reply_message(&ctx, respond, send_voice(&client, &ctx, chat_id, &path, duration).await);
         }
         Command::SendSticker { chat_id, sticker_id, respond } => {
-            let _ = respond.send(send_document_by_id(&client, &ctx, chat_id, sticker_id).await);
+            reply_message(&ctx, respond, send_document_by_id(&client, &ctx, chat_id, sticker_id).await);
         }
         Command::SendGif { chat_id, gif_id, respond } => {
-            let _ = respond.send(send_document_by_id(&client, &ctx, chat_id, gif_id).await);
+            reply_message(&ctx, respond, send_document_by_id(&client, &ctx, chat_id, gif_id).await);
         }
         Command::ForwardMessages { from_chat, ids, to_chat, respond } => {
-            let _ = respond.send(forward_messages(&client, &ctx, from_chat, &ids, to_chat).await);
+            let result = forward_messages(&client, &ctx, from_chat, &ids, to_chat).await;
+            if let Ok(messages) = &result && let Some(cache) = &ctx.history_cache {
+                for message in messages { cache.update(message); }
+            }
+            let _ = respond.send(result);
         }
         Command::SearchMessages { chat_id, query, before_id, respond } => {
             let _ = respond.send(search_messages(&client, &ctx, chat_id, &query, before_id, None).await);
@@ -339,13 +428,17 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             let _ = respond.send(mark_unread(&client, &ctx, chat_id, unread).await);
         }
         Command::DeleteChat { chat_id, respond } => {
-            let _ = respond.send(delete_chat(&client, &ctx, chat_id).await);
+            let result = delete_chat(&client, &ctx, chat_id).await;
+            if result.is_ok() && let Some(cache) = &ctx.history_cache { cache.clear(chat_id); }
+            let _ = respond.send(result);
         }
         Command::ClearHistory { chat_id, respond } => {
-            let _ = respond.send(clear_history(&client, &ctx, chat_id).await);
+            let result = clear_history(&client, &ctx, chat_id).await;
+            if result.is_ok() && let Some(cache) = &ctx.history_cache { cache.clear(chat_id); }
+            let _ = respond.send(result);
         }
-        Command::SaveDraft { chat_id, text, reply_to: _, respond } => {
-            let _ = respond.send(save_draft(&client, &ctx, chat_id, &text).await);
+        Command::SaveDraft { chat_id, text, reply_to, respond } => {
+            let _ = respond.send(save_draft(&client, &ctx, chat_id, &text, reply_to).await);
         }
         Command::GetChatInfo { chat_id, respond } => {
             let _ = respond.send(get_chat_info(&client, &ctx, chat_id).await);
@@ -373,7 +466,9 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             let _ = respond.send(create_group(&client, &ctx, &title, &user_ids).await);
         }
         Command::GetFolders(tx) => {
-            let _ = tx.send(get_folders(&client, &ctx).await);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), get_folders(&client, &ctx))
+                .await.unwrap_or_else(|_| Err("Loading folders timed out. Please retry.".into()));
+            let _ = tx.send(result);
         }
         Command::GetStickerPacks(tx) => {
             let _ = tx.send(sticker_packs(&client, &ctx).await);
@@ -401,11 +496,11 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             let _ = respond.send(add_contact(&client, &ctx, user_id, &first_name, &last_name, &phone).await);
         }
         Command::SendPoll { chat_id, draft, respond } => {
-            let _ = respond.send(send_poll(&client, &ctx, chat_id, draft).await);
+            reply_message(&ctx, respond, send_poll(&client, &ctx, chat_id, draft).await);
         }
         Command::SendLocation { chat_id, point, respond } => {
             let media = tl::enums::InputMedia::GeoPoint(tl::types::InputMediaGeoPoint { geo_point: input_geo(point) });
-            let _ = respond.send(send_media_msg(&client, &ctx, chat_id, media, "").await);
+            reply_message(&ctx, respond, send_media_msg(&client, &ctx, chat_id, media, "").await);
         }
         Command::SendTextAt { chat_id, text, reply_to, at, respond } => {
             let _ = respond.send(send_raw(&client, &ctx, chat_id, None, &text, reply_to, Some(at)).await.map(|_| ()));
@@ -446,7 +541,7 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             let _ = respond.send(create_topic(&client, &ctx, forum_id, &title).await);
         }
         Command::SendVideoNote { chat_id, path, duration, size, respond } => {
-            let _ = respond.send(send_video_note(&client, &ctx, chat_id, &path, duration, size).await);
+            reply_message(&ctx, respond, send_video_note(&client, &ctx, chat_id, &path, duration, size).await);
         }
         Command::SendLiveLocation { chat_id, point, period_secs, respond } => {
             let media = tl::enums::InputMedia::GeoLive(tl::types::InputMediaGeoLive {
@@ -456,7 +551,7 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
                 period: Some(period_secs.clamp(60, 86_400) as i32),
                 proximity_notification_radius: None,
             });
-            let _ = respond.send(send_media_msg(&client, &ctx, chat_id, media, "").await);
+            reply_message(&ctx, respond, send_media_msg(&client, &ctx, chat_id, media, "").await);
         }
         Command::UpdateLiveLocation { chat_id, msg_id, point, respond } => {
             let media = tl::enums::InputMedia::GeoLive(tl::types::InputMediaGeoLive {
@@ -507,6 +602,20 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             let handle = ctx.calls.lock().unwrap().clone();
             let _ = respond.send(handle.command(super::calls::CallCommand::SetMuted(muted)).await);
         }
+        Command::ImportLegacyArchive { account_id, respond } => {
+            let result = if account_id != ctx.account_id { Err("Account changed; reopen the import dialog".into()) }
+                else if let Some(archive) = ctx.archive.as_ref() { archive.import_legacy().await }
+                else { Err("Sign in before importing history".into()) };
+            let _ = respond.send(result);
+        }
+        Command::CallSetDevices { call_id, input, output, respond } => {
+            let handle = ctx.calls.lock().unwrap().clone();
+            let _ = respond.send(handle.command(super::calls::CallCommand::SetDevices { call_id, input, output }).await);
+        }
+        Command::SearchPlaces { query, respond } => {
+            let endpoint = crate::settings::load().media.place_search_url;
+            let _ = respond.send(ctx.places.run(&ctx.http, &endpoint, &query).await);
+        }
         Command::CallDevicesList(tx) => {
             let _ = tx.send(super::calls::devices());
         }
@@ -536,6 +645,10 @@ impl Backend {
         if self.update_loop_started {
             return Ok(());
         }
+        let client = self.client()?.clone();
+        let me = get_me(&client).await?;
+        let flags = *self.ctx.flags.lock().unwrap();
+        self.ctx = Ctx::new(me.id, flags, self.events.clone()).await?;
         let Some(updates_rx) = self.updates_rx.take() else {
             // The receiver was consumed by a failed earlier attempt; there is
             // no way to rebuild it — never report Ready with dead updates.
@@ -544,7 +657,6 @@ impl Backend {
                     .to_string(),
             );
         };
-        let client = self.client.as_ref().unwrap().clone();
         let stream = client
             .stream_updates(updates_rx, UpdatesConfiguration::default())
             .await
@@ -555,7 +667,17 @@ impl Backend {
         // Voice-call actor: owns all call state; the update loop feeds it.
         let call_handle = super::calls::spawn(client.clone(), ctx.clone(), events.clone());
         *ctx.calls.lock().unwrap() = call_handle;
-        tokio::spawn(consume_updates(stream, client, ctx, events));
+        let presence_ctx = ctx.clone();
+        let presence_client = client.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                if !presence_ctx.active.load(Ordering::Acquire) { break; }
+                let _ = apply_presence_status(&presence_client, &presence_ctx).await;
+            }
+        });
+        ctx.background.lock().unwrap().push(heartbeat.abort_handle());
+        self.update_task = Some(tokio::spawn(consume_updates(stream, client, ctx, events)));
         Ok(())
     }
 
@@ -589,7 +711,7 @@ impl Backend {
         );
         chmod_session_files(&self.session_path);
         let SenderPool { runner, updates, handle } = SenderPool::new(session, api_id);
-        tokio::spawn(runner.run());
+        self.sender_task = Some(tokio::spawn(async move { runner.run().await; }));
         let client = Client::new(handle);
         // Store BEFORE the fallible RPC below: a network failure here must not
         // let a Retry open a second sender pool over the same session.
@@ -604,9 +726,24 @@ impl Backend {
         }
     }
 
-    /// Sign out, drop the client and delete the local session so the next
-    /// `start()` begins a fresh login. The old sender pool is left to die
-    /// with the process (a rare action; a restart is cheap).
+    async fn stop_session_tasks(&mut self) {
+        self.ctx.stop_background();
+        self.data_tasks.shutdown().await;
+        if let Some(task) = self.update_task.take() { task.abort(); let _ = task.await; }
+        let handle = self.ctx.calls.lock().unwrap().clone();
+        handle.shutdown().await;
+        *self.ctx.calls.lock().unwrap() = super::calls::CallHandle::disabled();
+        if let Some(cache) = &self.ctx.history_cache { cache.flush().await; }
+        self.ctx.presence_active.store(false, Ordering::Release);
+        if let Some(client) = &self.client {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), apply_presence_status(client, &self.ctx)).await;
+        }
+        if let Some(task) = self.sender_task.take() { task.abort(); let _ = task.await; }
+        self.update_loop_started = false;
+    }
+
+    /// Tear down all session owners before removing SQLite files, then prepare
+    /// a new unauthenticated client so the phone form works without a restart.
     async fn log_out(&mut self) -> Result<AuthState, TgError> {
         // End any live call and await teardown before deleting the session.
         {
@@ -614,29 +751,43 @@ impl Backend {
             handle.shutdown().await;
             *self.ctx.calls.lock().unwrap() = super::calls::CallHandle::disabled();
         }
-        if let Some(client) = self.client.take() {
-            if let Err(e) = client.sign_out().await {
-                eprintln!("omarchygram: sign out: {e}");
+        self.ctx.stop_background();
+        self.data_tasks.shutdown().await;
+        if let Some(task) = self.update_task.take() { task.abort(); let _ = task.await; }
+        if let Some(client) = self.client.as_ref() {
+            // A failed sign-out is recoverable; do not pretend the account was revoked.
+            if let Err(error) = client.sign_out().await {
+                self.ctx.active.store(true, Ordering::Release);
+                self.update_loop_started = false;
+                // Rebuilding the update receiver requires a fresh sender pool.
+                self.stop_session_tasks().await;
+                self.client = None;
+                self.updates_rx = None;
+                let _ = self.start().await;
+                return Err(format!("could not sign out: {error}"));
             }
         }
+        self.stop_session_tasks().await;
+        self.client = None;
         self.login_token = None;
         self.password_token = None;
         self.updates_rx = None;
         self.update_loop_started = false;
-        self.ctx.peers.lock().unwrap().clear();
-        self.ctx.titles.lock().unwrap().clear();
+        let flags = *self.ctx.flags.lock().unwrap();
+        self.ctx = Ctx::new(0, flags, self.events.clone()).await?;
         for suffix in ["", "-journal", "-wal", "-shm"] {
             let mut os = self.session_path.as_os_str().to_owned();
             os.push(suffix);
             let p = PathBuf::from(os);
             if p.exists() {
-                let _ = std::fs::remove_file(&p);
+                std::fs::remove_file(&p).map_err(|e| format!("could not remove signed-out session: {e}"))?;
             }
         }
-        Ok(AuthState::NeedPhone)
+        self.start().await
     }
 
     async fn submit_phone(&mut self, phone: &str) -> Result<AuthState, TgError> {
+        if self.client.is_none() { self.start().await?; }
         let api_hash = self.api_hash.clone().ok_or_else(|| "not connected".to_string())?;
         let token = self
             .client()?
@@ -671,10 +822,24 @@ impl Backend {
     }
 
     async fn submit_password(&mut self, password: &str) -> Result<AuthState, TgError> {
-        let token = self
-            .password_token
-            .take()
-            .ok_or_else(|| "enter the login code first".to_string())?;
+        let token = match self.password_token.take() {
+            Some(token) => token,
+            None if self.login_token.is_some() => {
+                // A transport failure consumes grammers' non-cloneable token.
+                // Fetch a fresh SRP challenge on the next explicit retry.
+                if self.client()?.is_authorized().await.map_err(|_| "Could not reconnect. Check your connection and try again.")? {
+                    self.on_authorized().await?;
+                    return Ok(AuthState::Ready);
+                }
+                let challenge: tl::types::account::Password = self.client()?.invoke(&tl::functions::account::GetPassword {}).await
+                    .map_err(|_| "Could not refresh password verification. Check your connection and try again.")?.into();
+                if challenge.current_algo.is_none() || challenge.srp_id.is_none() || challenge.srp_b.is_none() {
+                    return Err("Password verification is unavailable. Try again shortly.".into());
+                }
+                grammers_client::client::PasswordToken::new(challenge)
+            }
+            None => return Err("Enter the login code first".into()),
+        };
         match self.client()?.check_password(token, password).await {
             Ok(_) => {
                 self.on_authorized().await.map_err(|e| {
@@ -688,25 +853,31 @@ impl Backend {
                 Err("Wrong password — try again.".into())
             }
             Err(e) => {
-                // The password token was consumed and only InvalidPassword
-                // returns a fresh one; the code flow must be redone.
-                self.login_token = None;
-                Err(format!(
-                    "password check failed: {e} — restart Omarchygram and log in again"
-                ))
+                Err(format!("Password check failed: {e}. Check your connection and try again."))
             }
         }
     }
 }
 
 async fn get_dialogs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<ChatSummary>, TgError> {
-    refresh_story_rings(client, ctx, false).await;
-    let mut iter = client.iter_dialogs().limit(200);
+    let mut loaded = ctx.dialogs_loaded.lock().await;
+    let result = fetch_dialogs(client, ctx).await?;
+    *loaded = true;
+    Ok(result)
+}
+
+async fn fetch_dialogs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<ChatSummary>, TgError> {
+    // With no folder filter, Telegram returns both normal and archived dialogs.
+    // Stories load independently: an optional stories request must not delay chats.
+    let mut iter = client.iter_dialogs();
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     let now = Local::now().timestamp() as i32;
     while let Some(dialog) = iter.next().await.map_err(|e| e.to_string())? {
         let chat_id = dialog.peer_id().bot_api_dialog_id_unchecked();
+        if !seen.insert(chat_id) { continue; }
         let facts = describe_peer(dialog.peer());
+        if facts.forum { ctx.forums.lock().unwrap().insert(chat_id); }
         let title = facts
             .title_override
             .clone()
@@ -780,128 +951,6 @@ async fn get_dialogs(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<ChatSummary>
             has_photo: facts.photo_id.is_some(),
             draft,
             forum: facts.forum,
-            story_ring: ctx.story_rings.lock().unwrap().get(&chat_id).copied().unwrap_or_default(),
-        });
-    }
-    // The archive folder is not part of iter_dialogs; fetch it raw. A failure
-    // there must not hide the main list.
-    match get_archived_dialogs(client, ctx, now).await {
-        Ok(archived) => out.extend(archived),
-        Err(e) => eprintln!("omarchygram: archived dialogs unavailable: {e}"),
-    }
-    Ok(out)
-}
-
-/// Dialogs in Telegram's archive folder (folder_id 1), built from the raw
-/// response because grammers' dialog iterator cannot select a folder.
-async fn get_archived_dialogs(client: &Client, ctx: &Arc<Ctx>, now: i32) -> Result<Vec<ChatSummary>, TgError> {
-    use grammers_client::session::types::PeerAuth;
-    use tl::enums::messages::Dialogs as D;
-    let r = client
-        .invoke(&tl::functions::messages::GetDialogs {
-            exclude_pinned: false,
-            folder_id: Some(1),
-            offset_date: 0,
-            offset_id: 0,
-            offset_peer: tl::enums::InputPeer::Empty,
-            limit: 100,
-            hash: 0,
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    let (dialogs, messages, chats, users) = match r {
-        D::Dialogs(d) => (d.dialogs, d.messages, d.chats, d.users),
-        D::Slice(d) => (d.dialogs, d.messages, d.chats, d.users),
-        D::NotModified(_) => return Ok(vec![]),
-    };
-    let mut out = Vec::new();
-    for dialog in dialogs {
-        let tl::enums::Dialog::Dialog(d) = dialog else { continue };
-        let chat_id = peer_chat_id(&d.peer);
-        // Resolve the peer from the response's user/chat lists.
-        let (title, kind, username, photo_id, presence, contact, peer_ref, forum) = match &d.peer {
-            tl::enums::Peer::User(pu) => {
-                let Some(tl::enums::User::User(u)) = users.iter().find(|u| matches!(u, tl::enums::User::User(x) if x.id == pu.user_id)) else { continue };
-                let (name, username, _phone, presence, _has_photo, contact) = user_facts(u);
-                let kind = if u.is_self { ChatKind::Saved } else if u.bot { ChatKind::Bot } else { ChatKind::User };
-                let photo_id = match &u.photo { Some(tl::enums::UserProfilePhoto::Photo(p)) => Some(p.photo_id), _ => None };
-                let title = if u.is_self { "Saved Messages".to_string() } else { name };
-                let peer_ref = PeerRef { id: PeerId::user_unchecked(u.id), auth: PeerAuth::from_hash(u.access_hash.unwrap_or(0)) };
-                (title, kind, username, photo_id, presence, contact, peer_ref, false)
-            }
-            tl::enums::Peer::Chat(pc) => {
-                let Some(tl::enums::Chat::Chat(c)) = chats.iter().find(|c| matches!(c, tl::enums::Chat::Chat(x) if x.id == pc.chat_id)) else { continue };
-                let photo_id = match &c.photo { tl::enums::ChatPhoto::Photo(p) => Some(p.photo_id), _ => None };
-                (c.title.clone(), ChatKind::Group, String::new(), photo_id, Presence::Unknown, false, PeerId::chat_unchecked(c.id).to_ambient_ref(), false)
-            }
-            tl::enums::Peer::Channel(pc) => {
-                let Some(tl::enums::Chat::Channel(c)) = chats.iter().find(|c| matches!(c, tl::enums::Chat::Channel(x) if x.id == pc.channel_id)) else { continue };
-                let photo_id = match &c.photo { tl::enums::ChatPhoto::Photo(p) => Some(p.photo_id), _ => None };
-                let kind = if c.megagroup { ChatKind::Group } else { ChatKind::Channel };
-                let peer_ref = PeerRef { id: PeerId::channel_unchecked(c.id), auth: PeerAuth::from_hash(c.access_hash.unwrap_or(0)) };
-                (c.title.clone(), kind, c.username.clone().unwrap_or_default(), photo_id, Presence::Unknown, false, peer_ref, c.forum)
-            }
-        };
-        if forum {
-            ctx.forums.lock().unwrap().insert(chat_id);
-        }
-        ctx.remember(chat_id, peer_ref, Some(&title));
-        if let Some(pid) = photo_id {
-            ctx.photos.lock().unwrap().insert(chat_id, pid);
-        }
-        let muted = is_muted(&d.notify_settings, now);
-        ctx.meta.lock().unwrap().insert(
-            chat_id,
-            DialogMeta { kind, contact, muted, unread: d.unread_count > 0, archived: true },
-        );
-        // Last message: raw, preview only (the full conversion needs grammers' peer map).
-        let last = messages.iter().find_map(|m| match m {
-            tl::enums::Message::Message(x) if x.id == d.top_message && peer_chat_id(&x.peer_id) == chat_id => Some(x),
-            _ => None,
-        });
-        let (last_message, last_time, last_msg_id, last_outgoing) = match last {
-            Some(m) => {
-                let preview = if !m.message.is_empty() {
-                    m.message.clone()
-                } else {
-                    match &m.media {
-                        Some(tl::enums::MessageMedia::Photo(_)) => "[photo]".to_string(),
-                        Some(tl::enums::MessageMedia::Document(_)) => "[file]".to_string(),
-                        Some(_) => "[message]".to_string(),
-                        None => String::new(),
-                    }
-                };
-                (
-                    preview,
-                    Local.timestamp_opt(m.date as i64, 0).single(),
-                    m.id,
-                    m.out,
-                )
-            }
-            None => (String::new(), None, d.top_message, false),
-        };
-        out.push(ChatSummary {
-            id: chat_id,
-            title,
-            kind,
-            username,
-            last_message,
-            last_sender: String::new(),
-            last_time,
-            last_msg_id,
-            last_outgoing,
-            unread: d.unread_count,
-            mentions: d.unread_mentions_count,
-            unread_mark: d.unread_mark,
-            read_inbox_max_id: d.read_inbox_max_id,
-            read_outbox_max_id: d.read_outbox_max_id,
-            pinned: d.pinned,
-            muted,
-            archived: true,
-            presence,
-            has_photo: photo_id.is_some(),
-            draft: draft_text(d.draft.as_ref()),
-            forum,
             story_ring: ctx.story_rings.lock().unwrap().get(&chat_id).copied().unwrap_or_default(),
         });
     }
@@ -1057,6 +1106,20 @@ async fn get_history(
 /// from raw outside the crate, so the page is refetched by id.
 async fn get_topic_history(client: &Client, ctx: &Arc<Ctx>, forum_id: i64, topic: i32, before_id: Option<i32>) -> Result<Vec<Msg>, TgError> {
     let peer = ctx.peer(forum_id)?;
+    let synthetic = topic_chat_id(forum_id, topic);
+    if topic == 1 {
+        let mut iter = client.iter_messages(peer);
+        if let Some(before) = before_id { iter = iter.offset_id(before); }
+        let mut page = Vec::new();
+        while let Some(message) = iter.next().await.map_err(|e| e.to_string())? {
+            let message = convert(ctx, &message, forum_id);
+            if super::msg_in_chat(&message, synthetic) { page.push(message); }
+            if page.len() == 50 { break; }
+        }
+        page.reverse();
+        merge_deleted(ctx, synthetic, before_id, &mut page).await;
+        return Ok(page);
+    }
     let r = client
         .invoke(&tl::functions::messages::GetReplies {
             peer: peer.into(),
@@ -1072,12 +1135,10 @@ async fn get_topic_history(client: &Client, ctx: &Arc<Ctx>, forum_id: i64, topic
         .await
         .map_err(|e| format!("topic history failed: {e}"))?;
     let ids: Vec<i32> = raw_messages(r).iter().filter_map(raw_message_id).collect();
-    if ids.is_empty() {
-        return Ok(vec![]);
-    }
     let fetched = client.get_messages_by_id(peer, &ids).await.map_err(|e| e.to_string())?;
-    let mut out: Vec<Msg> = fetched.into_iter().flatten().map(|m| convert(ctx, &m, forum_id)).collect();
+    let mut out: Vec<Msg> = fetched.into_iter().flatten().map(|m| convert(ctx, &m, forum_id)).filter(|m| super::msg_in_chat(m, synthetic)).collect();
     out.sort_by_key(|m| m.id);
+    merge_deleted(ctx, synthetic, before_id, &mut out).await;
     Ok(out)
 }
 
@@ -1120,11 +1181,16 @@ async fn get_history_at_date(
     chat_id: i64,
     date: chrono::DateTime<Local>,
 ) -> Result<Vec<Msg>, TgError> {
+    if split_topic_chat_id(chat_id).is_some() {
+        let mut page = search_topic(client, ctx, chat_id, "", None, None, date.timestamp().saturating_add(1).clamp(0, i32::MAX as i64) as i32).await?;
+        page.sort_by_key(|m| m.id);
+        return Ok(page);
+    }
     let peer = ctx.peer(chat_id)?;
     // offset_date = messages strictly older than this unix time, newest first.
     let mut iter = client
         .iter_messages(peer)
-        .offset_date(date.timestamp() as i32 + 1)
+        .offset_date(date.timestamp().saturating_add(1).clamp(0, i32::MAX as i64) as i32)
         .limit(50);
     let mut out = Vec::new();
     while let Some(m) = iter.next().await.map_err(|e| e.to_string())? {
@@ -1137,31 +1203,16 @@ async fn get_history_at_date(
     Ok(out)
 }
 
-/// Ghost on: tell Telegram we're offline now and keep re-asserting it every
-/// minute (sending a message or fetching can flip us online). Ghost off:
-/// send `offline: false` once. Read receipts are already suppressed by the
-/// flag itself; this only covers presence.
-async fn apply_ghost_status(client: &Client, ctx: &Arc<Ctx>, was: bool, now: bool) -> Result<(), TgError> {
-    if now == was {
-        return Ok(());
-    }
-    client
-        .invoke(&tl::functions::account::UpdateStatus { offline: now })
-        .await
-        .map_err(|e| format!("could not update online status: {e}"))?;
-    if now {
-        let client = client.clone();
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                if !ctx.flags.lock().unwrap().ghost_mode {
-                    return;
-                }
-                let _ = client.invoke(&tl::functions::account::UpdateStatus { offline: true }).await;
-            }
-        });
-    }
+/// Presence follows app activity, not an open socket. Serialize overlapping
+/// focus/settings/heartbeat requests and read the newest intent after locking.
+async fn apply_presence_status(client: &Client, ctx: &Arc<Ctx>) -> Result<(), TgError> {
+    let mut applied = ctx.presence_update.lock().await;
+    let offline = ctx.flags.lock().unwrap().ghost_mode || !ctx.presence_active.load(Ordering::Acquire);
+    if applied.as_ref().is_some_and(|(last, at)| *last == offline && at.elapsed().as_secs() < 55) { return Ok(()); }
+    tokio::time::timeout(std::time::Duration::from_secs(5), client.invoke(&tl::functions::account::UpdateStatus { offline }))
+        .await.map_err(|_| "Updating online status timed out".to_string())?
+        .map_err(|_| "Could not update online status".to_string())?;
+    *applied = Some((offline, std::time::Instant::now()));
     Ok(())
 }
 
@@ -1174,7 +1225,19 @@ async fn download_media(
     let (chat_id, _) = real_chat(chat_id);
     let media = { ctx.media.lock().unwrap().get(&(chat_id, msg_id)).cloned() };
     let Some(media) = media else {
-        return Ok(None);
+        // Cached history can render before Telegram repopulates media refs.
+        // Reuse only a completed file for this account/chat/message.
+        let dir = ctx.media_dir();
+        return tokio::task::spawn_blocking(move || {
+            let prefix = format!("{chat_id}_{msg_id}.");
+            Ok(std::fs::read_dir(dir).into_iter().flatten().flatten().find_map(|entry| {
+                let name = entry.file_name();
+                let ext = name.to_str()?.strip_prefix(&prefix)?;
+                if !(1..=8).contains(&ext.len()) || !ext.chars().all(|c| c.is_ascii_alphanumeric()) { return None; }
+                let path = entry.path();
+                (entry.file_type().ok()?.is_file() && complete_file(&path)).then_some(path)
+            }))
+        }).await.map_err(|_| "Media cache unavailable".to_string())?;
     };
     // Locations render as a map; nothing to download from Telegram.
     let point = match &media {
@@ -1189,20 +1252,10 @@ async fn download_media(
     if matches!(media, Media::Contact(_) | Media::Dice(_) | Media::Poll(_)) {
         return Ok(None);
     }
-    let dir = paths::media_dir();
+    let dir = ctx.media_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     let stem = format!("{chat_id}_{msg_id}");
-
-    // Serve from cache when already downloaded (webp never survives; see below).
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&format!("{stem}.")) && !name.ends_with(".webp") {
-                return Ok(Some(entry.path()));
-            }
-        }
-    }
 
     let ext = match &media {
         Media::Photo(_) => "jpg".to_string(),
@@ -1225,33 +1278,36 @@ async fn download_media(
             .unwrap_or_else(|| "bin".to_string()),
         _ => "bin".to_string(),
     };
-    let path = dir.join(format!("{stem}.{ext}"));
-    client
-        .download_media(&media, &path)
-        .await
-        .map_err(|e| format!("download failed: {e}"))?;
-    chmod_600(&path);
-
-    // GdkPixbuf on this system has no webp loader; convert stickers to png.
-    // (Animated .tgs stickers fail to decode; the UI shows them as unavailable.)
-    if ext == "webp" {
-        let png = dir.join(format!("{stem}.png"));
-        let mut reader = image::ImageReader::open(&path)
-            .map_err(|e| e.to_string())?
-            .with_guessed_format()
-            .map_err(|e| e.to_string())?;
-        let mut limits = image::Limits::default();
-        limits.max_image_width = Some(4096);
-        limits.max_image_height = Some(4096);
-        limits.max_alloc = Some(128 * 1024 * 1024);
-        reader.limits(limits);
-        let img = reader.decode().map_err(|e| format!("sticker decode failed: {e}"))?;
-        img.save(&png).map_err(|e| e.to_string())?;
-        chmod_600(&png);
-        let _ = std::fs::remove_file(&path);
-        return Ok(Some(png));
-    }
+    let path = dir.join(format!("{stem}.{}", if ext == "webp" { "png" } else { &ext }));
+    download_complete(client, ctx, &media, &path, ext == "webp").await?;
     Ok(Some(path))
+}
+
+/// Final paths only ever contain a complete download. A waiter shares the
+/// first result; cancelled/failed writes leave no discoverable cache entry.
+async fn download_complete<D: grammers_client::media::Downloadable>(
+    client: &Client, ctx: &Ctx, media: &D, path: &std::path::Path, webp: bool,
+) -> Result<(), TgError> {
+    let _guard = ctx.download_lock(path).await;
+    if complete_file(path) { return Ok(()); }
+    let _permit = ctx.download_slots.acquire().await.map_err(|_| "download service stopped")?;
+    let pending = crate::storage::PendingFile::new(path).map_err(|e| e.to_string())?;
+    client.download_media(media, pending.path()).await.map_err(|e| format!("download failed: {e}"))?;
+    if !complete_file(pending.path()) { return Err("download returned an empty file; try again".into()); }
+    let destination = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        if webp {
+            let png = crate::storage::PendingFile::new(&destination).map_err(|e| e.to_string())?;
+            webp_to_png(pending.path(), png.path())?;
+            png.commit(&destination).map_err(|e| e.to_string())
+        } else {
+            pending.commit(&destination).map_err(|e| e.to_string())
+        }
+    }).await.map_err(|e| e.to_string())?
+}
+
+fn complete_file(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
 
 async fn send_text(
@@ -1379,6 +1435,7 @@ fn register_media(ctx: &Ctx, m: &Message, chat_id: i64) {
 }
 
 fn convert(ctx: &Ctx, m: &Message, chat_id: i64) -> Msg {
+    let (chat_id, _) = real_chat(chat_id);
     let mi = media_info(m.media().as_ref(), m.date().with_timezone(&Local), m.edit_date().map(|d| d.with_timezone(&Local)));
     register_media(ctx, m, chat_id);
     if let Some(Media::Poll(p)) = m.media() {
@@ -1535,6 +1592,7 @@ async fn consume_updates(
                 let chat_id = m.peer_id().bot_api_dialog_id_unchecked();
                 remember_from_message(&ctx, &m, chat_id).await;
                 let msg = convert(&ctx, &m, chat_id);
+                if let Some(cache) = &ctx.history_cache { cache.update(&msg); }
                 if events.send(Event::NewMessage(msg)).await.is_err() {
                     return;
                 }
@@ -1549,6 +1607,7 @@ async fn consume_updates(
                 let chat_id = m.peer_id().bot_api_dialog_id_unchecked();
                 remember_from_message(&ctx, &m, chat_id).await;
                 let msg = convert(&ctx, &m, chat_id);
+                if let Some(cache) = &ctx.history_cache { cache.update(&msg); }
                 if events.send(Event::MessageChanged(msg)).await.is_err() {
                     return;
                 }
@@ -1574,23 +1633,21 @@ async fn consume_updates(
                     by_chat.entry(c).or_default().push(id);
                 }
                 for (chat_id, msg_ids) in by_chat {
+                    if let Some(cache) = &ctx.history_cache { cache.delete(chat_id, &msg_ids); }
                     if events.send(Event::MessageDeleted { chat_id, msg_ids }).await.is_err() {
                         return;
                     }
                 }
             }
             Ok(Update::Raw(raw)) => {
-                if let Some((chat_id, name)) = typing_from_raw(&ctx, &raw.raw) {
-                    if events.send(Event::Typing { chat_id, name }).await.is_err() {
+                if let Some((chat_id, name)) = typing_from_raw(&ctx, &raw.raw)
+                    && events.send(Event::Typing { chat_id, name }).await.is_err() {
                         return;
                     }
-                }
-                if let tl::enums::Update::MessageReactions(u) = &raw.raw {
-                    if let Some(msg) = refetch_for_reactions(&client, &ctx, u).await {
-                        if events.send(Event::MessageChanged(msg)).await.is_err() {
-                            return;
-                        }
-                    }
+                if let tl::enums::Update::MessageReactions(u) = &raw.raw
+                    && let Some(msg) = refetch_for_reactions(&client, &ctx, u).await {
+                    if let Some(cache) = &ctx.history_cache { cache.update(&msg); }
+                    if events.send(Event::MessageChanged(msg)).await.is_err() { return; }
                 }
                 // Voice calls: route to the single-owner actor, don't emit directly.
                 match &raw.raw {
@@ -1603,9 +1660,8 @@ async fn consume_updates(
                     _ => {}
                 }
                 if let Some(ev) = event_from_raw(&ctx, &raw.raw) {
-                    if events.send(ev).await.is_err() {
-                        return;
-                    }
+                    cache_event(&ctx, &ev);
+                    if events.send(ev).await.is_err() { return; }
                 }
             }
             Ok(_) => {}
@@ -1787,8 +1843,8 @@ fn media_info(media: Option<&Media>, date: DateTime<Local>, edited: Option<DateT
                 mi.doc_name = Some(d.name().filter(|n| !n.is_empty()).unwrap_or("file").to_string());
             }
             mi.round = round;
-            if audio {
-                if let Some(tl::enums::Document::Document(doc)) = d.raw.document.as_ref() {
+            if audio
+                && let Some(tl::enums::Document::Document(doc)) = d.raw.document.as_ref() {
                     for attr in &doc.attributes {
                         if let tl::enums::DocumentAttribute::Audio(a) = attr {
                             mi.audio_title = a.title.clone().filter(|t| !t.is_empty());
@@ -1796,7 +1852,6 @@ fn media_info(media: Option<&Media>, date: DateTime<Local>, edited: Option<DateT
                         }
                     }
                 }
-            }
             mi.doc_size = d.size().map(|s| s as u64);
             mi.duration = d.duration().map(|s| s.round() as u32);
             mi.photo_size = d.resolution();
@@ -2021,10 +2076,10 @@ async fn download_avatar(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Resul
     let Some(photo_id) = ctx.photos.lock().unwrap().get(&chat_id).copied() else {
         return Ok(None);
     };
-    let dir = paths::avatar_dir();
+    let dir = ctx.avatar_dir();
     private_dir(&dir)?;
     let path = dir.join(format!("{chat_id}_{photo_id}.jpg"));
-    if path.exists() {
+    if complete_file(&path) {
         return Ok(Some(path));
     }
     let peer = input_peer(ctx, chat_id)?;
@@ -2035,11 +2090,7 @@ async fn download_avatar(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Resul
             photo_id,
         }),
     };
-    client
-        .download_media(&location, &path)
-        .await
-        .map_err(|e| format!("avatar download failed: {e}"))?;
-    chmod_600(&path);
+    download_complete(client, ctx, &location, &path, false).await?;
     Ok(Some(path))
 }
 
@@ -2055,9 +2106,8 @@ fn webp_to_png(path: &std::path::Path, png: &std::path::Path) -> Result<(), TgEr
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
     let img = reader.decode().map_err(|e| format!("sticker decode failed: {e}"))?;
-    img.save(png).map_err(|e| e.to_string())?;
+    img.save_with_format(png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
     chmod_600(png);
-    let _ = std::fs::remove_file(path);
     Ok(())
 }
 
@@ -2066,7 +2116,7 @@ async fn download_document_by_id(client: &Client, ctx: &Arc<Ctx>, id: i64, stick
     let Some(doc) = ctx.documents.lock().unwrap().get(&id).cloned() else {
         return Err("unknown sticker or gif — open the picker again".into());
     };
-    let dir = paths::media_dir();
+    let dir = ctx.media_dir();
     private_dir(&dir)?;
     let mime = doc.mime_type.as_str();
     if sticker && !matches!(mime, "image/webp" | "image/png" | "application/x-tgsticker" | "video/webm") {
@@ -2083,10 +2133,9 @@ async fn download_document_by_id(client: &Client, ctx: &Arc<Ctx>, id: i64, stick
     };
     let stem = format!("doc_{id}");
     let final_path = dir.join(format!("{stem}.{}", if ext == "webp" { "png" } else { ext }));
-    if final_path.exists() {
+    if complete_file(&final_path) {
         return Ok(Some(final_path));
     }
-    let path = dir.join(format!("{stem}.{ext}"));
     let location = ChatPhoto {
         raw: tl::enums::InputFileLocation::InputDocumentFileLocation(tl::types::InputDocumentFileLocation {
             id: doc.id,
@@ -2095,14 +2144,7 @@ async fn download_document_by_id(client: &Client, ctx: &Arc<Ctx>, id: i64, stick
             thumb_size: String::new(),
         }),
     };
-    client
-        .download_media(&location, &path)
-        .await
-        .map_err(|e| format!("download failed: {e}"))?;
-    chmod_600(&path);
-    if ext == "webp" {
-        webp_to_png(&path, &final_path)?;
-    }
+    download_complete(client, ctx, &location, &final_path, ext == "webp").await?;
     Ok(Some(final_path))
 }
 
@@ -2149,6 +2191,19 @@ async fn delete_messages(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, ids: &[i
 }
 
 async fn forward_messages(client: &Client, ctx: &Arc<Ctx>, from_chat: i64, ids: &[i32], to_chat: i64) -> Result<Vec<Msg>, TgError> {
+    if let Some((_, topic)) = split_topic_chat_id(to_chat) {
+        let random_ids: Vec<i64> = ids.iter().map(|_| random_id()).collect();
+        let updates = client.invoke(&tl::functions::messages::ForwardMessages {
+            silent: false, background: false, with_my_score: false, drop_author: false,
+            drop_media_captions: false, noforwards: false, allow_paid_floodskip: false,
+            from_peer: input_peer(ctx, from_chat)?, id: ids.to_vec(), random_id: random_ids.clone(),
+            to_peer: input_peer(ctx, to_chat)?, top_msg_id: Some(topic), reply_to: None,
+            schedule_date: None, schedule_repeat_period: None, send_as: None, quick_reply_shortcut: None,
+            effect: None, video_timestamp: None, allow_paid_stars: None, suggested_post: None,
+        }).await.map_err(|e| format!("forward failed: {e}"))?;
+        let sent: Vec<i32> = random_ids.into_iter().filter_map(|id| sent_message_id(&updates, id)).collect();
+        return get_messages(client, ctx, to_chat, &sent).await;
+    }
     let from = ctx.peer(from_chat)?;
     let to = ctx.peer(to_chat)?;
     let sent = client
@@ -2166,6 +2221,9 @@ async fn search_messages(
     before_id: Option<i32>,
     filter: Option<tl::enums::MessagesFilter>,
 ) -> Result<Vec<Msg>, TgError> {
+    if split_topic_chat_id(chat_id).is_some() {
+        return search_topic(client, ctx, chat_id, query, before_id, filter, 0).await;
+    }
     let peer = ctx.peer(chat_id)?;
     let mut iter = client.search_messages(peer).query(query).limit(50);
     if let Some(f) = filter {
@@ -2181,6 +2239,36 @@ async fn search_messages(
             break;
         }
     }
+    Ok(out)
+}
+
+async fn search_topic(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, query: &str,
+    before_id: Option<i32>, filter: Option<tl::enums::MessagesFilter>, max_date: i32,
+) -> Result<Vec<Msg>, TgError> {
+    let (forum, topic) = real_chat(chat_id);
+    let mut offset = before_id.unwrap_or(0);
+    let mut out = Vec::new();
+    loop {
+        let response = client.invoke(&tl::functions::messages::Search {
+            peer: input_peer(ctx, forum)?, q: query.to_string(), from_id: None, saved_peer_id: None,
+            saved_reaction: None, top_msg_id: topic.filter(|id| *id != 1),
+            filter: filter.clone().unwrap_or(tl::enums::MessagesFilter::InputMessagesFilterEmpty),
+            min_date: 0, max_date, offset_id: offset, add_offset: 0,
+            limit: 50, max_id: 0, min_id: 0, hash: 0,
+        }).await.map_err(|e| format!("topic search failed: {e}"))?;
+        let ids: Vec<i32> = raw_messages(response).iter().filter_map(raw_message_id).collect();
+        if ids.is_empty() { break; }
+        let next = *ids.iter().min().unwrap();
+        let mut messages = get_messages(client, ctx, forum, &ids).await?;
+        messages.retain(|m| super::msg_in_chat(m, chat_id));
+        messages.sort_by_key(|m| std::cmp::Reverse(m.id));
+        out.extend(messages);
+        // General is not a reply thread: paginate the forum's search and
+        // filter out explicit topics, rather than searching replies to ID 1.
+        if out.len() >= 50 || topic != Some(1) || next == offset { break; }
+        offset = next;
+    }
+    out.truncate(50);
     Ok(out)
 }
 
@@ -2227,8 +2315,8 @@ async fn search_chats(client: &Client, ctx: &Arc<Ctx>, query: &str) -> Result<Ve
         }
     }
     // Exact public username.
-    if !q.contains(char::is_whitespace) {
-        if let Ok(Some(peer)) = client.resolve_username(q).await {
+    if !q.contains(char::is_whitespace)
+        && let Ok(Some(peer)) = client.resolve_username(q).await {
             let id = peer.id().bot_api_dialog_id_unchecked();
             if !out.iter().any(|c| c.id == id) {
                 let facts = describe_peer(&peer);
@@ -2250,7 +2338,6 @@ async fn search_chats(client: &Client, ctx: &Arc<Ctx>, query: &str) -> Result<Ve
                 });
             }
         }
-    }
     Ok(out)
 }
 
@@ -2263,6 +2350,9 @@ async fn peer_ref_of(peer: &Peer) -> Result<Option<PeerRef>, TgError> {
 }
 
 async fn get_pinned_message(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<Option<Msg>, TgError> {
+    if split_topic_chat_id(chat_id).is_some() {
+        return search_messages(client, ctx, chat_id, "", None, Some(tl::enums::MessagesFilter::InputMessagesFilterPinned)).await.map(|mut m| m.drain(..).next());
+    }
     let peer = ctx.peer(chat_id)?;
     let m = client.get_pinned_message(peer).await.map_err(|e| e.to_string())?;
     Ok(m.map(|m| convert(ctx, &m, chat_id)))
@@ -2365,6 +2455,13 @@ fn dialog_peer(ctx: &Ctx, chat_id: i64) -> Result<tl::enums::InputDialogPeer, Tg
 }
 
 async fn set_pinned(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, pinned: bool) -> Result<(), TgError> {
+    if let Some((forum, topic)) = split_topic_chat_id(chat_id) {
+        client.invoke(&tl::functions::messages::UpdatePinnedForumTopic {
+            peer: input_peer(ctx, forum)?, topic_id: topic, pinned,
+        }).await.map_err(|e| format!("pin topic failed: {e}"))?;
+        let _ = ctx.events.try_send(Event::TopicsChanged { forum_id: forum });
+        return Ok(());
+    }
     client
         .invoke(&tl::functions::messages::ToggleDialogPin { pinned, peer: dialog_peer(ctx, chat_id)? })
         .await
@@ -2380,7 +2477,10 @@ async fn set_muted(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, mode: MuteMode
     };
     client
         .invoke(&tl::functions::account::UpdateNotifySettings {
-            peer: tl::enums::InputNotifyPeer::Peer(tl::types::InputNotifyPeer { peer: input_peer(ctx, chat_id)? }),
+            peer: match split_topic_chat_id(chat_id) {
+                Some((forum, topic)) => tl::enums::InputNotifyPeer::InputNotifyForumTopic(tl::types::InputNotifyForumTopic { peer: input_peer(ctx, forum)?, top_msg_id: topic }),
+                None => tl::enums::InputNotifyPeer::Peer(tl::types::InputNotifyPeer { peer: input_peer(ctx, chat_id)? }),
+            },
             settings: tl::enums::InputPeerNotifySettings::Settings(tl::types::InputPeerNotifySettings {
                 show_previews: None,
                 silent: None,
@@ -2401,6 +2501,7 @@ async fn set_muted(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, mode: MuteMode
 }
 
 async fn set_archived(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, archived: bool) -> Result<(), TgError> {
+    require_dialog(chat_id, "archive")?;
     client
         .invoke(&tl::functions::folders::EditPeerFolders {
             folder_peers: vec![tl::enums::InputFolderPeer::Peer(tl::types::InputFolderPeer {
@@ -2418,6 +2519,7 @@ async fn set_archived(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, archived: b
 }
 
 async fn mark_unread(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, unread: bool) -> Result<(), TgError> {
+    require_dialog(chat_id, "mark unread")?;
     client
         .invoke(&tl::functions::messages::MarkDialogUnread { unread, parent_peer: None, peer: dialog_peer(ctx, chat_id)? })
         .await
@@ -2426,11 +2528,35 @@ async fn mark_unread(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, unread: bool
 }
 
 async fn delete_chat(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<(), TgError> {
+    if let Some((forum, topic)) = split_topic_chat_id(chat_id) {
+        if topic == 1 { return Err("The General topic cannot be deleted.".into()); }
+        loop {
+            let tl::enums::messages::AffectedHistory::History(result) = client.invoke(&tl::functions::messages::DeleteTopicHistory {
+                peer: input_peer(ctx, forum)?, top_msg_id: topic,
+            }).await.map_err(|e| format!("delete topic failed: {e}"))?;
+            if result.offset == 0 { break; }
+        }
+        let _ = ctx.events.try_send(Event::TopicsChanged { forum_id: forum });
+        return Ok(());
+    }
     let peer = ctx.peer(chat_id)?;
     client.delete_dialog(peer).await.map_err(|e| format!("delete chat failed: {e}"))
 }
 
 async fn clear_history(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<(), TgError> {
+    if let Some((forum, topic)) = split_topic_chat_id(chat_id) {
+        let mut before = None;
+        loop {
+            let page = get_topic_history(client, ctx, forum, topic, before).await?;
+            let Some(oldest) = page.first().map(|m| m.id) else { break };
+            if before.is_some_and(|id| oldest >= id) { break; }
+            let ids: Vec<i32> = page.iter().filter(|m| m.id != topic && super::msg_in_chat(m, chat_id)).map(|m| m.id).collect();
+            if !ids.is_empty() { delete_messages(client, ctx, chat_id, &ids).await?; }
+            before = Some(oldest);
+        }
+        let _ = ctx.events.try_send(Event::TopicsChanged { forum_id: forum });
+        return Ok(());
+    }
     let peer = ctx.peer(chat_id)?;
     if peer.id.kind() == grammers_client::session::types::PeerKind::Channel {
         client
@@ -2454,12 +2580,12 @@ async fn clear_history(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<
     }
 }
 
-async fn save_draft(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, text: &str) -> Result<(), TgError> {
+async fn save_draft(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, text: &str, reply_to: Option<i32>) -> Result<(), TgError> {
     client
         .invoke(&tl::functions::messages::SaveDraft {
             no_webpage: false,
             invert_media: false,
-            reply_to: None,
+            reply_to: reply_header(reply_to, real_chat(chat_id).1),
             peer: input_peer(ctx, chat_id)?,
             message: text.to_string(),
             entities: None,
@@ -2644,7 +2770,7 @@ async fn get_contacts(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<Contact>, T
         }
         out.push(Contact { user_id: id, name, username, phone, presence, has_photo, story_ring: StoryRing::None });
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     Ok(out)
 }
 
@@ -2714,12 +2840,17 @@ async fn create_group(client: &Client, ctx: &Arc<Ctx>, title: &str, user_ids: &[
 }
 
 async fn get_folders(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<Folder>, TgError> {
+    // Folder predicates need a complete dialog snapshot. Concurrent startup
+    // requests wait for the same load, instead of evaluating an empty cache.
+    let mut loaded = ctx.dialogs_loaded.lock().await;
+    if !*loaded { fetch_dialogs(client, ctx).await?; *loaded = true; }
+    let meta = ctx.meta.lock().unwrap().clone();
+    drop(loaded);
     let r = client
         .invoke(&tl::functions::messages::GetDialogFilters {})
         .await
         .map_err(|e| e.to_string())?;
     let tl::enums::messages::DialogFilters::Filters(f) = r;
-    let meta = ctx.meta.lock().unwrap().clone();
     let mut out = Vec::new();
     for filter in f.filters {
         let (id, title, pinned, include, exclude, flags) = match filter {
@@ -2770,6 +2901,12 @@ fn real_chat(chat_id: i64) -> (i64, Option<i32>) {
     }
 }
 
+fn require_dialog(chat_id: i64, action: &str) -> Result<(), TgError> {
+    if split_topic_chat_id(chat_id).is_some() {
+        Err(format!("Telegram does not support {action} for a single topic. Open the forum to change the whole chat."))
+    } else { Ok(()) }
+}
+
 /// Sends need a topic header for every topic but General (1).
 fn in_topic(chat_id: i64) -> bool {
     matches!(real_chat(chat_id), (_, Some(t)) if t != 1)
@@ -2811,7 +2948,7 @@ fn reply_header(reply_to: Option<i32>, topic: Option<i32>) -> Option<tl::enums::
     let reply_to_msg_id = reply_to.or(topic)?;
     Some(tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
         reply_to_msg_id,
-        top_msg_id: topic,
+        top_msg_id: topic.filter(|id| reply_to.is_some_and(|reply| reply != *id)),
         reply_to_peer_id: None,
         quote_text: None,
         quote_entities: None,
@@ -3036,11 +3173,11 @@ async fn edit_media(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, msg_id: i32, 
 
 async fn emit_poll_updates(ctx: &Ctx, updates: &tl::enums::Updates) {
     for u in updates_list(updates) {
-        if let tl::enums::Update::MessagePoll(_) = u {
-            if let Some(ev) = event_from_raw(ctx, u) {
+        if let tl::enums::Update::MessagePoll(_) = u
+            && let Some(ev) = event_from_raw(ctx, u) {
+                cache_event(ctx, &ev);
                 let _ = ctx.events.send(ev).await;
             }
-        }
     }
 }
 
@@ -3173,6 +3310,7 @@ fn raw_message_chat_id(m: &tl::enums::Message) -> Option<i64> {
 /// A `Msg` straight from a raw message (scheduled history, topic previews):
 /// no sender resolution beyond "You"/empty, no reactions, no archive.
 fn convert_raw(ctx: &Ctx, raw: &tl::types::Message, chat_id: i64) -> Msg {
+    let (chat_id, _) = real_chat(chat_id);
     let date = Local.timestamp_opt(raw.date as i64, 0).single().unwrap_or_else(Local::now);
     let edited = raw.edit_date.and_then(|d| Local.timestamp_opt(d as i64, 0).single());
     let media = raw.media.clone().and_then(Media::from_raw);
@@ -3271,17 +3409,14 @@ async fn press_button(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, msg_id: i32
 // ----- forum topics -----
 
 async fn get_topics(client: &Client, ctx: &Arc<Ctx>, forum_id: i64) -> Result<Vec<Topic>, TgError> {
-    let r = client
-        .invoke(&tl::functions::messages::GetForumTopics {
-            peer: input_peer(ctx, forum_id)?,
-            q: None,
-            offset_date: 0,
-            offset_id: 0,
-            offset_topic: 0,
-            limit: 100,
-        })
-        .await
-        .map_err(|e| format!("topics failed: {e}"))?;
+    let mut all = Vec::new();
+    let mut seen = HashSet::new();
+    let mut offset = (0, 0, 0);
+    loop {
+    let r = client.invoke(&tl::functions::messages::GetForumTopics {
+        peer: input_peer(ctx, forum_id)?, q: None, offset_date: offset.0,
+        offset_id: offset.1, offset_topic: offset.2, limit: 100,
+    }).await.map_err(|e| format!("topics failed: {e}"))?;
     let tl::enums::messages::ForumTopics::Topics(t) = r;
     ctx.forums.lock().unwrap().insert(forum_id);
     let previews: HashMap<i32, Msg> = t
@@ -3309,13 +3444,39 @@ async fn get_topics(client: &Client, ctx: &Arc<Ctx>, forum_id: i64) -> Result<Ve
                     last_time: last.map(|m| m.ts).or_else(|| Local.timestamp_opt(x.date as i64, 0).single()),
                     pinned: x.pinned,
                     closed: x.closed,
+                    muted: is_muted(&x.notify_settings, Local::now().timestamp() as i32),
+                    draft: draft_text(x.draft.as_ref()),
+                    draft_reply_to: x.draft.as_ref().and_then(|d| match d {
+                        tl::enums::DraftMessage::Message(d) => d.reply_to.as_ref().and_then(|r| match r {
+                            tl::enums::InputReplyTo::Message(r) => Some(r.reply_to_msg_id).filter(|id| *id != x.id),
+                            _ => None,
+                        }),
+                        _ => None,
+                    }),
+                    read_outbox_max_id: x.read_outbox_max_id,
                 })
             }
             tl::enums::ForumTopic::Deleted(_) => None,
         })
         .collect();
-    out.sort_by_key(|t| (std::cmp::Reverse(t.pinned), std::cmp::Reverse(t.last_time)));
-    Ok(out)
+    let next = t.topics.iter().rev().find_map(|topic| match topic {
+        tl::enums::ForumTopic::Topic(topic) => {
+            let date = if t.order_by_create_date { topic.date } else {
+                previews.get(&topic.top_message).map(|m| m.ts.timestamp() as i32).unwrap_or(topic.date)
+            };
+            Some((date, topic.top_message, topic.id))
+        }
+        _ => None,
+    });
+    let previous_len = all.len();
+    all.extend(out.drain(..).filter(|topic| seen.insert(topic.id)));
+    if all.len() >= t.count.max(0) as usize || all.len() == previous_len { break; }
+    let Some(next) = next else { break };
+    if next == offset { break; }
+    offset = next;
+    }
+    all.sort_by_key(|t| (std::cmp::Reverse(t.pinned), std::cmp::Reverse(t.last_time)));
+    Ok(all)
 }
 
 async fn create_topic(client: &Client, ctx: &Arc<Ctx>, forum_id: i64, title: &str) -> Result<Topic, TgError> {
@@ -3353,13 +3514,17 @@ async fn create_topic(client: &Client, ctx: &Arc<Ctx>, forum_id: i64, title: &st
 /// Stitches OpenStreetMap tiles into a `width`×`height` PNG centered on
 /// `point` (cached by rounded coordinates). Network trouble is `Ok(None)`.
 async fn download_map(ctx: &Arc<Ctx>, point: GeoPoint, zoom: u8, width: u32, height: u32, marker: bool) -> Result<Option<PathBuf>, TgError> {
+    if !point.lat.is_finite() || !point.lon.is_finite() || point.lat.abs() > 90.0 || point.lon.abs() > 180.0 {
+        return Err("Enter valid latitude and longitude".into());
+    }
     let zoom = zoom.clamp(1, 19);
     let width = width.clamp(16, 1024);
     let height = height.clamp(16, 1024);
-    let dir = paths::media_dir().join("maps");
+    let dir = ctx.media_dir().join("maps");
     private_dir(&dir)?;
     let path = dir.join(format!("{:.5}_{:.5}_{zoom}_{width}x{height}{}.png", point.lat, point.lon, if marker { "" } else { "-tile" }));
-    if path.exists() {
+    let _request = ctx.download_lock(&path).await;
+    if complete_file(&path) {
         return Ok(Some(path));
     }
     let n = (1u64 << zoom) as f64;
@@ -3372,34 +3537,51 @@ async fn download_map(ctx: &Arc<Ctx>, point: GeoPoint, zoom: u8, width: u32, hei
     let tx1 = ((left + width as f64 - 1.0) / 256.0).floor() as i64;
     let ty0 = (top / 256.0).floor() as i64;
     let ty1 = ((top + height as f64 - 1.0) / 256.0).floor() as i64;
-    let mut canvas = image::RgbaImage::from_pixel(width, height, image::Rgba([0xe0, 0xe0, 0xe0, 0xff]));
+    let mut fetches = tokio::task::JoinSet::new();
     for ty in ty0..=ty1 {
         for tx in tx0..=tx1 {
             let max = n as i64;
             let (wx, wy) = (tx.rem_euclid(max), ty);
-            if wy < 0 || wy >= max {
-                continue;
-            }
-            let url = format!("https://tile.openstreetmap.org/{zoom}/{wx}/{wy}.png");
-            let bytes = match ctx.http.get(&url).send().await {
-                Ok(r) if r.status().is_success() => match r.bytes().await {
-                    Ok(b) => b,
-                    Err(_) => return Ok(None),
-                },
-                _ => return Ok(None),
-            };
-            let Ok(tile) = image::load_from_memory(&bytes) else { return Ok(None) };
-            let tile = tile.to_rgba8();
-            let ox = (tx as f64 * 256.0 - left).round() as i64;
-            let oy = (ty as f64 * 256.0 - top).round() as i64;
-            for (px, py, pixel) in tile.enumerate_pixels() {
-                let x = ox + px as i64;
-                let y = oy + py as i64;
-                if x >= 0 && y >= 0 && (x as u32) < width && (y as u32) < height {
-                    canvas.put_pixel(x as u32, y as u32, *pixel);
-                }
-            }
+            if wy < 0 || wy >= max { continue; }
+            let ctx = ctx.clone();
+            let tile_path = dir.join(format!("tile-{zoom}-{wx}-{wy}.png"));
+            fetches.spawn(async move {
+                let _request = ctx.download_lock(&tile_path).await;
+                let fresh = std::fs::metadata(&tile_path).ok().and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() < 7 * 86400);
+                let bytes = if fresh {
+                    tokio::fs::read(&tile_path).await.map_err(|e| e.to_string())?
+                } else {
+                    let _slot = ctx.download_slots.acquire().await.map_err(|e| e.to_string())?;
+                    let url = format!("https://tile.openstreetmap.org/{zoom}/{wx}/{wy}.png");
+                    let mut response = ctx.http.get(url).send().await.map_err(|_| "Map download failed; try again".to_string())?
+                        .error_for_status().map_err(|_| "Map tiles unavailable; try again".to_string())?;
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = response.chunk().await.map_err(|_| "Map download interrupted".to_string())? {
+                        if bytes.len() + chunk.len() > 1024 * 1024 { return Err("Map tile is too large".to_string()); }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    bytes
+                };
+                Ok::<_, String>((tx, ty, bytes, tile_path, !fresh))
+            });
         }
+    }
+    let mut tiles = Vec::new();
+    while let Some(result) = fetches.join_next().await {
+        tiles.push(result.map_err(|e| e.to_string())??);
+    }
+    // Decode, stitch and encode away from Tokio's network/update workers.
+    let path = tokio::task::spawn_blocking(move || -> Result<PathBuf, String> {
+    let mut canvas = image::RgbaImage::from_pixel(width, height, image::Rgba([0xe0, 0xe0, 0xe0, 0xff]));
+    for (tx, ty, bytes, tile_path, save) in tiles {
+        let reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), image::ImageFormat::Png);
+        if reader.into_dimensions().map_err(|_| "Invalid map tile")? != (256, 256) { return Err("Invalid map tile size".into()); }
+        let tile = image::load_from_memory(&bytes).map_err(|_| "Invalid map tile")?.to_rgba8();
+        if save { crate::storage::atomic_write(&tile_path, &bytes).map_err(|e| e.to_string())?; }
+        let ox = (tx as f64 * 256.0 - left).round() as i64;
+        let oy = (ty as f64 * 256.0 - top).round() as i64;
+        image::imageops::overlay(&mut canvas, &tile, ox, oy);
     }
     let (mx, my) = (width as i32 / 2, height as i32 / 2);
     for y in (my - 9).max(0)..(my + 9).min(height as i32) {
@@ -3415,8 +3597,11 @@ async fn download_map(ctx: &Arc<Ctx>, point: GeoPoint, zoom: u8, width: u32, hei
             }
         }
     }
-    canvas.save(&path).map_err(|e| e.to_string())?;
-    chmod_600(&path);
+    let pending = crate::storage::PendingFile::new(&path).map_err(|e| e.to_string())?;
+    canvas.save_with_format(pending.path(), image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    pending.commit(&path).map_err(|e| e.to_string())?;
+    Ok(path)
+    }).await.map_err(|e| e.to_string())??;
     Ok(Some(path))
 }
 
@@ -3424,12 +3609,11 @@ async fn download_map(ctx: &Arc<Ctx>, point: GeoPoint, zoom: u8, width: u32, hei
 
 fn peer_name(users: &[tl::enums::User], chats: &[tl::enums::Chat], chat_id: i64) -> (String, bool) {
     for u in users {
-        if let tl::enums::User::User(u) = u {
-            if u.id == chat_id {
+        if let tl::enums::User::User(u) = u
+            && u.id == chat_id {
                 let (name, _, _, _, has_photo, _) = user_facts(u);
                 return (name, has_photo);
             }
-        }
     }
     for c in chats {
         match c {
@@ -3495,24 +3679,7 @@ async fn fetch_all_stories(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<StoryP
     }
     peers.sort_by_key(|p| (std::cmp::Reverse(p.unread), p.name.to_lowercase()));
     *ctx.story_rings.lock().unwrap() = rings;
-    *ctx.stories_fetched.lock().unwrap() = Some(std::time::Instant::now());
     Ok(peers)
-}
-
-/// Refreshes `ctx.story_rings` at most every 5 minutes (`force` ignores the age).
-async fn refresh_story_rings(client: &Client, ctx: &Arc<Ctx>, force: bool) {
-    let fresh = ctx
-        .stories_fetched
-        .lock()
-        .unwrap()
-        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(300));
-    if fresh && !force {
-        return;
-    }
-    if let Err(e) = fetch_all_stories(client, ctx).await {
-        eprintln!("omarchygram: stories unavailable: {e}");
-        *ctx.stories_fetched.lock().unwrap() = Some(std::time::Instant::now());
-    }
 }
 
 async fn get_story_peers(client: &Client, ctx: &Arc<Ctx>) -> Result<Vec<StoryPeer>, TgError> {
@@ -3580,14 +3747,13 @@ async fn download_story(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, story_id:
         Media::Document(_) => "mp4",
         _ => return Ok(None),
     };
-    let dir = paths::media_dir();
+    let dir = ctx.media_dir();
     private_dir(&dir)?;
-    let path = dir.join(format!("story_{}_{story_id}.{ext}", chat_id.unsigned_abs()));
-    if path.exists() {
+    let path = dir.join(format!("story_{chat_id}_{story_id}.{ext}"));
+    if complete_file(&path) {
         return Ok(Some(path));
     }
-    client.download_media(&media, &path).await.map_err(|e| format!("download failed: {e}"))?;
-    chmod_600(&path);
+    download_complete(client, ctx, &media, &path, false).await?;
     Ok(Some(path))
 }
 
@@ -3596,7 +3762,6 @@ async fn mark_stories_seen(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, up_to_
         .invoke(&tl::functions::stories::ReadStories { peer: input_peer(ctx, chat_id)?, max_id: up_to_id })
         .await
         .map_err(|e| format!("read stories failed: {e}"))?;
-    *ctx.stories_fetched.lock().unwrap() = None;
     let _ = ctx.events.send(Event::StoriesChanged).await;
     Ok(())
 }
@@ -3734,10 +3899,7 @@ fn event_from_raw(ctx: &Ctx, u: &tl::enums::Update) -> Option<Event> {
         U::DeleteScheduledMessages(x) => Event::ScheduledChanged { chat_id: peer_chat_id(&x.peer) },
         U::PinnedForumTopic(x) => Event::TopicsChanged { forum_id: peer_chat_id(&x.peer) },
         U::PinnedForumTopics(x) => Event::TopicsChanged { forum_id: peer_chat_id(&x.peer) },
-        U::Story(_) | U::ReadStories(_) => {
-            *ctx.stories_fetched.lock().unwrap() = None;
-            Event::StoriesChanged
-        }
+        U::Story(_) | U::ReadStories(_) => Event::StoriesChanged,
         U::ReadHistoryOutbox(x) => Event::ReadOutbox { chat_id: peer_chat_id(&x.peer), max_id: x.max_id },
         U::ReadChannelOutbox(x) => Event::ReadOutbox { chat_id: -1_000_000_000_000 - x.channel_id, max_id: x.max_id },
         U::ReadHistoryInbox(x) => Event::ReadInbox { chat_id: peer_chat_id(&x.peer), max_id: x.max_id },

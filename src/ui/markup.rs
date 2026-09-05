@@ -120,7 +120,7 @@ fn render_impl(
 
     let mut out = String::new();
     let mut active: Vec<SafeSpan<'_>> = Vec::new();
-    for offset in 0..char_count {
+    for (offset, character) in chars.iter().copied().enumerate().take(char_count) {
         let desired = safe
             .iter()
             .filter(|item| item.span.start <= offset && offset < item.span.end)
@@ -138,7 +138,7 @@ fn render_impl(
             out.push_str(&open_tag(item, revealed, code_background));
         }
         active = desired;
-        escape_char(chars[offset], &mut out);
+        escape_char(character, &mut out);
     }
     for item in active.iter().rev() {
         out.push_str(&close_tag(item, revealed, code_background));

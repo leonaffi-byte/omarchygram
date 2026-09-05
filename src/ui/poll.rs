@@ -50,7 +50,7 @@ fn render(
     card: &gtk::Box,
     poll: &Poll,
     msg_id: i32,
-    action: &Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    action: &crate::ui::CallbackSlot<dyn Fn(MessageAction)>,
 ) {
     while let Some(child) = card.first_child() {
         card.remove(&child);
@@ -179,11 +179,10 @@ fn render(
 
     card.append(&label(&footer_line(poll), "omg-poll-footer"));
 
-    if poll.quiz && (poll.voted || poll.closed) {
-        if let Some(solution) = &poll.solution {
+    if poll.quiz && (poll.voted || poll.closed)
+        && let Some(solution) = &poll.solution {
             card.append(&label(solution, "omg-poll-solution"));
         }
-    }
 
     if poll.voted && !poll.closed && !poll.quiz {
         let retract = gtk::Button::with_label("Retract vote");
@@ -205,7 +204,7 @@ fn render(
     card.append(&error);
 }
 
-pub fn build(message: &Msg, action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>) -> gtk::Widget {
+pub fn build(message: &Msg, action: crate::ui::CallbackSlot<dyn Fn(MessageAction)>) -> gtk::Widget {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
     card.add_css_class("omg-poll");
     if let Some(poll) = &message.poll {
@@ -218,7 +217,7 @@ pub fn update(
     widget: &gtk::Widget,
     poll: &Poll,
     msg_id: i32,
-    action: &Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    action: &crate::ui::CallbackSlot<dyn Fn(MessageAction)>,
 ) {
     if let Some(card) = widget.downcast_ref::<gtk::Box>() {
         render(card, poll, msg_id, action);

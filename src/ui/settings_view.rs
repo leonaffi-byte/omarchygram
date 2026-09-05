@@ -27,6 +27,7 @@ use super::keys_view::KeysView;
 pub const PAGE_NAMES: &[&str] = &[
     "account",
     "appearance",
+    "messaging",
     "timestamps",
     "privacy",
     "calls",
@@ -62,13 +63,14 @@ struct AiKeyRow {
 /// changes are reflected via `store.on_change`.
 pub struct SettingsView {
     pub widget: gtk::Box,
-    on_close: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-    on_logout: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    on_close: crate::ui::CallbackSlot<dyn Fn()>,
+    on_logout: crate::ui::CallbackSlot<dyn Fn()>,
     syncing: Rc<Cell<bool>>,
     switches: Rc<RefCell<Vec<(gtk::Switch, SwitchGetter)>>>,
     entries: Rc<RefCell<Vec<(gtk::Entry, EntryGetter)>>>,
-    dropdowns: Rc<RefCell<Vec<(gtk::DropDown, &'static [&'static str], DropGetter)>>>,
+    dropdowns: Rc<RefCell<Vec<DropdownBinding>>>,
     stack: gtk::Stack,
+    search: gtk::SearchEntry,
     keys_view: KeysView,
     tg: Rc<RefCell<Option<Tg>>>,
     local: LocalServices,
@@ -119,7 +121,12 @@ impl SettingsView {
         title.set_halign(gtk::Align::Start);
         title.set_hexpand(true);
         title_row.append(&title);
+        let search = gtk::SearchEntry::new();
+        search.set_placeholder_text(Some("Search settings"));
+        search.set_width_chars(18);
+        title_row.append(&search);
         let close = gtk::Button::with_label("Esc");
+        close.set_tooltip_text(Some("Close settings (Esc)"));
         close.add_css_class("omg-bar-close");
         title_row.append(&close);
         widget.append(&title_row);
@@ -150,6 +157,7 @@ impl SettingsView {
             entries: Rc::new(RefCell::new(Vec::new())),
             dropdowns: Rc::new(RefCell::new(Vec::new())),
             stack,
+            search: search.clone(),
             keys_view,
             tg: Rc::new(RefCell::new(None)),
             local: LocalServices::spawn(),
@@ -186,6 +194,7 @@ impl SettingsView {
 
         view.build_account_page(&initial);
         view.build_appearance_page(&store, &initial);
+        view.build_messaging_page(&store, &initial);
         view.build_timestamps_page(&store, &initial);
         view.build_privacy_page(&store, &initial);
         view.build_calls_page(&store, &initial);
@@ -194,6 +203,7 @@ impl SettingsView {
         view.build_keyboard_page();
         view.build_animations_page(&store, &effects, &initial);
         view.stack.set_visible_child_name("account");
+        install_settings_search(&search, &view.stack);
 
         {
             let on_close = view.on_close.clone();
@@ -273,6 +283,7 @@ impl SettingsView {
 
     fn add_page(&self, name: &str, title: &str) -> gtk::Box {
         let column = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        column.set_valign(gtk::Align::Start);
         column.set_margin_start(16);
         column.set_margin_end(16);
         column.set_margin_top(8);
@@ -280,6 +291,10 @@ impl SettingsView {
         let scroll = gtk::ScrolledWindow::new();
         scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         scroll.set_vexpand(true);
+        scroll.set_max_content_width(720);
+        scroll.set_propagate_natural_width(true);
+        scroll.set_halign(gtk::Align::Center);
+        scroll.set_hexpand(true);
         scroll.set_child(Some(&column));
         self.stack.add_titled(&scroll, Some(name), title);
         column
@@ -366,36 +381,61 @@ impl SettingsView {
         let appearance = self.add_section(&page, "APPEARANCE");
         self.add_switch(
             store,
-            &appearance,
-            "Show avatars",
-            "Show profile photos and initials in the chat list.",
+            &appearance, ("Show avatars", "Show profile photos and initials in the chat list."),
             initial.ui.show_avatars,
             |s, v| s.ui.show_avatars = v,
             |s| s.ui.show_avatars,
         );
         self.add_switch(
             store,
-            &appearance,
-            "Compact chat list",
-            "56px chat rows instead of 64px.",
+            &appearance, ("Compact chat list", "Compact: 56 px rows. Comfortable: 64 px rows. Text stays the same size."),
             initial.ui.compact_list,
             |s, v| s.ui.compact_list = v,
             |s| s.ui.compact_list,
         );
+        self.add_dropdown(store, &appearance, "Text size", "Change text throughout Omarchygram. Monitor scaling still applies.",
+            &["Small · 85%", "Default · 100%", "Large · 115%", "Larger · 130%", "Largest · 150%"],
+            &["85", "100", "115", "130", "150"], &initial.ui.text_scale.to_string(),
+            |s, value| s.ui.text_scale = value.parse().unwrap_or(100), |s| s.ui.text_scale.to_string());
+        let preview = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+        preview.set_valign(gtk::Align::Start);
+        for (name, height) in [("Comfortable", 64), ("Compact", 56)] {
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            let title = gtk::Label::new(Some(name));
+            column.append(&title);
+            let sample = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            sample.add_css_class("omg-density-preview");
+            sample.set_valign(gtk::Align::Start);
+            sample.set_size_request(176, height * 2);
+            for label in ["Marta\nSee you tomorrow", "Design group\n3 unread messages"] {
+                let label = gtk::Label::new(Some(label)); label.set_size_request(-1, height); label.set_xalign(0.0); sample.append(&label);
+            }
+            column.append(&sample); preview.append(&column);
+        }
+        appearance.append(&preview);
+    }
+
+    fn build_messaging_page(&self, store: &Rc<SettingsStore>, initial: &Settings) {
+        let page = self.add_page("messaging", "Messaging");
+        let background = self.add_section(&page, "BACKGROUND");
         self.add_switch(
             store,
-            &appearance,
-            "Send on Enter",
-            "Off: Enter inserts a newline, Ctrl+Enter sends.",
+            &background, ("Keep running when the window closes", "Messages and call notifications continue. Reopen from the launcher; Quit or Ctrl+Q exits."),
+            initial.ui.keep_running,
+            |s, v| s.ui.keep_running = v,
+            |s| s.ui.keep_running,
+        );
+        let messaging = self.add_section(&page, "MESSAGING");
+        self.add_switch(
+            store,
+            &messaging, ("Send on Enter", "Off: Enter inserts a newline, Ctrl+Enter sends."),
             initial.ui.send_on_enter,
             |s, v| s.ui.send_on_enter = v,
             |s| s.ui.send_on_enter,
         );
         self.add_switch(
             store,
-            &appearance,
-            "Markdown formatting on send",
-            "Parse **bold** etc. when sending; off sends text literally.",
+            &messaging, ("Markdown formatting on send", "Parse **bold** etc. when sending; off sends text literally."),
             initial.ui.markdown_send,
             |s, v| s.ui.markdown_send = v,
             |s| s.ui.markdown_send,
@@ -407,18 +447,14 @@ impl SettingsView {
         let timestamps = self.add_section(&page, "TIMESTAMPS");
         self.add_switch(
             store,
-            &timestamps,
-            "Show seconds",
-            "Message timestamps as HH:MM:SS instead of HH:MM.",
+            &timestamps, ("Show seconds", "Message timestamps as HH:MM:SS instead of HH:MM."),
             initial.show_seconds,
             |s, v| s.show_seconds = v,
             |s| s.show_seconds,
         );
         self.add_switch(
             store,
-            &timestamps,
-            "Header clock",
-            "Live ticking HH:MM:SS clock in the chat header.",
+            &timestamps, ("Header clock", "Live ticking HH:MM:SS clock in the chat header."),
             initial.header_clock || initial.animation("liveclock"),
             |s, v| {
                 s.header_clock = v;
@@ -426,12 +462,21 @@ impl SettingsView {
             },
             |s| s.header_clock || s.animation("liveclock"),
         );
+        self.add_dropdown(store, &timestamps, "Time style", "Choose a preset or edit the custom format below.",
+            &["Use seconds setting", "24-hour · 14:05", "12-hour · 02:05 PM", "Date + time · 05 Sep 14:05", "Custom"],
+            &["", "%H:%M", "%I:%M %p", "%d %b %H:%M", "custom"], time_preset(&initial.timestamp_format),
+            |s,v| { if v != "custom" { s.timestamp_format = v; } }, |s| time_preset(&s.timestamp_format).into());
+        let example = gtk::Label::new(None);
+        example.add_css_class("omg-small"); example.set_halign(gtk::Align::Start);
+        timestamps.append(&example);
+        let weak = example.downgrade();
+        store.on_change(move |settings| {
+            if let Some(example) = weak.upgrade() { example.set_label(&time_style_preview(settings.time_format())); }
+        });
+        example.set_label(&time_style_preview(initial.time_format()));
         self.add_entry(
             store,
-            &timestamps,
-            "Time format",
-            "strftime override for message timestamps; empty uses the toggles above.",
-            "%H:%M",
+            &timestamps, ("Custom time format", "Advanced: strftime syntax, such as %H:%M or %I:%M %p. Leave empty to use the seconds setting.", "%H:%M"),
             &initial.timestamp_format,
             |s, v| s.timestamp_format = v,
             |s| s.timestamp_format.clone(),
@@ -458,9 +503,7 @@ impl SettingsView {
 
         self.add_switch(
             store,
-            &calls,
-            "Ringtone for incoming calls",
-            "Play a ringtone while an incoming call is waiting.",
+            &calls, ("Ringtone for incoming calls", "Play a ringtone while an incoming call is waiting."),
             initial.calls.ringtone,
             |settings, value| settings.calls.ringtone = value,
             |settings| settings.calls.ringtone,
@@ -529,31 +572,57 @@ impl SettingsView {
         let privacy = self.add_section(&page, "PRIVACY");
         self.add_switch(
             store,
-            &privacy,
-            "Ghost mode",
-            "Don't send read receipts or online status while browsing.",
+            &privacy, ("Ghost mode", "Suppress read receipts and request offline status. Sending messages or using another Telegram client may still reveal activity."),
             initial.ghost_mode,
             |s, v| s.ghost_mode = v,
             |s| s.ghost_mode,
         );
         self.add_switch(
             store,
-            &privacy,
-            "Keep deleted messages",
-            "Keep messages others delete, shown struck through.",
+            &privacy, ("Keep deleted messages", "Show deleted messages saved in this account’s local archive. Only messages this app has received can be recovered."),
             initial.anti_delete,
             |s, v| s.anti_delete = v,
             |s| s.anti_delete,
         );
         self.add_switch(
             store,
-            &privacy,
-            "Keep edit history",
-            "Keep previous versions of edited messages.",
+            &privacy, ("Keep edit history", "Show earlier versions saved on this computer. Turning this off hides them; it does not erase the local archive."),
             initial.edit_history,
             |s, v| s.edit_history = v,
             |s| s.edit_history,
         );
+        let row = Self::add_row(&privacy, "Older local history", "Archives from earlier versions stay on disk. Import only if that archive belongs entirely to the account you are using now.");
+        row.set_orientation(gtk::Orientation::Vertical);
+        let import = gtk::Button::with_label("Import older history…");
+        import.set_halign(gtk::Align::Start);
+        row.append(&import);
+        let status = gtk::Label::new(None);
+        status.set_wrap(true); status.set_xalign(0.0); row.append(&status);
+        let tg = self.tg.clone();
+        let weak_status = status.downgrade();
+        import.connect_clicked(move |button| {
+            let Some(tg) = tg.borrow().clone() else { return };
+            let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+            let button = button.downgrade();
+            let status = weak_status.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let Ok(me) = tg.get_me().await else { return };
+                let dialog = gtk::AlertDialog::builder().modal(true)
+                    .message(format!("Import older history for {}?", me.name))
+                    .detail(format!("Account: {}. Only continue if the older archive contains this account's messages. Earlier versions did not record the account owner. Import adds missing messages and edit history, keeps current messages, and leaves the original file unchanged.", me.id))
+                    .buttons(["Cancel", "Import history"]).cancel_button(0).default_button(0).build();
+                if dialog.choose_future(Some(&window)).await != Ok(1) { return; }
+                if let Some(button) = button.upgrade() { button.set_sensitive(false); }
+                if let Some(status) = status.upgrade() { status.set_label("Importing local history…"); }
+                let result = tg.import_legacy_archive(me.id).await;
+                if let Some(button) = button.upgrade() { button.set_sensitive(true); }
+                if let Some(status) = status.upgrade() {
+                    status.set_label(&match result { Ok(count) => format!("Imported {count} messages. Reopen a chat to see its saved history."), Err(error) => error });
+                }
+            });
+        });
+        self.add_entry(store, &privacy, ("Place search provider", "Place names go to this provider only when you press Search. Default: Photon by komoot, using OpenStreetMap data. A private Photon server is also supported.", "https://photon.komoot.io/api"), &initial.media.place_search_url,
+            |s,value| s.media.place_search_url = value, |s| s.media.place_search_url.clone());
     }
 
     fn build_ai_page(&self, store: &Rc<SettingsStore>, initial: &Settings) {
@@ -561,18 +630,14 @@ impl SettingsView {
         let ai = self.add_section(&page, "AI");
         self.add_switch(
             store,
-            &ai,
-            "Enable AI features",
-            "AI chat and transcription commands.",
+            &ai, ("Enable AI features", "AI chat and transcription commands."),
             initial.ai.enabled,
             |s, v| s.ai.enabled = v,
             |s| s.ai.enabled,
         );
         self.add_switch(
             store,
-            &ai,
-            "Auto-transcribe voice",
-            "Transcribe voice messages automatically when they arrive.",
+            &ai, ("Auto-transcribe voice", "Transcribe voice messages automatically when they arrive."),
             initial.ai.transcribe_auto,
             |s, v| s.ai.transcribe_auto = v,
             |s| s.ai.transcribe_auto,
@@ -581,7 +646,7 @@ impl SettingsView {
             store,
             &ai,
             "Chat provider",
-            "Auto picks the best available provider.",
+            "Auto tries local Ollama first, then a cloud provider with a configured key. Text is sent to the selected provider.",
             CHAT_PROVIDER_LABELS,
             CHAT_PROVIDER_VALUES,
             &initial.ai.chat_provider,
@@ -592,7 +657,7 @@ impl SettingsView {
             store,
             &ai,
             "Transcribe provider",
-            "Auto picks the best available provider.",
+            "Auto tries local Whisper first, then Groq and OpenAI. Cloud transcription uploads the audio; pin a local provider to prevent fallback.",
             TRANSCRIBE_PROVIDER_LABELS,
             TRANSCRIBE_PROVIDER_VALUES,
             &initial.ai.transcribe_provider,
@@ -601,20 +666,14 @@ impl SettingsView {
         );
         self.add_entry(
             store,
-            &ai,
-            "Chat model",
-            "Model override for the chat provider; empty = provider default.",
-            "",
+            &ai, ("Chat model", "Model override for the chat provider; empty = provider default.", ""),
             &initial.ai.chat_model,
             |s, v| s.ai.chat_model = v,
             |s| s.ai.chat_model.clone(),
         );
         self.add_entry(
             store,
-            &ai,
-            "Ollama URL",
-            "Base URL of the local Ollama server.",
-            "",
+            &ai, ("Ollama URL", "Usually http://localhost:11434. A remote URL sends your text to that server.", ""),
             &initial.ai.ollama_url,
             |s, v| s.ai.ollama_url = v,
             |s| s.ai.ollama_url.clone(),
@@ -624,16 +683,19 @@ impl SettingsView {
         // the stored key; only Clear removes it. Values are never prefilled.
         let keys_section = self.add_section(&page, "API KEYS");
         for (provider, label) in AI_KEY_ROWS {
+            let field = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            field.add_css_class("omg-settings-row");
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             let name = gtk::Label::new(Some(label));
             name.set_halign(gtk::Align::Start);
             name.set_valign(gtk::Align::Center);
-            row.append(&name);
+            field.append(&name);
             let status = gtk::Label::new(Some("not set"));
             status.add_css_class("omg-auth-hint");
             status.set_valign(gtk::Align::Center);
-            row.append(&status);
+            field.append(&status);
             let entry = gtk::PasswordEntry::new();
+            entry.update_property(&[gtk::accessible::Property::Label(label)]);
             entry.set_show_peek_icon(true);
             entry.set_hexpand(true);
             entry.set_valign(gtk::Align::Center);
@@ -646,7 +708,8 @@ impl SettingsView {
             clear.add_css_class("omg-attach");
             clear.set_valign(gtk::Align::Center);
             row.append(&clear);
-            keys_section.append(&row);
+            field.append(&row);
+            keys_section.append(&field);
 
             {
                 let weak = self.weak_ai();
@@ -741,11 +804,10 @@ impl SettingsView {
             let weak = self.weak_ai();
             let store = Rc::downgrade(store);
             self.test_button.connect_clicked(move |_| {
-                if let Some(this) = weak.upgrade() {
-                    if let Some(store) = store.upgrade() {
+                if let Some(this) = weak.upgrade()
+                    && let Some(store) = store.upgrade() {
                         this.test_providers(&store);
                     }
-                }
             });
         }
     }
@@ -755,18 +817,14 @@ impl SettingsView {
         let os = self.add_section(&page, "OMARCHY ACTIONS");
         self.add_switch(
             store,
-            &os,
-            "Enable",
-            "Show the \"Omarchy\" virtual chat with named actions.",
+            &os, ("Enable", "Show the \"Omarchy\" virtual chat with named actions."),
             initial.os.enabled,
             |s, v| s.os.enabled = v,
             |s| s.os.enabled,
         );
         self.add_switch(
             store,
-            &os,
-            "Allow shell commands",
-            "Permit run <command> actions (each confirm-gated on the desktop).",
+            &os, ("Allow shell commands", "Run custom terminal commands from the Omarchy chat. Each command asks for confirmation."),
             initial.os.shell,
             |s, v| s.os.shell = v,
             |s| s.os.shell,
@@ -926,6 +984,8 @@ impl SettingsView {
 
     // ----- probe hooks (programmatic; no synthetic input) -----
 
+    pub fn probe_search(&self, text: &str) { self.search.set_text(text); self.search.emit_by_name::<()>("search-changed", &[]); }
+
     pub fn probe_show_page(&self, name: &str) {
         if name != "keyboard" {
             self.keys_view.cancel_capture();
@@ -1025,6 +1085,7 @@ impl SettingsView {
 
     fn add_section(&self, parent: &gtk::Box, title: &str) -> gtk::Box {
         let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        section.add_css_class("omg-settings-section");
         let label = gtk::Label::new(Some(title));
         label.add_css_class("omg-section");
         label.set_halign(gtk::Align::Start);
@@ -1035,17 +1096,21 @@ impl SettingsView {
 
     fn add_row(section: &gtk::Box, label: &str, description: &str) -> gtk::Box {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.add_css_class("omg-settings-row");
         let text = gtk::Box::new(gtk::Orientation::Vertical, 4);
         text.set_hexpand(true);
         text.set_valign(gtk::Align::Center);
         let name = gtk::Label::new(Some(label));
         name.set_halign(gtk::Align::Start);
+        name.set_wrap(true);
         text.append(&name);
         if !description.is_empty() {
             let hint = gtk::Label::new(Some(description));
             hint.add_css_class("omg-auth-hint");
             hint.set_halign(gtk::Align::Start);
             hint.set_wrap(true);
+            hint.set_max_width_chars(42);
+            hint.set_xalign(0.0);
             text.append(&hint);
         }
         row.append(&text);
@@ -1057,12 +1122,12 @@ impl SettingsView {
         &self,
         store: &Rc<SettingsStore>,
         section: &gtk::Box,
-        label: &str,
-        description: &str,
+        copy: (&str, &str),
         initial: bool,
         set: impl Fn(&mut Settings, bool) + 'static,
         get: impl Fn(&Settings) -> bool + 'static,
     ) {
+        let (label, description) = copy;
         let row = Self::add_row(section, label, description);
         let switch = gtk::Switch::new();
         switch.add_css_class("omg-switch");
@@ -1075,11 +1140,10 @@ impl SettingsView {
             let store = Rc::downgrade(store);
             let syncing = self.syncing.clone();
             switch.connect_state_set(move |_, state| {
-                if !syncing.get() {
-                    if let Some(store) = store.upgrade() {
+                if !syncing.get()
+                    && let Some(store) = store.upgrade() {
                         store.update(|settings| set(settings, state));
                     }
-                }
                 glib::Propagation::Proceed
             });
         }
@@ -1091,15 +1155,17 @@ impl SettingsView {
         &self,
         store: &Rc<SettingsStore>,
         section: &gtk::Box,
-        label: &str,
-        description: &str,
-        placeholder: &str,
+        copy: (&str, &str, &str),
         initial: &str,
         set: impl Fn(&mut Settings, String) + 'static,
         get: impl Fn(&Settings) -> String + 'static,
     ) {
+        let (label, description, placeholder) = copy;
         let row = Self::add_row(section, label, description);
+        row.set_orientation(gtk::Orientation::Vertical);
         let entry = gtk::Entry::new();
+        entry.set_hexpand(true);
+        entry.update_property(&[gtk::accessible::Property::Label(label)]);
         entry.set_valign(gtk::Align::Center);
         entry.set_width_chars(18);
         if !placeholder.is_empty() {
@@ -1112,12 +1178,11 @@ impl SettingsView {
             let store = Rc::downgrade(store);
             let syncing = self.syncing.clone();
             entry.connect_changed(move |entry| {
-                if !syncing.get() {
-                    if let Some(store) = store.upgrade() {
+                if !syncing.get()
+                    && let Some(store) = store.upgrade() {
                         let value = entry.text().to_string();
                         store.update(|settings| set(settings, value));
                     }
-                }
             });
         }
         row.append(&entry);
@@ -1167,9 +1232,9 @@ impl SettingsView {
     fn add_presets(&self, store: &Rc<SettingsStore>, section: &gtk::Box) {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         for (label, apply) in [
-            ("Purist (all off)", apply_purist as fn(&mut Settings)),
+            ("Off", apply_purist as fn(&mut Settings)),
             ("Subtle", apply_subtle as fn(&mut Settings)),
-            ("Full phosphor", apply_full_phosphor as fn(&mut Settings)),
+            ("Full", apply_full_phosphor as fn(&mut Settings)),
         ] {
             let button = gtk::Button::with_label(label);
             button.add_css_class("omg-attach");
@@ -1372,7 +1437,7 @@ struct AccountWeak {
     me_retry: glib::object::WeakRef<gtk::Button>,
     creds_status: glib::object::WeakRef<gtk::Label>,
     account_gen: std::rc::Weak<Cell<u64>>,
-    on_logout: std::rc::Weak<RefCell<Option<Rc<dyn Fn()>>>>,
+    on_logout: std::rc::Weak<crate::ui::CallbackCell<dyn Fn()>>,
     change_dialog: std::rc::Weak<RefCell<Option<glib::WeakRef<gtk::Window>>>>,
     change_form: std::rc::Weak<RefCell<Option<Rc<CredentialsForm>>>>,
     change_restart: std::rc::Weak<RefCell<Option<glib::WeakRef<gtk::Label>>>>,
@@ -1713,8 +1778,8 @@ impl AiParts {
             return;
         }
         let result = ui_set_ai_key(provider, Some(value));
-        if result.is_ok() {
-            if let Some(row) = self
+        if result.is_ok()
+            && let Some(row) = self
                 .rows
                 .borrow()
                 .iter()
@@ -1722,7 +1787,6 @@ impl AiParts {
             {
                 row.entry.set_text("");
             }
-        }
         self.report_ai_write(result);
     }
 
@@ -1750,11 +1814,10 @@ impl AiParts {
             {
                 return;
             }
-            if let Ok(file) = result {
-                if let Some(path) = file.path() {
+            if let Ok(file) = result
+                && let Some(path) = file.path() {
                     entry.set_text(&path.to_string_lossy());
                 }
-            }
         });
     }
 
@@ -1789,6 +1852,8 @@ impl AiParts {
             let Some(busy) = test_busy.upgrade() else {
                 return;
             };
+            let chosen = |task: crate::ai::Task| providers.iter().find(|p| p.available && p.task == task).map(|p| p.id).unwrap_or("none available");
+            let resolution = format!("Auto chat: {}\nAuto transcription: {}\n\n", chosen(crate::ai::Task::Chat), chosen(crate::ai::Task::Transcribe));
             let text = providers
                 .into_iter()
                 .map(|provider| {
@@ -1806,7 +1871,7 @@ impl AiParts {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            result.set_label(&text);
+            result.set_label(&format!("{resolution}{text}"));
             result.set_visible(true);
             busy.set(false);
             button.set_sensitive(true);
@@ -1999,4 +2064,81 @@ fn ui_set_ai_key(provider: &str, value: Option<&str>) -> Result<(), String> {
         ai.remove(key);
     }
     write_ui_table(&path, &table)
+}
+
+fn settings_labels(widget: &gtk::Widget) -> String {
+    let mut text = widget.downcast_ref::<gtk::Label>().map(|l| l.text().to_string()).unwrap_or_default();
+    let mut child = widget.first_child();
+    while let Some(next) = child { child = next.next_sibling(); text.push(' '); text.push_str(&settings_labels(&next)); }
+    text
+}
+
+fn settings_rows(widget: &gtk::Widget, rows: &mut Vec<gtk::Widget>) {
+    if widget.has_css_class("omg-settings-row") { rows.push(widget.clone()); return; }
+    let mut child = widget.first_child();
+    while let Some(next) = child { child = next.next_sibling(); settings_rows(&next, rows); }
+}
+
+fn install_settings_search(search: &gtk::SearchEntry, stack: &gtk::Stack) {
+    let pages = stack.pages();
+    let mut index = Vec::new();
+    for i in 0..pages.n_items() {
+        if let Some(page) = pages.item(i).and_downcast::<gtk::StackPage>() {
+            let mut rows = Vec::new(); settings_rows(&page.child(), &mut rows);
+            index.push((page.downgrade(), rows.iter().map(|row| (row.downgrade(), settings_labels(row).to_lowercase())).collect::<Vec<_>>()));
+        }
+    }
+    let empty = gtk::Label::new(Some("No matching settings. Try a category or a feature name."));
+    empty.set_wrap(true); empty.add_css_class("omg-empty-state");
+    let empty_page = stack.add_named(&empty, Some("search-empty")); empty_page.set_visible(false);
+    let empty_page = empty_page.downgrade();
+    let stack = stack.downgrade();
+    search.connect_search_changed(move |entry| {
+        let query = entry.text().trim().to_lowercase();
+        let mut first = None;
+        for (page, rows) in &index {
+            let Some(page) = page.upgrade() else { continue };
+            let category_match = query.is_empty() || page.title().is_some_and(|t| t.to_lowercase().contains(&query))
+                || (rows.is_empty() && settings_labels(&page.child()).to_lowercase().contains(&query));
+            let mut any = category_match;
+            for (row, labels) in rows {
+                let matches = category_match || labels.contains(&query);
+                if let Some(row) = row.upgrade() { row.set_visible(matches); }
+                any |= matches;
+            }
+            filter_settings_sections(&page.child(), !query.is_empty());
+            page.set_visible(any);
+            if any && first.is_none() { first = page.name(); }
+        }
+        if let Some(empty) = empty_page.upgrade() { empty.set_visible(first.is_none()); }
+        if let Some(stack) = stack.upgrade() {
+            if let Some(first) = first { stack.set_visible_child_name(&first); }
+            else { stack.set_visible_child_name("search-empty"); }
+        }
+    });
+}
+
+fn time_style_preview(format: &str) -> String {
+    use std::fmt::Write;
+    let mut text = String::from("Preview: ");
+    if write!(&mut text, "{}", chrono::Local::now().format(format)).is_err() { return "Incomplete or invalid time format".into(); }
+    text
+}
+
+fn filter_settings_sections(widget: &gtk::Widget, filtering: bool) {
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        filter_settings_sections(&next, filtering);
+        child = next.next_sibling();
+    }
+    if widget.has_css_class("omg-settings-section") {
+        let mut rows = Vec::new(); settings_rows(widget, &mut rows);
+        widget.set_visible(!filtering || rows.iter().any(|row| row.is_visible()));
+    }
+}
+
+type DropdownBinding = (gtk::DropDown, &'static [&'static str], DropGetter);
+
+fn time_preset(format: &str) -> &str {
+    match format { "" | "%H:%M" | "%I:%M %p" | "%d %b %H:%M" => format, _ => "custom" }
 }

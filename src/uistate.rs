@@ -65,17 +65,11 @@ impl UiState {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        use std::io::Write;
-        let p = path();
-        if let Some(dir) = p.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let text = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let tmp = p.with_extension("toml.tmp");
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, &p)
+        crate::storage::update_table(&path(), |table| {
+            let _: UiState = table.clone().try_into().map_err(|_| std::io::Error::other("invalid window state; existing file preserved"))?;
+            if self.last_location.is_none() { table.remove("last_location"); }
+            crate::storage::merge_table(table, toml::Table::try_from(self).map_err(std::io::Error::other)?);
+            Ok(())
+        })
     }
 }

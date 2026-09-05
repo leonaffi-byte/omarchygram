@@ -55,6 +55,7 @@ impl VirtualStore {
     }
 }
 
+#[derive(Default)]
 pub struct AuxState {
     pub transcripts: HashMap<(i64, i32), ReqState<String>>,
     pub translations: HashMap<(i64, i32), ReqState<String>>,
@@ -62,16 +63,6 @@ pub struct AuxState {
     pub draft_token: u64,
 }
 
-impl Default for AuxState {
-    fn default() -> Self {
-        Self {
-            transcripts: HashMap::new(),
-            translations: HashMap::new(),
-            summaries: HashMap::new(),
-            draft_token: 0,
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReqState<T> {

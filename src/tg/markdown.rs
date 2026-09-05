@@ -36,8 +36,8 @@ fn parse_into(chars: &[char], out: &mut String, spans: &mut Vec<Span>, base: usi
     let mut len = base; // char length of `out`
     while i < chars.len() {
         // Code block: ```lang\n...``` — no nesting inside.
-        if starts_with(chars, i, "```") {
-            if let Some(close) = find(chars, i + 3, "```") {
+        if starts_with(chars, i, "```")
+            && let Some(close) = find(chars, i + 3, "```") {
                 let body: String = chars[i + 3..close].iter().collect();
                 let (lang, code) = split_lang(&body);
                 if !code.is_empty() {
@@ -49,11 +49,10 @@ fn parse_into(chars: &[char], out: &mut String, spans: &mut Vec<Span>, base: usi
                     continue;
                 }
             }
-        }
         // Inline code — no nesting inside.
-        if chars[i] == '`' {
-            if let Some(close) = find(chars, i + 1, "`") {
-                if close > i + 1 {
+        if chars[i] == '`'
+            && let Some(close) = find(chars, i + 1, "`")
+                && close > i + 1 {
                     let start = len;
                     let code: String = chars[i + 1..close].iter().collect();
                     out.push_str(&code);
@@ -62,12 +61,10 @@ fn parse_into(chars: &[char], out: &mut String, spans: &mut Vec<Span>, base: usi
                     i = close + 1;
                     continue;
                 }
-            }
-        }
         // Link: [text](url)
-        if chars[i] == '[' {
-            if let Some(mid) = find(chars, i + 1, "](") {
-                if let Some(close) = find(chars, mid + 2, ")") {
+        if chars[i] == '['
+            && let Some(mid) = find(chars, i + 1, "](")
+                && let Some(close) = find(chars, mid + 2, ")") {
                     let url: String = chars[mid + 2..close].iter().collect();
                     if mid > i + 1 && !url.is_empty() && !url.contains(char::is_whitespace) {
                         let start = len;
@@ -78,8 +75,6 @@ fn parse_into(chars: &[char], out: &mut String, spans: &mut Vec<Span>, base: usi
                         continue;
                     }
                 }
-            }
-        }
         // Paired markers with nesting.
         let mut matched = false;
         for (marker, kind) in [
@@ -89,8 +84,8 @@ fn parse_into(chars: &[char], out: &mut String, spans: &mut Vec<Span>, base: usi
             ("||", SpanKind::Spoiler),
         ] {
             if starts_with(chars, i, marker) {
-                if let Some(close) = find(chars, i + 2, marker) {
-                    if close > i + 2 {
+                if let Some(close) = find(chars, i + 2, marker)
+                    && close > i + 2 {
                         let start = len;
                         parse_into(&chars[i + 2..close], out, spans, len);
                         len = out.chars().count();
@@ -98,7 +93,6 @@ fn parse_into(chars: &[char], out: &mut String, spans: &mut Vec<Span>, base: usi
                         i = close + 2;
                         matched = true;
                     }
-                }
                 break;
             }
         }

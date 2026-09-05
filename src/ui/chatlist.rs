@@ -8,7 +8,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
-use crate::tg::{ChatKind, ChatSummary, Folder, Msg, Presence, Tg};
+use crate::tg::{ChatKind, ChatSummary, Folder, Msg, Presence, StoryPeer, StoryRing, Tg};
 
 use super::anim::Effects;
 use super::avatar::{self, Avatar};
@@ -49,7 +49,7 @@ struct ChatRow {
     mentions: gtk::Label,
     pin: gtk::Label,
     ticks: gtk::Label,
-    avatar_binding: Rc<RefCell<Option<(i64, bool, String, bool)>>>,
+    avatar_binding: Rc<RefCell<Option<AvatarBinding>>>,
     title_text: Rc<RefCell<String>>,
     unread_count: Rc<Cell<i32>>,
 }
@@ -104,8 +104,8 @@ pub struct ChatList {
     on_search_open: Rc<RefCell<Option<SearchOpenCallback>>>,
     on_search: Rc<RefCell<Option<SearchCallback>>>,
     on_search_retry: Rc<RefCell<Option<RetryCallback>>>,
-    on_folder: Rc<RefCell<Option<Rc<dyn Fn(i32)>>>>,
-    on_main_menu: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    on_folder: crate::ui::CallbackSlot<dyn Fn(i32)>,
+    on_main_menu: crate::ui::CallbackSlot<dyn Fn()>,
     on_chat_action: Rc<RefCell<Option<ChatActionCallback>>>,
     context_popover: PopoverSlot,
     effects: Rc<Effects>,
@@ -121,7 +121,6 @@ impl ChatList {
 
         let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         top_bar.add_css_class("omg-sidebar-top");
-        top_bar.set_size_request(-1, 48);
         let menu_button = gtk::Button::with_label(icons::MENU);
         menu_button.add_css_class("omg-icon-button");
         menu_button.set_tooltip_text(Some("Main menu"));
@@ -138,6 +137,7 @@ impl ChatList {
         archived_title.set_visible(false);
         top_bar.append(&archived_title);
         let search = gtk::SearchEntry::new();
+        search.set_valign(gtk::Align::Center);
         search.set_placeholder_text(Some("Search"));
         search.set_hexpand(true);
         top_bar.append(&search);
@@ -195,6 +195,7 @@ impl ChatList {
         search_page.set_child(Some(&search_sections));
 
         let content = gtk::Stack::new();
+        content.set_hhomogeneous(false);
         content.set_transition_type(gtk::StackTransitionType::None);
         content.set_hexpand(true);
         content.set_vexpand(true);
@@ -386,6 +387,11 @@ impl ChatList {
         }
     }
 
+    pub fn set_compact(&self, compact: bool) {
+        if compact { self.widget.add_css_class("omg-compact-list"); } else { self.widget.remove_css_class("omg-compact-list"); }
+        for row in self.rows.borrow().values() { row.avatar.set_size(if self.collapsed.get() { 28 } else if compact { 32 } else { 40 }); }
+    }
+
     pub fn set_on_open(&self, callback: OpenCallback) {
         *self.on_open.borrow_mut() = Some(callback);
     }
@@ -408,7 +414,9 @@ impl ChatList {
         *self.on_chat_action.borrow_mut() = Some(callback);
     }
 
-    pub fn set_chats(&self, chats: Vec<ChatSummary>) {
+    pub fn set_chats(&self, mut chats: Vec<ChatSummary>) {
+        let mut seen = HashSet::new();
+        chats.retain(|chat| seen.insert(chat.id));
         crate::status::unread_changed();
         let old_value = self.scroll.vadjustment().value();
         let virtual_ids: HashSet<i64> = self.virtual_order.borrow().iter().copied().collect();
@@ -752,6 +760,20 @@ impl ChatList {
         }
     }
 
+    /// Story requests finish independently of the chat snapshot.
+    pub fn set_story_peers(&self, peers: &[StoryPeer]) {
+        let rings: HashMap<_, _> = peers.iter().map(|peer| {
+            (peer.chat_id, if peer.unread { StoryRing::Unread } else { StoryRing::Read })
+        }).collect();
+        let changed: Vec<_> = self.summaries.borrow_mut().values_mut().filter_map(|chat| {
+            let ring = rings.get(&chat.id).copied().unwrap_or_default();
+            if chat.story_ring == ring { return None; }
+            chat.story_ring = ring;
+            Some(chat.id)
+        }).collect();
+        for id in changed { self.update_row(id); }
+    }
+
     pub fn unread(&self, chat_id: i64) -> i32 {
         self.summaries
             .borrow()
@@ -829,16 +851,13 @@ impl ChatList {
         let mut titles = Vec::new();
         let mut child = self.list.first_child();
         while let Some(widget) = child {
-            if let Ok(row) = widget.clone().downcast::<gtk::ListBoxRow>() {
-                if let Some(id) = rows
+            if let Ok(row) = widget.clone().downcast::<gtk::ListBoxRow>()
+                && let Some(id) = rows
                     .iter()
                     .find_map(|(id, value)| (value.widget == row).then_some(*id))
-                {
-                    if let Some(summary) = summaries.get(&id) {
+                    && let Some(summary) = summaries.get(&id) {
                         titles.push(summary.title.clone());
                     }
-                }
-            }
             child = widget.next_sibling();
         }
         titles
@@ -864,7 +883,7 @@ impl ChatList {
                 && matches!(&*self.mode.borrow(), SidebarMode::Dialogs(_)),
         );
         for row in self.rows.borrow().values() {
-            row.avatar.set_size(if collapsed { 28 } else { 44 });
+            row.avatar.set_size(if collapsed { 28 } else if self.widget.has_css_class("omg-compact-list") { 32 } else { 40 });
             row.details.set_visible(!collapsed);
             row.unread_dot
                 .set_visible(collapsed && row.unread_count.get() > 0);
@@ -1050,8 +1069,18 @@ impl ChatList {
                 chats.push(chat.clone());
             }
         }
+        let chat_count = chats.len();
+        let show_chats = chat_count > 0 || data.chats_loading || data.chats_error.is_some();
+        self.search_chats.set_visible(show_chats);
+        if let Some(title) = self.search_chats.prev_sibling().and_downcast::<gtk::Label>() {
+            title.set_label(&format!("Chats · {chat_count}"));
+            title.set_visible(show_chats);
+        }
+        if let Some(title) = self.search_messages.prev_sibling().and_downcast::<gtk::Label>() {
+            title.set_label(&format!("Messages · {}{}", data.messages.len(), if data.messages.len() >= 50 { " shown" } else { "" }));
+        }
         for chat in chats {
-            let button = search_chat_button(&chat);
+            let button = search_chat_button(&chat, &data.query);
             let callback = self.on_search_open.clone();
             let id = chat.id;
             button.connect_clicked(move |_| {
@@ -1070,7 +1099,7 @@ impl ChatList {
             self.search_chats.append(&state_row("No results", false));
         }
         for message in &data.messages {
-            let button = search_message_button(message);
+            let button = search_message_button(message, &data.query);
             let callback = self.on_search_open.clone();
             let chat_id = message.chat_id;
             let msg_id = message.id;
@@ -1148,7 +1177,7 @@ impl ChatList {
         widget.add_css_class("omg-chat-row");
         widget.set_tooltip_text(Some(title));
         let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let avatar = Avatar::new(if self.collapsed.get() { 28 } else { 44 });
+        let avatar = Avatar::new(if self.collapsed.get() { 28 } else if self.widget.has_css_class("omg-compact-list") { 32 } else { 40 });
         let avatar_overlay = gtk::Overlay::new();
         avatar_overlay.set_child(Some(&avatar.widget));
         let unread_dot = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1381,13 +1410,11 @@ impl ChatList {
                 self.list.append(&row.widget);
             }
         }
-        if let Some(selected) = self.selected.get() {
-            if let Some(row) = self.rows.borrow().get(&selected) {
-                if row.widget.parent().is_some() {
+        if let Some(selected) = self.selected.get()
+            && let Some(row) = self.rows.borrow().get(&selected)
+                && row.widget.parent().is_some() {
                     self.list.select_row(Some(&row.widget));
                 }
-            }
-        }
         let archived = self.archived_total();
         self.archived_count.set_label(&archived.to_string());
         self.archived_button.set_visible(
@@ -1513,32 +1540,29 @@ impl ChatListParts {
                 .map(|folder| folder.chats.clone()),
             _ => None,
         };
-        for id in self.order.borrow().iter().copied() {
-            let Some(summary) = self.summaries.borrow().get(&id).cloned() else {
+        for id in self.order.borrow().iter() {
+            let Some(summary) = self.summaries.borrow().get(id).cloned() else {
                 continue;
             };
             let visible = match &mode {
                 SidebarMode::Dialogs(folder) => {
                     !summary.archived
                         && (*folder == 0
-                            || folder_ids.as_ref().is_some_and(|ids| ids.contains(&id)))
+                            || folder_ids.as_ref().is_some_and(|ids| ids.contains(id)))
                 }
                 SidebarMode::Archived => summary.archived,
                 SidebarMode::Search(_) => false,
             };
-            if visible {
-                if let Some(row) = self.rows.borrow().get(&id) {
+            if visible
+                && let Some(row) = self.rows.borrow().get(id) {
                     self.list.append(&row.widget);
                 }
-            }
         }
-        if let Some(selected) = self.selected.get() {
-            if let Some(row) = self.rows.borrow().get(&selected) {
-                if row.widget.parent().is_some() {
+        if let Some(selected) = self.selected.get()
+            && let Some(row) = self.rows.borrow().get(&selected)
+                && row.widget.parent().is_some() {
                     self.list.select_row(Some(&row.widget));
                 }
-            }
-        }
         self.content.set_visible_child_name("dialogs");
     }
 }
@@ -1651,11 +1675,12 @@ fn context_button(
     button
 }
 
-fn search_chat_button(chat: &ChatSummary) -> gtk::Button {
+fn search_chat_button(chat: &ChatSummary, query: &str) -> gtk::Button {
     let button = gtk::Button::new();
     button.add_css_class("omg-search-row");
     let contents = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let title = gtk::Label::new(Some(&chat.title));
+    title.set_markup(&highlight_match(title.text().as_str(), query));
     title.add_css_class("omg-chat-title");
     title.set_halign(gtk::Align::Start);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -1670,7 +1695,7 @@ fn search_chat_button(chat: &ChatSummary) -> gtk::Button {
     button
 }
 
-fn search_message_button(message: &Msg) -> gtk::Button {
+fn search_message_button(message: &Msg, query: &str) -> gtk::Button {
     let button = gtk::Button::new();
     button.add_css_class("omg-search-row");
     let contents = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -1681,6 +1706,7 @@ fn search_message_button(message: &Msg) -> gtk::Button {
         format!("{} · {}", message.chat_title, message.sender)
     };
     let title = gtk::Label::new(Some(&heading));
+    title.set_markup(&highlight_match(title.text().as_str(), query));
     title.add_css_class("omg-chat-title");
     title.set_halign(gtk::Align::Start);
     title.set_hexpand(true);
@@ -1691,6 +1717,7 @@ fn search_message_button(message: &Msg) -> gtk::Button {
     top.append(&date);
     contents.append(&top);
     let snippet = gtk::Label::new(Some(&message.text));
+    snippet.set_markup(&highlight_match(&message.text, query));
     snippet.add_css_class("omg-chat-preview");
     snippet.set_halign(gtk::Align::Start);
     snippet.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -1801,3 +1828,42 @@ mod tests {
         assert_eq!(format_time_at(None, now), "");
     }
 }
+
+/// Case-insensitive matching with original Unicode byte boundaries and escaped
+/// markup, including lowercase expansions (for example dotted capital I).
+fn highlight_match(text: &str, query: &str) -> String {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() { return glib::markup_escape_text(text).to_string(); }
+    let mut folded = String::new();
+    let mut boundaries = Vec::new();
+    for (start, ch) in text.char_indices() {
+        let lower = ch.to_lowercase().collect::<String>();
+        boundaries.extend(std::iter::repeat_n((start, start + ch.len_utf8()), lower.len()));
+        folded.push_str(&lower);
+    }
+    let mut result = String::new();
+    let mut cursor = 0;
+    for (start, matched) in folded.match_indices(&query) {
+        let (from, to) = (boundaries[start].0, boundaries[start + matched.len() - 1].1);
+        if from < cursor { continue; }
+        result.push_str(&glib::markup_escape_text(&text[cursor..from]));
+        result.push_str("<b><u>");
+        result.push_str(&glib::markup_escape_text(&text[from..to]));
+        result.push_str("</u></b>");
+        cursor = to;
+    }
+    result.push_str(&glib::markup_escape_text(&text[cursor..]));
+    result
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    #[test]
+    fn unicode_and_markup_are_safe() {
+        assert_eq!(super::highlight_match("<MARTA> & İ", "marta"), "&lt;<b><u>MARTA</u></b>&gt; &amp; İ");
+        assert_eq!(super::highlight_match("İstanbul", "i"), "<b><u>İ</u></b>stanbul");
+        assert_eq!(super::highlight_match("שלום", "שלום"), "<b><u>שלום</u></b>");
+    }
+}
+
+type AvatarBinding = (i64, bool, String, bool);

@@ -42,8 +42,10 @@ struct CallInner {
     hang_up: gtk::Button,
     active_actions: gtk::Box,
     mute: gtk::ToggleButton,
-    action: RefCell<Option<Rc<dyn Fn(CallAction)>>>,
-    on_closed: RefCell<Option<Rc<dyn Fn()>>>,
+    devices: gtk::Expander,
+    settings: Rc<crate::settings::SettingsStore>,
+    action: crate::ui::CallbackCell<dyn Fn(CallAction)>,
+    on_closed: crate::ui::CallbackCell<dyn Fn()>,
     current: RefCell<Option<CallInfo>>,
     timer_source: RefCell<Option<glib::SourceId>>,
     close_source: RefCell<Option<glib::SourceId>>,
@@ -58,7 +60,7 @@ struct CallInner {
 }
 
 impl CallView {
-    pub fn new(tg: Tg, probe: bool, ringtone_enabled: bool) -> Self {
+    pub fn new(tg: Tg, probe: bool, ringtone_enabled: bool, settings: Rc<crate::settings::SettingsStore>) -> Self {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 16);
         widget.add_css_class("omg-call");
         widget.set_halign(gtk::Align::Center);
@@ -76,6 +78,8 @@ impl CallView {
 
         let status = gtk::Label::new(None);
         status.add_css_class("omg-call-status");
+        status.set_wrap(true);
+        status.set_max_width_chars(48);
         widget.append(&status);
 
         let timer = gtk::Label::new(Some("00:00"));
@@ -133,6 +137,20 @@ impl CallView {
         active_actions.append(&active_hang_up);
         widget.append(&active_actions);
 
+        let devices = gtk::Expander::new(Some("Audio devices"));
+        devices.set_visible(false);
+        widget.append(&devices);
+        // Expanded device settings and large text must remain reachable on
+        // short windows; keep the same card and controls within a scroller.
+        let content = gtk::Box::new(gtk::Orientation::Vertical, widget.spacing());
+        while let Some(child) = widget.first_child() { widget.remove(&child); content.append(&child); }
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_max_content_height(720);
+        scroll.set_propagate_natural_width(true);
+        scroll.set_child(Some(&content));
+        widget.append(&scroll);
         let inner = Rc::new(CallInner {
             widget: widget.clone(),
             tg,
@@ -146,6 +164,8 @@ impl CallView {
             hang_up,
             active_actions,
             mute,
+            devices,
+            settings,
             action: RefCell::new(None),
             on_closed: RefCell::new(None),
             current: RefCell::new(None),
@@ -187,6 +207,12 @@ impl CallView {
             });
         }
 
+        {
+            let weak = Rc::downgrade(&inner);
+            inner.devices.connect_expanded_notify(move |expander| {
+                if expander.is_expanded() && let Some(inner) = weak.upgrade() { inner.load_devices(); }
+            });
+        }
         Self { widget, inner }
     }
 
@@ -243,7 +269,7 @@ impl CallView {
 
     pub fn escape(&self) -> bool {
         match self.phase() {
-            Some(CallPhase::Ended) => self.is_open(),
+            Some(CallPhase::Ended) => { self.clear(); true },
             Some(_) => {
                 self.inner.emit(CallAction::HangUp);
                 true
@@ -282,6 +308,51 @@ impl CallView {
 }
 
 impl CallInner {
+    fn load_devices(self: &Rc<Self>) {
+        let Some(call) = self.current.borrow().clone().filter(|call| call.phase == CallPhase::Active) else { return };
+        let generation = self.generation.get();
+        let waiting = gtk::Label::new(Some("Loading audio devices…"));
+        self.devices.set_child(Some(&waiting));
+        let weak = Rc::downgrade(self);
+        let tg = self.tg.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.call_devices().await;
+            let Some(this) = weak.upgrade().filter(|this| this.generation.get() == generation && this.current.borrow().as_ref().is_some_and(|current| current.id == call.id && current.phase == CallPhase::Active)) else { return };
+            let devices = match result {
+                Ok(devices) => devices,
+                Err(_) => { waiting.set_label("Could not load devices. Close and reopen Audio devices to retry."); return; }
+            };
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            let prefs = this.settings.get().calls;
+            let input = gtk::DropDown::from_strings(&devices.input.iter().map(|device| device.name.as_str()).collect::<Vec<_>>());
+            let output = gtk::DropDown::from_strings(&devices.output.iter().map(|device| device.name.as_str()).collect::<Vec<_>>());
+            input.set_selected(devices.input.iter().position(|device| device.id == prefs.input_device).unwrap_or(0) as u32);
+            output.set_selected(devices.output.iter().position(|device| device.id == prefs.output_device).unwrap_or(0) as u32);
+            for (label, dropdown) in [("Microphone", &input), ("Speaker or headset", &output)] {
+                let name = gtk::Label::new(Some(label)); name.set_xalign(0.0); column.append(&name);
+                dropdown.update_property(&[gtk::accessible::Property::Label(label)]); column.append(dropdown);
+            }
+            let status = gtk::Label::new(None); status.set_wrap(true); status.set_max_width_chars(40); column.append(&status);
+            let apply = gtk::Button::with_label("Use these devices"); column.append(&apply);
+            this.devices.set_child(Some(&column));
+            let weak = Rc::downgrade(&this);
+            apply.connect_clicked(move |button| {
+                let (Some(mic), Some(speaker)) = (devices.input.get(input.selected() as usize), devices.output.get(output.selected() as usize)) else { return };
+                let (mic, speaker) = (mic.id.clone(), speaker.id.clone());
+                let weak = weak.clone(); let button = button.downgrade(); let status = status.downgrade();
+                if let Some(button) = button.upgrade() { button.set_sensitive(false); }
+                glib::MainContext::default().spawn_local(async move {
+                    let Some(this) = weak.upgrade() else { return };
+                    let result = this.tg.call_set_devices(call.id, mic.clone(), speaker.clone()).await;
+                    if this.generation.get() != generation { return; }
+                    let result = result.and_then(|()| this.settings.try_update(|settings| { settings.calls.input_device = mic; settings.calls.output_device = speaker; }));
+                    if let Some(status) = status.upgrade() { status.set_label(match &result { Ok(()) => "Audio devices updated", Err(error) => error }); }
+                    if let Some(button) = button.upgrade() { button.set_sensitive(true); }
+                });
+            });
+        });
+    }
+
     fn emit(&self, action: CallAction) {
         if let Some(callback) = self.action.borrow().as_ref().cloned() {
             callback(action);
@@ -309,6 +380,7 @@ impl CallInner {
         self.incoming_actions.set_visible(false);
         self.hang_up.set_visible(false);
         self.active_actions.set_visible(false);
+        self.devices.set_visible(info.phase == CallPhase::Active);
         self.timer.set_visible(false);
         self.emojis.set_visible(false);
         self.caption.set_visible(false);
@@ -331,21 +403,22 @@ impl CallInner {
                 self.stop_ringtone();
             }
             CallPhase::Exchanging => {
-                self.status.set_label("Exchanging keys…");
+                self.status.set_label("Securing the connection…");
                 self.status.set_visible(true);
                 self.hang_up.set_visible(true);
                 self.stop_timer();
                 self.stop_ringtone();
             }
             CallPhase::Connecting => {
-                self.status.set_label("Connecting…");
+                self.status.set_label(if info.connected_at.is_some() { "Reconnecting…" } else { "Connecting…" });
                 self.status.set_visible(true);
                 self.hang_up.set_visible(true);
                 self.stop_timer();
                 self.stop_ringtone();
             }
             CallPhase::Active => {
-                self.status.set_visible(false);
+                self.status.set_label(if info.muted { "Connected · Microphone muted" } else { "Connected · Microphone on" });
+                self.status.set_visible(true);
                 self.timer.set_visible(true);
                 self.emojis.set_label(&info.emojis);
                 self.emojis.set_visible(!info.emojis.is_empty());
@@ -369,15 +442,15 @@ impl CallInner {
                 }));
                 self.syncing_mute.set(false);
                 self.stop_ringtone();
-                self.clone().start_timer(info.connected_at.clone());
+                self.clone().start_timer(info.connected_at);
             }
             CallPhase::Ended => {
-                self.status.set_label(match info.end_reason {
+                self.status.set_label(info.error.as_deref().unwrap_or(match info.end_reason {
                     Some(CallEndReason::Declined) => "Declined",
                     Some(CallEndReason::Missed) => "Missed",
                     Some(CallEndReason::Failed) => "Call failed",
                     Some(CallEndReason::Hangup) | None => "Call ended",
-                });
+                }));
                 self.status.set_visible(true);
                 self.stop_timer();
                 self.stop_ringtone();
@@ -404,7 +477,7 @@ impl CallInner {
                 .borrow()
                 .as_ref()
                 .filter(|info| info.phase == CallPhase::Active)
-                .and_then(|info| info.connected_at.clone());
+                .and_then(|info| info.connected_at);
             if connected_at.is_none() {
                 this.timer_source.borrow_mut().take();
                 return glib::ControlFlow::Break;
@@ -434,7 +507,8 @@ impl CallInner {
         self.drop_close_source();
         let generation = self.generation.get();
         let weak = Rc::downgrade(&self);
-        let source = glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+        let delay = if self.current.borrow().as_ref().is_some_and(|call| call.error.is_some()) { 6000 } else { 1500 };
+        let source = glib::timeout_add_local_once(Duration::from_millis(delay), move || {
             let Some(this) = weak.upgrade() else { return };
             this.close_source.borrow_mut().take();
             if this.generation.get() == generation
@@ -470,14 +544,13 @@ impl CallInner {
         self.drop_close_source();
         self.stop_ringtone();
         self.current.borrow_mut().take();
-        if let Some(root) = self.widget.root() {
-            if root
+        if let Some(root) = self.widget.root()
+            && root
                 .focus()
                 .is_some_and(|focus| self.widget.is_ancestor(&focus))
             {
                 root.set_focus(None::<&gtk::Widget>);
             }
-        }
         self.widget.set_visible(false);
         if let Some(callback) = self.on_closed.borrow().as_ref().cloned() {
             callback();

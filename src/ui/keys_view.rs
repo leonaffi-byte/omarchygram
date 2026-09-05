@@ -308,12 +308,11 @@ impl KeysView {
 
     fn capture_hint(state: &Rc<State>, text: &str) {
         let rows = state.rows.borrow();
-        if let Some(id) = state.capturing.get() {
-            if let Some(row) = rows.iter().find(|row| row.id == id) {
+        if let Some(id) = state.capturing.get()
+            && let Some(row) = rows.iter().find(|row| row.id == id) {
                 row.note.set_label(text);
                 row.note.set_visible(true);
             }
-        }
     }
 
     fn resolved(state: &State, id: &str) -> String {
@@ -324,7 +323,7 @@ impl KeysView {
     }
 
     /// `(id, group, canonical)` for every row — the conflict input.
-    fn canonical_rows(state: &State) -> Vec<(String, String, Option<(u32, u32)>)> {
+    fn canonical_rows(state: &State) -> Vec<super::keys::CanonicalBinding> {
         state
             .rows
             .borrow()

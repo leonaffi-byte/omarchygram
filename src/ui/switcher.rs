@@ -12,8 +12,14 @@ pub struct Switcher {
     list: gtk::ListBox,
     chats: Rc<RefCell<Vec<(i64, String)>>>,
     visible_ids: Rc<RefCell<Vec<i64>>>,
-    on_open: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
-    on_cancel: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    on_open: crate::ui::CallbackSlot<dyn Fn(i64)>,
+    on_cancel: crate::ui::CallbackSlot<dyn Fn()>,
+}
+
+impl Default for Switcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Switcher {
@@ -33,12 +39,20 @@ impl Switcher {
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.set_activate_on_single_click(true);
-        widget.append(&list);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_max_content_height(400);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_child(Some(&list));
+        widget.append(&scroll);
+        let hint = gtk::Label::new(Some("↑ ↓ Move  ·  Enter Open  ·  Esc Close"));
+        hint.add_css_class("omg-muted");
+        widget.append(&hint);
 
         let chats = Rc::new(RefCell::new(Vec::<(i64, String)>::new()));
         let visible_ids = Rc::new(RefCell::new(Vec::<i64>::new()));
-        let on_open: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>> = Rc::new(RefCell::new(None));
-        let on_cancel: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let on_open: crate::ui::CallbackSlot<dyn Fn(i64)> = Rc::new(RefCell::new(None));
+        let on_cancel: crate::ui::CallbackSlot<dyn Fn()> = Rc::new(RefCell::new(None));
 
         {
             let list = list.clone();
@@ -49,10 +63,11 @@ impl Switcher {
             });
         }
         {
-            let widget = widget.clone();
+            let widget = widget.downgrade();
             let visible_ids = visible_ids.clone();
             let on_open = on_open.clone();
             list.connect_row_activated(move |_, row| {
+                let Some(widget) = widget.upgrade() else { return };
                 let index = row.index();
                 if index < 0 {
                     return;
@@ -69,12 +84,14 @@ impl Switcher {
 
         let controller = gtk::EventControllerKey::new();
         {
-            let widget = widget.clone();
+            let widget = widget.downgrade();
             let list = list.clone();
             let visible_ids = visible_ids.clone();
             let on_open = on_open.clone();
             let on_cancel = on_cancel.clone();
-            controller.connect_key_pressed(move |_, key, _, _| match key {
+            controller.connect_key_pressed(move |_, key, _, _| {
+                let Some(widget) = widget.upgrade() else { return glib::Propagation::Proceed };
+                match key {
                 gdk::Key::Escape => {
                     widget.set_visible(false);
                     if let Some(callback) = on_cancel.borrow().as_ref().cloned() {
@@ -103,6 +120,7 @@ impl Switcher {
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
+                }
             });
         }
         entry.add_controller(controller);
@@ -167,13 +185,27 @@ impl Switcher {
                 continue;
             }
             let row = gtk::ListBoxRow::new();
+            let (title, identity) = title.split_once('\n').unwrap_or((title, ""));
+            let details = gtk::Box::new(gtk::Orientation::Vertical, 4);
             let label = gtk::Label::new(Some(title));
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_max_width_chars(42);
             label.set_halign(gtk::Align::Start);
             label.set_margin_start(8);
             label.set_margin_end(8);
             label.set_margin_top(4);
             label.set_margin_bottom(4);
-            row.set_child(Some(&label));
+            details.append(&label);
+            if !identity.is_empty() {
+                let secondary = gtk::Label::new(Some(identity));
+                secondary.add_css_class("omg-muted");
+                secondary.set_halign(gtk::Align::Start);
+                secondary.set_margin_start(8);
+                secondary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                secondary.set_max_width_chars(42);
+                details.append(&secondary);
+            }
+            row.set_child(Some(&details));
             list.append(&row);
             visible_ids.borrow_mut().push(*chat_id);
         }

@@ -100,7 +100,7 @@ pub fn canonical(accel: &str) -> Option<(u32, u32)> {
 /// Same-group conflicting index pairs of `rows` (`(id, group, canonical)`),
 /// compared on canonical form (A28). Cross-group duplicates are allowed: the
 /// Composer controller wins while the composer has focus.
-pub fn find_conflicts(rows: &[(String, String, Option<(u32, u32)>)]) -> Vec<(usize, usize)> {
+pub fn find_conflicts(rows: &[CanonicalBinding]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for i in 0..rows.len() {
         let Some(a) = rows[i].2 else { continue };
@@ -237,11 +237,7 @@ fn rebuild(
             if capture_active() {
                 return glib::Propagation::Proceed;
             }
-            match wrap {
-                Some((open, close)) => wrap_buffer_selection(&buffer, open, close),
-                // Underline has no Telegram marker: the binding is a no-op.
-                None => {}
-            }
+            if let Some((open, close)) = wrap { wrap_buffer_selection(&buffer, open, close); }
             glib::Propagation::Stop
         });
         composer_controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(shortcut_action)));
@@ -326,3 +322,5 @@ fn char_offset_to_byte(text: &str, offset: i32) -> usize {
         .unwrap_or(text.len())
 }
 
+
+pub type CanonicalBinding = (String, String, Option<(u32, u32)>);

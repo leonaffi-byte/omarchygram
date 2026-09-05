@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use omarchygram::{config, status, theme, tg, ui, uistate};
+use omarchygram::{config, settings, status, theme, tg, ui, uistate};
 
 use gtk4 as gtk;
 use gtk4::glib;
@@ -12,6 +12,8 @@ fn main() -> glib::ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let smoke = args.iter().any(|a| a == "--smoke");
     let probe = args.iter().any(|a| a == "--probe");
+    let background = args.iter().any(|a| a == "--background");
+    let quit = args.iter().any(|a| a == "--quit");
 
     if smoke {
         // Never let offline demo/probe runs touch the user's real settings.
@@ -30,33 +32,79 @@ fn main() -> glib::ExitCode {
         // Offline AI stand-ins so probes can traverse the Assistant paths.
         unsafe { std::env::set_var("OMG_MOCK_AI", "1") };
         let ui_tmp = base.join(format!("omarchygram-smoke-{}-ui.toml", std::process::id()));
+        // Copy explicit gate seeds into isolation before replacing the path.
+        if let Some(seed) = std::env::var_os("OMG_UISTATE_PATH")
+            && let Err(error) = std::fs::copy(seed, &ui_tmp)
+        {
+            eprintln!("omarchygram: cannot seed smoke window state: {error}");
+        }
         unsafe { std::env::set_var("OMG_UISTATE_PATH", &ui_tmp) };
         // The bar-plugin status file too: probes must never touch the real one.
         let status_tmp = base.join(format!("omarchygram-smoke-{}-status.json", std::process::id()));
         unsafe { std::env::set_var("OMG_STATUS_PATH", &status_tmp) };
     }
-    config::enforce_permissions();
+    if !smoke { config::enforce_permissions(); }
 
     // Smoke/probe runs must never collapse into an already-running instance
     // (GTK would forward "activate" over D-Bus and exit 0 without running
     // anything), so they register as non-unique.
-    let flags = if smoke { gtk::gio::ApplicationFlags::NON_UNIQUE } else { gtk::gio::ApplicationFlags::default() };
-    let app = gtk::Application::builder().application_id(APP_ID).flags(flags).build();
+    let flags = if smoke && std::env::var_os("OMG_SMOKE_SINGLE_INSTANCE").is_none() { gtk::gio::ApplicationFlags::NON_UNIQUE } else { gtk::gio::ApplicationFlags::default() };
+    let app = gtk::Application::builder().application_id(if smoke { "dev.leoom.Omarchygram.Smoke" } else { APP_ID }).flags(flags).build();
+    let quit_action = gtk::gio::SimpleAction::new("quit", None);
+    let weak_app = app.downgrade();
+    quit_action.connect_activate(move |_, _| {
+        if let Some(app) = weak_app.upgrade() { app.quit(); }
+    });
+    app.add_action(&quit_action);
+    app.set_accels_for_action("app.quit", &["<Primary>q"]);
+    if quit {
+        if let Err(error) = app.register(gtk::gio::Cancellable::NONE) {
+            eprintln!("omarchygram: could not contact the running app: {error}");
+            return glib::ExitCode::FAILURE;
+        }
+        if app.is_remote() { app.activate_action("quit", None); }
+        return glib::ExitCode::SUCCESS;
+    }
+    let backend = Rc::new(std::cell::RefCell::new(None));
+    let active_backend = backend.clone();
     app.connect_activate(move |app| {
         // The Omarchy bar plugin's status file (specs/spec-bar-plugin.md §1):
         // "up" once GTK owns the main loop, "gone" on every normal exit path.
         status::set_running(true);
-        build(app, smoke, probe);
+        if let Some(tg) = build(app, smoke, probe, background) {
+            *active_backend.borrow_mut() = Some(tg);
+        }
     });
-    app.connect_shutdown(|_| status::shutdown());
+    app.connect_shutdown(move |app| {
+        if !smoke && let Some(window) = app.windows().into_iter().find(|w| w.widget_name() == "omarchygram-main") {
+            save_geometry(&window);
+        }
+        status::shutdown();
+    });
     // GTK must not see our flags.
-    app.run_with_args::<&str>(&[])
+    let code = app.run_with_args::<&str>(&[]);
+    if let Some(tg) = backend.borrow_mut().take() {
+        glib::MainContext::default().block_on(tg.shutdown());
+    }
+    code
 }
 
-fn build(app: &gtk::Application, smoke: bool, probe: bool) {
-    if let Some(window) = app.active_window() {
+fn save_geometry(window: &gtk::Window) {
+    let mut state = uistate::UiState::load();
+    state.maximized = window.is_maximized();
+    if !state.maximized && window.width() > 0 && window.height() > 0 {
+        state.window_w = window.width();
+        state.window_h = window.height();
+    }
+    if let Err(error) = state.save() { eprintln!("omarchygram: could not save window state: {error}"); }
+}
+
+fn build(app: &gtk::Application, smoke: bool, probe: bool, background: bool) -> Option<tg::Tg> {
+    // Hidden windows have no active-window entry. Reuse the same shell and
+    // session when the normal launcher activates the background application.
+    if let Some(window) = app.windows().into_iter().find(|w| w.widget_name() == "omarchygram-main") {
         window.present();
-        return;
+        return None;
     }
 
     let state = uistate::UiState::load();
@@ -68,17 +116,14 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
         .maximized(state.maximized)
         .build();
     window.add_css_class("omg-window");
-    if !smoke {
+    window.set_widget_name("omarchygram-main");
+    {
         // Remember the window geometry; pane widths are saved by the shell.
-        window.connect_close_request(|w| {
-            let mut s = uistate::UiState::load();
-            s.maximized = w.is_maximized();
-            if !s.maximized {
-                s.window_w = w.width();
-                s.window_h = w.height();
-            }
-            if let Err(e) = s.save() {
-                eprintln!("omarchygram: could not save ui-state: {e}");
+        window.connect_close_request(move |w| {
+            if !smoke { save_geometry(w.upcast_ref()); }
+            if settings::load().ui.keep_running {
+                w.set_visible(false);
+                return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
         });
@@ -94,13 +139,18 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
     // that quits the app on success; a failsafe below fails the run instead of
     // hanging. Without --smoke there is nothing scriptable, so just flash-run.
     let probe_traversal = probe && smoke;
-    let shell = Rc::new(ui::shell::Shell::new(tg, probe_traversal));
+    let shell = Rc::new(ui::shell::Shell::new(tg.clone(), probe_traversal));
     window.set_child(Some(&shell.widget));
-    window.present();
+    if !background { window.present(); }
 
     let shell_for_start = shell.clone();
+    let weak_window = window.downgrade();
     glib::MainContext::default().spawn_local(async move {
         shell_for_start.start().await;
+        // A background launch still needs a visible login form if the saved
+        // session is missing or cannot be opened.
+        if background && !shell_for_start.is_ready()
+            && let Some(window) = weak_window.upgrade() { window.present(); }
     });
     // Keep the shell alive with the window.
     unsafe { window.set_data("shell", shell) };
@@ -182,6 +232,7 @@ fn build(app: &gtk::Application, smoke: bool, probe: bool) {
         let app = app.clone();
         glib::timeout_add_seconds_local_once(2, move || app.quit());
     }
+    Some(tg)
 }
 
 /// Render the toplevel's child into a PNG through GSK (no screen capture).

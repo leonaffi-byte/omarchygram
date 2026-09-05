@@ -89,8 +89,9 @@ impl Viewer {
         let save = gtk::Button::with_label(icons::SAVE);
         save.add_css_class("omg-icon-button");
         save.set_tooltip_text(Some("Save as"));
+        save.update_property(&[gtk::accessible::Property::Label("Save as")]);
         toolbar.append(&save);
-        let open = gtk::Button::with_label("Open");
+        let open = gtk::Button::with_label("Open externally");
         open.add_css_class("omg-menu-item");
         toolbar.append(&open);
         let close = gtk::Button::with_label(icons::CLOSE);
@@ -142,7 +143,7 @@ impl Viewer {
         {
             let state = state.clone();
             let view = widgets(
-                &picture, &title, &caption, &loading, &previous, &next, &save, &open,
+                &picture, &title, &caption, &loading, [&previous, &next, &save, &open],
             );
             let action = action.clone();
             previous.connect_clicked(move |_| navigate(&state, &view, &action, -1));
@@ -150,7 +151,7 @@ impl Viewer {
         {
             let state = state.clone();
             let view = widgets(
-                &picture, &title, &caption, &loading, &previous, &next, &save, &open,
+                &picture, &title, &caption, &loading, [&previous, &next, &save, &open],
             );
             let action = action.clone();
             next.connect_clicked(move |_| navigate(&state, &view, &action, 1));
@@ -191,18 +192,19 @@ impl Viewer {
         let keys = gtk::EventControllerKey::new();
         {
             let buttons = [
-                previous.clone(),
-                next.clone(),
-                save.clone(),
-                open.clone(),
-                close.clone(),
+                previous.downgrade(),
+                next.downgrade(),
+                save.downgrade(),
+                open.downgrade(),
+                close.downgrade(),
             ];
             let state = state.clone();
             let action = action.clone();
             let view = widgets(
-                &picture, &title, &caption, &loading, &previous, &next, &save, &open,
+                &picture, &title, &caption, &loading, [&previous, &next, &save, &open],
             );
             keys.connect_key_pressed(move |_, key, _, modifiers| {
+                let buttons = buttons.iter().filter_map(glib::WeakRef::upgrade).collect::<Vec<_>>();
                 if key == gdk::Key::Escape {
                     let source_id = state.borrow().source_id;
                     if let Some(callback) = action.borrow().as_ref().cloned() {
@@ -211,13 +213,13 @@ impl Viewer {
                     return glib::Propagation::Stop;
                 }
                 if key == gdk::Key::Left {
-                    if view.previous.is_sensitive() {
+                    if view.previous.upgrade().is_some_and(|button| button.is_sensitive()) {
                         navigate(&state, &view, &action, -1);
                     }
                     return glib::Propagation::Stop;
                 }
                 if key == gdk::Key::Right {
-                    if view.next.is_sensitive() {
+                    if view.next.upgrade().is_some_and(|button| button.is_sensitive()) {
                         navigate(&state, &view, &action, 1);
                     }
                     return glib::Propagation::Stop;
@@ -395,10 +397,7 @@ impl Viewer {
                 &self.title,
                 &self.caption,
                 &self.loading,
-                &self.previous,
-                &self.next,
-                &self.save,
-                &self.open,
+                [&self.previous, &self.next, &self.save, &self.open],
             ),
             &self.action,
         );
@@ -415,14 +414,14 @@ fn move_focus_outside(subtree: &gtk::Widget) {
 
 #[derive(Clone)]
 struct ViewerWidgets {
-    picture: gtk::Picture,
-    title: gtk::Label,
-    caption: gtk::Label,
-    loading: gtk::Label,
-    previous: gtk::Button,
-    next: gtk::Button,
-    save: gtk::Button,
-    open: gtk::Button,
+    picture: glib::WeakRef<gtk::Picture>,
+    title: glib::WeakRef<gtk::Label>,
+    caption: glib::WeakRef<gtk::Label>,
+    loading: glib::WeakRef<gtk::Label>,
+    previous: glib::WeakRef<gtk::Button>,
+    next: glib::WeakRef<gtk::Button>,
+    save: glib::WeakRef<gtk::Button>,
+    open: glib::WeakRef<gtk::Button>,
 }
 
 fn widgets(
@@ -430,20 +429,18 @@ fn widgets(
     title: &gtk::Label,
     caption: &gtk::Label,
     loading: &gtk::Label,
-    previous: &gtk::Button,
-    next: &gtk::Button,
-    save: &gtk::Button,
-    open: &gtk::Button,
+    controls: [&gtk::Button; 4],
 ) -> ViewerWidgets {
+    let [previous, next, save, open] = controls;
     ViewerWidgets {
-        picture: picture.clone(),
-        title: title.clone(),
-        caption: caption.clone(),
-        loading: loading.clone(),
-        previous: previous.clone(),
-        next: next.clone(),
-        save: save.clone(),
-        open: open.clone(),
+        picture: picture.downgrade(),
+        title: title.downgrade(),
+        caption: caption.downgrade(),
+        loading: loading.downgrade(),
+        previous: previous.downgrade(),
+        next: next.downgrade(),
+        save: save.downgrade(),
+        open: open.downgrade(),
     }
 }
 
@@ -469,6 +466,14 @@ fn refresh_widgets(
     widgets: &ViewerWidgets,
     action: &Rc<RefCell<Option<Callback>>>,
 ) {
+    let Some(picture) = widgets.picture.upgrade() else { return };
+    let Some(title) = widgets.title.upgrade() else { return };
+    let Some(caption) = widgets.caption.upgrade() else { return };
+    let Some(loading) = widgets.loading.upgrade() else { return };
+    let Some(previous) = widgets.previous.upgrade() else { return };
+    let Some(next) = widgets.next.upgrade() else { return };
+    let Some(save) = widgets.save.upgrade() else { return };
+    let Some(open) = widgets.open.upgrade() else { return };
     let (message, index, count, path, generation) = {
         let state = state.borrow();
         let Some(message) = state.photos.get(state.index).cloned() else {
@@ -482,10 +487,8 @@ fn refresh_widgets(
             state.generation,
         )
     };
-    widgets
-        .title
-        .set_label(&format!("Photo {} of {}", index + 1, count));
-    widgets.caption.set_label(&format!(
+    title.set_label(&format!("Photo {} of {}", index + 1, count));
+    caption.set_label(&format!(
         "{}  ·  {}{}",
         if message.sender.is_empty() {
             "Unknown"
@@ -499,18 +502,18 @@ fn refresh_widgets(
             format!("\n{}", message.text)
         }
     ));
-    widgets.previous.set_sensitive(index > 0);
-    widgets.next.set_sensitive(index + 1 < count);
-    widgets.save.set_sensitive(path.is_some());
-    widgets.open.set_sensitive(path.is_some());
-    widgets.loading.remove_css_class("omg-error");
+    previous.set_sensitive(index > 0);
+    next.set_sensitive(index + 1 < count);
+    save.set_sensitive(path.is_some());
+    open.set_sensitive(path.is_some());
+    loading.remove_css_class("omg-error");
     if let Some(path) = path {
-        widgets.picture.set_filename(Some(&path));
-        widgets.loading.set_visible(false);
+        picture.set_filename(Some(&path));
+        loading.set_visible(false);
     } else {
-        widgets.picture.set_paintable(None::<&gdk::Paintable>);
-        widgets.loading.set_label("Loading…");
-        widgets.loading.set_visible(true);
+        picture.set_paintable(None::<&gdk::Paintable>);
+        loading.set_label("Loading…");
+        loading.set_visible(true);
         if let Some(callback) = action.borrow().as_ref().cloned() {
             callback(ViewerAction::Load {
                 msg_id: message.id,

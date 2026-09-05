@@ -11,6 +11,7 @@
   --fg-light: $light_foreground;
   --muted: $muted;
   --accent: $accent;
+  --on-accent: $on_accent;
   --selection: $selection;
   --red: $red;
   --green: $green;
@@ -27,6 +28,21 @@ window.omg-window {
   font-family: "JetBrainsMono Nerd Font", monospace;
   font-size: 10.5pt;
 }
+
+/* Native GTK defaults can still be dark when Omarchy changes to a light
+   palette. Paint the foundational surfaces explicitly before component rules. */
+.omg-window list, .omg-chat-header {
+  background-color: var(--bg-dark);
+  color: var(--fg);
+}
+.omg-window entry, .omg-window dropdown > button {
+  background-image: none;
+  background-color: var(--bg-darker);
+  color: var(--fg);
+  border: 1px solid var(--bg-lighter);
+}
+.omg-window entry text { color: var(--fg); caret-color: var(--accent); }
+.omg-window button { background-image: none; color: var(--fg); }
 
 /* GTK's default focus ring is Adwaita blue — retint it everywhere so no
    non-token color ever appears. */
@@ -915,8 +931,8 @@ scrollbar slider:hover {
 }
 
 .omg-sidebar-top {
-  min-height: 48px;
-  padding: 0 8px;
+  min-height: 56px;
+  padding: 4px 8px;
   border-bottom: 1px solid var(--bg-lighter);
 }
 
@@ -924,7 +940,7 @@ scrollbar slider:hover {
   background-color: var(--bg-darker);
   color: var(--fg);
   border: 1px solid var(--bg-lighter);
-  border-radius: 6px;
+  border-radius: 4px;
   padding: 6px 10px;
   caret-color: var(--accent);
 }
@@ -1152,6 +1168,12 @@ button.omg-primary,
   background-color: var(--bg-dark);
   border-left: 2px solid var(--accent);
   border-bottom: 1px solid var(--bg-lighter);
+}
+
+.omg-history-status {
+  padding: 4px 12px;
+  background-color: var(--bg-dark);
+  border-top: 1px solid var(--bg-lighter);
 }
 
 .omg-pre-block {
@@ -1642,7 +1664,7 @@ button.omg-scheduled-bar {
   background-image: none;
   background-color: var(--bg-dark);
   color: var(--fg);
-  min-height: 40px;
+  min-height: 28px;
   padding: 4px 12px;
   border: none;
   border-left: 2px solid var(--accent);
@@ -2063,3 +2085,51 @@ button.omg-call-control:focus-visible {
   opacity: 0.9;
 }
 /* ---- end 7 ---- */
+
+/* Review: clear interaction states, consistent native controls and density. */
+.omg-window button:focus-visible,
+.omg-window entry:focus-within,
+.omg-window textview:focus-within,
+.omg-window checkbutton:focus-visible,
+.omg-window dropdown:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.omg-window list row:selected {
+  background-color: var(--selection);
+  color: var(--fg);
+}
+.omg-window checkbutton check,
+.omg-window checkbutton radio {
+  background-image: none;
+  background-color: var(--bg-dark);
+  border: 1px solid var(--muted);
+  color: var(--fg);
+  box-shadow: none;
+}
+.omg-window checkbutton check:checked,
+.omg-window checkbutton radio:checked {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+button.omg-primary { color: var(--on-accent); }
+button.omg-icon-button, button.omg-attach, button.omg-bar-close { color: var(--fg-light); }
+button.omg-danger, button.omg-call-decline, button.omg-call-hangup { color: var(--red); border: 1px solid var(--red); }
+.omg-window button:disabled { opacity: 0.5; }
+.omg-composer button { min-width: 24px; min-height: 24px; padding: 8px; margin: 0; }
+button.omg-reaction-anchor { min-width: 16px; min-height: 16px; padding: 0 4px; border: none; }
+.omg-chat-row { min-height: 48px; padding: 8px; }
+.omg-compact-list .omg-chat-row { min-height: 40px; padding: 8px; }
+.omg-chat-row:selected { border-left: 3px solid var(--accent); padding-left: 5px; }
+.omg-settings-form { padding: 16px 24px; }
+.omg-form-label { color: var(--fg); font-weight: bold; }
+.omg-search-match { color: var(--fg); }
+
+.omg-density-preview { background-color: var(--bg-dark); border: 1px solid var(--bg-lighter); padding: 0 8px; }
+.omg-window label link, .omg-window label link:visited { color: var(--accent); }
+.omg-stories-compact { padding: 4px; }
+.omg-stories-compact button.omg-story-item { padding: 2px; min-width: 32px; min-height: 32px; }
+.omg-switcher list { background-color: var(--bg-dark); color: var(--fg); }
+.omg-switcher row:selected, .omg-switcher row:selected:focus { background-color: var(--selection); color: var(--fg); }
+.omg-switcher row:hover { background-color: var(--bg-lighter); }

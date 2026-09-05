@@ -93,6 +93,29 @@ Telegram sends you (and your password if you use two-step verification). The
 session is stored at `~/.local/share/omarchygram/omarchygram.session`, so this
 happens only once.
 
+## Background operation and online status
+
+Closing the window keeps Omarchygram running: messages, synchronization and
+notifications continue without occupying a workspace. Launch it again to
+restore the same window and chat. Disable this in **Settings → Messaging →
+Keep running when the window closes** if you prefer closing to quit.
+
+Use **☰ → Quit Omarchygram**, **Ctrl+Q**, or `omarchygram --quit` to stop it.
+`omarchygram --background` starts with the window hidden; login still opens a
+window when needed. This does not enable automatic startup at login.
+
+Omarchygram reports online while its window is visible, focused and used within
+the last five minutes. Hiding it, moving focus elsewhere or becoming idle
+requests offline status. Ghost mode always requests offline. Telegram privacy
+settings, network delays and your other Telegram clients can affect what
+contacts see; a background connection alone does not request online status.
+
+Recently opened chats display their cached messages immediately, then refresh
+from Telegram. The account-specific cache keeps up to 24 recent pages of 50
+messages each, at most 12 MiB of message payload. Cache files are private and
+persist across restarts. A chat without cached history still needs its first
+Telegram response. Failed refreshes keep the cached content and offer Retry.
+
 ## Layout
 
 Telegram Desktop's layout on the Omarchy skin: a resizable chat list (drag
@@ -111,7 +134,7 @@ Search inside a chat (the magnifier in the header, `Ctrl+Shift+F`) with
 "N of M" navigation; bold/italic/strike/code/links/spoilers render and can be
 typed with the usual shortcuts or `**markers**`; link previews; reactions
 (right-click a message for the quick row, click a pill to toggle); pinned
-message bar; forward to one or several chats; full-window photo viewer with
+message bar with a four-line preview and Expand/Collapse; forward to one or several chats; full-window photo viewer with
 arrow keys and Save/Open; video/GIF/audio cards that download and open in
 your default app.
 
@@ -163,7 +186,7 @@ edit the file by hand). Everything below is off until you turn it on.
   reading), *Keep deleted messages* (messages others delete stay, struck
   through), *Keep edit history* (right-click an edited message → Edit history).
   Messages are recorded in a local archive at
-  `~/.local/share/omarchygram/archive.sqlite` (private to your user).
+  `~/.local/share/omarchygram/accounts/<account-id>/archive.sqlite` (private to your user and separated by Telegram account). Older unscoped history can be imported from Settings → Privacy after confirming which account it belongs to; the original file is preserved.
 - **AI** — enable the Assistant chat and the AI actions; auto-transcribe voice
   messages; pin a provider/model if you don't want auto-detection.
 - **Omarchy actions** — enable the Omarchy chat; allow shell commands (each one
@@ -302,3 +325,16 @@ its release page (the version pinned in `bin/fetch-ntgcalls`); its license text
 and copyright notices are preserved there. To build against your own ntgcalls,
 point `NTGCALLS_LIB_DIR` at your `libntgcalls.a`, or set `NTGCALLS_DYLIB=1` to
 link it dynamically.
+
+### Review improvements (September 2026)
+
+Settings now supports search, a Messaging category, text sizes from 85–150%,
+and compact/comfortable chat-list previews. Theme colors maintain readable
+secondary text across dark and light palettes; narrow windows use a compact
+chat and story rail.
+
+The location dialog keeps coordinate entry and adds an explicit place search
+(Photon by default; configurable in Settings → Privacy) and optional system
+location through GeoClue. Nothing is searched automatically. Check or select
+the pin before sharing. Active calls offer microphone/speaker selection under
+Audio devices, with mute preserved during changes.

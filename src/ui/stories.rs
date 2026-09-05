@@ -1,6 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -19,60 +18,32 @@ use super::icons;
 
 const DECODE_ERROR: &str = "can't play this: install gst-plugins-good gst-libav";
 
-struct RetainedStoryMedia {
-    path: PathBuf,
-    media: gtk::MediaFile,
-}
-
 thread_local! {
-    // One retained GTK pipeline per story identity, mirroring player.rs. A
-    // revisited story reuses the stream, and a changed cache path retargets
-    // it instead of leaking another GstPlay pipeline.
-    static STORY_MEDIA_POOL: RefCell<HashMap<(i64, i32), RetainedStoryMedia>> = RefCell::new(HashMap::new());
-    static RETIRED_STORY_MEDIA: RefCell<Vec<RetainedStoryMedia>> = const { RefCell::new(Vec::new()) };
+    // Only one story is visible: reuse one decoder for the entire viewer.
+    // Direct pipeline ownership allows resources to be released on close.
+    static STORY_MEDIA: RefCell<Option<gtk::MediaFile>> = const { RefCell::new(None) };
 }
 
-fn pooled_story_media(chat_id: i64, story_id: i32, path: &Path) -> gtk::MediaFile {
-    STORY_MEDIA_POOL
-        .try_with(|pool| {
-            let mut pool = pool.borrow_mut();
-            let identity = (chat_id, story_id);
-            if let Some(entry) = pool.get_mut(&identity) {
-                if entry.path != path {
-                    entry.media.pause();
-                    entry.media.set_filename(Some(path));
-                    entry.path = path.to_path_buf();
-                }
-                return entry.media.clone();
-            }
-            let media = gtk::MediaFile::for_filename(path);
-            // See CLAUDE.md: the extra reference prevents GTK 4.22's media
-            // backend from finalizing inside a GStreamer dispatch.
-            std::mem::forget(media.clone());
-            pool.insert(
-                identity,
-                RetainedStoryMedia {
-                    path: path.to_path_buf(),
-                    media: media.clone(),
-                },
-            );
-            media
-        })
-        .unwrap_or_else(|_| {
-            let media = gtk::MediaFile::for_filename(path);
-            std::mem::forget(media.clone());
-            media
-        })
+fn pooled_story_media(_chat_id: i64, _story_id: i32, path: &Path) -> gtk::MediaFile {
+    STORY_MEDIA.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let media = slot.get_or_insert_with(|| {
+
+                super::video_stream::new()
+        });
+        media.pause();
+        media.set_filename(Some(path));
+        media.clone()
+    })
 }
 
 fn retire_story_media_session() {
-    let retained: Vec<RetainedStoryMedia> = STORY_MEDIA_POOL
-        .try_with(|pool| pool.borrow_mut().drain().map(|(_, entry)| entry).collect())
-        .unwrap_or_default();
-    for entry in &retained {
-        entry.media.pause();
-    }
-    let _ = RETIRED_STORY_MEDIA.try_with(|retired| retired.borrow_mut().extend(retained));
+    let _ = STORY_MEDIA.try_with(|slot| {
+        if let Some(media) = slot.borrow().as_ref() {
+            media.pause();
+            media.set_filename(None::<&Path>);
+        }
+    });
 }
 
 /// Keep story-video errors consistent with the wave-6A inline player. GTK's
@@ -120,8 +91,10 @@ fn move_focus_outside(subtree: &gtk::Widget) {
 pub struct StoriesStrip {
     pub widget: gtk::Box,
     items_box: gtk::Box,
+    scroll: gtk::ScrolledWindow,
+    compact: Rc<Cell<bool>>,
     tg: Tg,
-    on_peer_click: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
+    on_peer_click: crate::ui::CallbackSlot<dyn Fn(i64)>,
     peers: Rc<RefCell<Vec<StoryPeer>>>,
 }
 
@@ -145,6 +118,8 @@ impl StoriesStrip {
         Self {
             widget,
             items_box,
+            scroll,
+            compact: Rc::new(Cell::new(false)),
             tg,
             on_peer_click: Rc::new(RefCell::new(None)),
             peers: Rc::new(RefCell::new(Vec::new())),
@@ -153,6 +128,18 @@ impl StoriesStrip {
 
     pub fn set_on_peer_click<F: Fn(i64) + 'static>(&self, callback: F) {
         *self.on_peer_click.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    pub fn set_compact(&self, compact: bool) {
+        if self.compact.replace(compact) == compact { return; }
+        self.items_box.set_orientation(if compact { gtk::Orientation::Vertical } else { gtk::Orientation::Horizontal });
+        self.items_box.set_spacing(if compact { 4 } else { 8 });
+        self.scroll.set_policy(if compact { gtk::PolicyType::Never } else { gtk::PolicyType::Automatic }, if compact { gtk::PolicyType::Automatic } else { gtk::PolicyType::Never });
+        self.scroll.set_min_content_height(if compact { 80 } else { -1 });
+        self.scroll.set_max_content_height(if compact { 80 } else { -1 });
+        if compact { self.widget.add_css_class("omg-stories-compact"); } else { self.widget.remove_css_class("omg-stories-compact"); }
+        let peers = self.peers.borrow().clone();
+        self.update_peers(peers);
     }
 
     pub fn update_peers(&self, peers: Vec<StoryPeer>) {
@@ -175,11 +162,12 @@ impl StoriesStrip {
         for peer in peers {
             let button = gtk::Button::new();
             button.add_css_class("omg-story-item");
+            button.set_tooltip_text(Some(&format!("{} · {}", peer.name, if peer.unread { "New stories" } else { "Stories" })));
 
             let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
             col.set_halign(gtk::Align::Center);
 
-            let avatar = Avatar::new(40);
+            let avatar = Avatar::new(if self.compact.get() { 28 } else { 40 });
             avatar.bind(&self.tg, peer.chat_id, &peer.name, peer.has_photo);
             if peer.unread {
                 avatar.widget.add_css_class("omg-story-unread");
@@ -199,6 +187,7 @@ impl StoriesStrip {
             label.set_ellipsize(gtk::pango::EllipsizeMode::End);
             label.set_max_width_chars(7);
             col.append(&label);
+            label.set_visible(!self.compact.get());
 
             button.set_child(Some(&col));
 
@@ -278,6 +267,9 @@ pub struct StoryViewer {
     media_file: Rc<RefCell<Option<gtk::MediaFile>>>,
     media_error_handler: Rc<RefCell<Option<glib::SignalHandlerId>>>,
     error_label: gtk::Label,
+    retry: gtk::Button,
+    pause_button: gtk::Button,
+    loading: gtk::Spinner,
     caption: gtk::Label,
     tg: Tg,
     peers: Rc<RefCell<Vec<StoryPeer>>>,
@@ -291,8 +283,8 @@ pub struct StoryViewer {
     story_started: Rc<RefCell<Option<Instant>>>,
     story_elapsed: Rc<Cell<Duration>>,
     progress: Rc<Cell<f64>>,
-    on_seen: Rc<RefCell<Option<Rc<dyn Fn(i64, i32)>>>>,
-    on_closed: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    on_seen: crate::ui::CallbackSlot<dyn Fn(i64, i32)>,
+    on_closed: crate::ui::CallbackSlot<dyn Fn()>,
 }
 
 fn remove_source_if_present(source_id: glib::SourceId) {
@@ -313,13 +305,16 @@ impl StoryViewer {
         widget.set_focusable(true);
         widget.set_visible(false);
 
-        // 9:16 stage, max 720 px tall (405x720)
+        // The media fits within the available window height, including controls.
         let stage = gtk::Box::new(gtk::Orientation::Vertical, 0);
         stage.add_css_class("omg-story-stage");
         stage.set_halign(gtk::Align::Center);
         stage.set_valign(gtk::Align::Center);
         stage.set_vexpand(true);
-        stage.set_size_request(405, 720);
+        stage.set_size_request(320, 400);
+        stage.set_hexpand(true);
+        stage.set_margin_start(16);
+        stage.set_margin_end(16);
         widget.append(&stage);
 
         // Top bar: segments + header
@@ -350,6 +345,9 @@ impl StoryViewer {
         header_time.add_css_class("omg-muted");
         header_row.append(&header_time);
 
+        let pause_button = gtk::Button::with_label("Pause");
+        pause_button.set_tooltip_text(Some("Pause story · Space"));
+        header_row.append(&pause_button);
         let close_btn = gtk::Button::with_label(icons::CLOSE);
         close_btn.add_css_class("omg-icon-button");
         close_btn.set_tooltip_text(Some("Close"));
@@ -364,7 +362,7 @@ impl StoryViewer {
         content_overlay.set_vexpand(true);
 
         let picture = gtk::Picture::new();
-        picture.set_content_fit(gtk::ContentFit::Cover);
+        picture.set_content_fit(gtk::ContentFit::Contain);
         picture.set_can_shrink(true);
         picture.set_hexpand(true);
         picture.set_vexpand(true);
@@ -377,6 +375,12 @@ impl StoryViewer {
         error_label.set_wrap(true);
         error_label.set_visible(false);
         content_overlay.add_overlay(&error_label);
+
+        let loading = gtk::Spinner::new();
+        loading.set_halign(gtk::Align::Center);
+        loading.set_valign(gtk::Align::Center);
+        loading.set_visible(false);
+        content_overlay.add_overlay(&loading);
 
         // Caption at bottom
         let caption = gtk::Label::new(None);
@@ -391,6 +395,21 @@ impl StoryViewer {
         content_overlay.add_overlay(&caption);
 
         stage.append(&content_overlay);
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        controls.set_halign(gtk::Align::Center);
+        controls.set_margin_top(8);
+        controls.set_margin_bottom(8);
+        let previous = gtk::Button::with_label("Previous");
+        previous.set_tooltip_text(Some("Previous story · Left arrow"));
+        let next = gtk::Button::with_label("Next");
+        next.set_tooltip_text(Some("Next story · Right arrow"));
+        let retry = gtk::Button::with_label("Retry");
+        retry.add_css_class("omg-primary");
+        retry.set_visible(false);
+        controls.append(&previous);
+        controls.append(&retry);
+        controls.append(&next);
+        stage.append(&controls);
 
         let this = Rc::new(Self {
             widget,
@@ -402,6 +421,9 @@ impl StoryViewer {
             media_file: Rc::new(RefCell::new(None)),
             media_error_handler: Rc::new(RefCell::new(None)),
             error_label,
+            retry,
+            pause_button,
+            loading,
             caption,
             tg,
             peers: Rc::new(RefCell::new(Vec::new())),
@@ -419,6 +441,17 @@ impl StoryViewer {
             on_closed: Rc::new(RefCell::new(None)),
         });
 
+        for (button, direction) in [(previous, -1), (next, 1), (this.pause_button.clone(), 0), (this.retry.clone(), 2)] {
+            let weak = Rc::downgrade(&this);
+            button.connect_clicked(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    match direction {
+                        -1 => this.previous(), 1 => this.next(), 0 => this.toggle_pause(),
+                        _ => { if this.current_stories.borrow().is_empty() { this.load_current_peer(0); } else { this.show_story(this.current_story_idx.get()); } }
+                    }
+                }
+            });
+        }
         // Click navigation exists only in the left and right thirds (§7.3).
         let click_gesture = gtk::GestureClick::new();
         let weak = Rc::downgrade(&this);
@@ -518,6 +551,9 @@ impl StoryViewer {
         };
         drop(peers);
 
+        self.loading.start(); self.loading.set_visible(true);
+        self.retry.set_visible(false); self.error_label.set_visible(false);
+        self.current_stories.borrow_mut().clear();
         self.header_name.set_label(&peer.name);
         self.header_avatar.bind(&self.tg, peer.chat_id, &peer.name, peer.has_photo);
 
@@ -533,12 +569,15 @@ impl StoryViewer {
                     *this.current_stories.borrow_mut() = stories;
                     this.show_story(story_index);
                 }
-                _ => {
-                    if !this.visible.get() || this.epoch.get() != epoch {
-                        return;
+                Ok(_) => {
+                    if this.visible.get() && this.epoch.get() == epoch { this.next_peer(); }
+                }
+                Err(_) => {
+                    if this.visible.get() && this.epoch.get() == epoch {
+                        this.loading.stop(); this.loading.set_visible(false);
+                        this.error_label.set_label("Could not load stories. Check your connection and try again.");
+                        this.error_label.set_visible(true); this.retry.set_visible(true);
                     }
-                    // Next peer if empty
-                    this.next_peer();
                 }
             }
         });
@@ -622,6 +661,8 @@ impl StoryViewer {
         }
 
         self.error_label.set_visible(false);
+        self.retry.set_visible(false);
+        self.loading.start(); self.loading.set_visible(true);
         self.picture.set_paintable(None::<&gdk::Paintable>);
 
         // Mark seen immediately when story becomes current (spec §7.3)
@@ -663,6 +704,8 @@ impl StoryViewer {
                             if let Some(error) = m.error() {
                                 this.error_label.set_label(&media_error_text(&error));
                                 this.error_label.set_visible(true);
+                                this.retry.set_visible(true);
+                                if !this.paused.get() { this.toggle_pause(); }
                             }
                         });
                         *this.media_error_handler.borrow_mut() = Some(handler);
@@ -673,8 +716,11 @@ impl StoryViewer {
                             this.error_label.set_label(&media_error_text(&error));
                             this.error_label.set_visible(true);
                         }
-                    } else if let Ok(texture) = gdk::Texture::from_file(&gio::File::for_path(&path)) {
-                        this.picture.set_paintable(Some(&texture));
+                    } else {
+                        let texture = gio::spawn_blocking(move || gdk::Texture::from_file(&gio::File::for_path(&path)).ok()).await.ok().flatten();
+                        if !this.visible.get() || this.epoch.get() != epoch { return; }
+                        if let Some(texture) = texture { this.picture.set_paintable(Some(&texture)); }
+                        else { this.error_label.set_label("Could not display this story"); this.error_label.set_visible(true); }
                     }
                 }
                 _ => {
@@ -689,7 +735,10 @@ impl StoryViewer {
             if !this.visible.get() || this.epoch.get() != epoch {
                 return;
             }
-            this.start_timer(duration_secs, epoch);
+            this.loading.stop(); this.loading.set_visible(false);
+            if this.error_label.is_visible() {
+                this.retry.set_visible(true);
+            } else { this.start_timer(duration_secs, epoch); }
         });
     }
 
@@ -699,6 +748,7 @@ impl StoryViewer {
         self.story_elapsed.set(Duration::ZERO);
         self.progress.set(0.0);
         self.paused.set(false);
+        self.pause_button.set_label("Pause");
 
         let this_weak = Rc::downgrade(self);
         let duration_ms = (duration_secs * 1000.0).max(500.0);
@@ -779,6 +829,7 @@ impl StoryViewer {
     pub fn toggle_pause(&self) {
         let new_state = !self.paused.get();
         self.paused.set(new_state);
+        self.pause_button.set_label(if new_state { "Resume" } else { "Pause" });
         if new_state {
             if let Some(started) = self.story_started.borrow_mut().take() {
                 self.story_elapsed
@@ -840,6 +891,7 @@ impl StoryViewer {
         *self.story_started.borrow_mut() = None;
         self.story_elapsed.set(Duration::ZERO);
         self.paused.set(false);
+        self.pause_button.set_label("Pause");
         let media = self.media_file.borrow().clone();
         if let Some(media) = media.as_ref()
             && let Some(handler) = self.media_error_handler.borrow_mut().take()
@@ -849,6 +901,7 @@ impl StoryViewer {
         self.picture.set_paintable(None::<&gdk::Paintable>);
         if let Some(media) = media {
             media.pause();
+            media.set_filename(None::<&Path>);
         }
         self.media_file.borrow_mut().take();
     }

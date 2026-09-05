@@ -30,6 +30,7 @@ type Callback = Rc<dyn Fn(PollDialogAction)>;
 
 struct OptionRow {
     row: gtk::Box,
+    label: gtk::Label,
     entry: gtk::Entry,
     correct: gtk::CheckButton,
     remove: gtk::Button,
@@ -52,6 +53,7 @@ pub struct PollDialog {
     add_option: gtk::Button,
     create: gtk::Button,
     error: gtk::Label,
+    validation: gtk::Label,
     action: RefCell<Option<Callback>>,
     busy: Cell<bool>,
     /// Set once in `new()`; option rows are built after construction and
@@ -91,7 +93,12 @@ impl PollDialog {
         heading.append(&close);
         card.append(&heading);
 
+        let question_label = gtk::Label::new(Some("Question"));
+        question_label.add_css_class("omg-form-label");
+        question_label.set_halign(gtk::Align::Start);
+        card.append(&question_label);
         let question = gtk::Entry::new();
+        question.update_property(&[gtk::accessible::Property::Label("Question")]);
         question.set_placeholder_text(Some("Question"));
         question.set_max_length(MAX_QUESTION);
         card.append(&question);
@@ -103,7 +110,7 @@ impl PollDialog {
         question_row.append(&question_count);
         card.append(&question_row);
 
-        let options_label = gtk::Label::new(Some("Options"));
+        let options_label = gtk::Label::new(Some("Options · add at least two"));
         options_label.add_css_class("omg-small");
         options_label.add_css_class("omg-muted");
         options_label.set_halign(gtk::Align::Start);
@@ -121,7 +128,7 @@ impl PollDialog {
         let anonymous = gtk::CheckButton::with_label("Anonymous voting");
         anonymous.set_active(true);
         let multiple = gtk::CheckButton::with_label("Multiple answers");
-        let quiz = gtk::CheckButton::with_label("Quiz mode");
+        let quiz = gtk::CheckButton::with_label("Quiz · choose one correct answer");
         toggles.append(&anonymous);
         toggles.append(&multiple);
         toggles.append(&quiz);
@@ -131,6 +138,10 @@ impl PollDialog {
         let solution = gtk::Entry::new();
         solution.set_placeholder_text(Some("Explanation (optional)"));
         solution.set_max_length(MAX_SOLUTION);
+        let solution_label = gtk::Label::new(Some("Explanation (optional)"));
+        solution_label.set_halign(gtk::Align::Start);
+        solution_row.append(&solution_label);
+        solution.update_property(&[gtk::accessible::Property::Label("Explanation (optional)")]);
         solution_row.append(&solution);
         solution_row.set_visible(false);
         card.append(&solution_row);
@@ -142,6 +153,11 @@ impl PollDialog {
         error.set_visible(false);
         card.append(&error);
 
+        let validation = gtk::Label::new(None);
+        validation.add_css_class("omg-small");
+        validation.set_halign(gtk::Align::Start);
+        validation.set_wrap(true);
+        card.append(&validation);
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let cancel = gtk::Button::with_label("Cancel");
         cancel.add_css_class("omg-menu-item");
@@ -170,6 +186,7 @@ impl PollDialog {
             add_option,
             create,
             error,
+            validation,
             action: RefCell::new(None),
             busy: Cell::new(false),
             self_weak: RefCell::new(Weak::new()),
@@ -338,8 +355,11 @@ impl PollDialog {
         correct.set_valign(gtk::Align::Center);
         correct.set_visible(self.quiz.is_active());
         row.append(&correct);
+        let label = gtk::Label::new(None);
+        label.set_halign(gtk::Align::Start);
+        row.append(&label);
         let entry = gtk::Entry::new();
-        entry.set_placeholder_text(Some("Option"));
+        entry.set_placeholder_text(Some("Answer"));
         entry.set_max_length(MAX_OPTION);
         entry.set_hexpand(true);
         row.append(&entry);
@@ -351,6 +371,7 @@ impl PollDialog {
         self.options_box.append(&row);
         self.options.borrow_mut().push(OptionRow {
             row,
+            label,
             entry: entry.clone(),
             correct: correct.clone(),
             remove: remove.clone(),
@@ -368,10 +389,9 @@ impl PollDialog {
         {
             // Enter in the LAST option adds a row (spec §4.2).
             let weak = this.clone();
-            let entry_ref = entry.clone();
-            entry.connect_activate(move |_| {
+            entry.connect_activate(move |entry_ref| {
                 let Some(this) = weak.upgrade() else { return };
-                if this.is_last_option(&entry_ref) {
+                if this.is_last_option(entry_ref) {
                     this.add_option_row(true);
                 }
             });
@@ -386,10 +406,9 @@ impl PollDialog {
         }
         {
             let weak = this.clone();
-            let remove_ref = remove.clone();
-            remove.connect_clicked(move |_| {
+            remove.connect_clicked(move |remove_ref| {
                 if let Some(this) = weak.upgrade() {
-                    this.remove_option(&remove_ref);
+                    this.remove_option(remove_ref);
                 }
             });
         }
@@ -438,7 +457,10 @@ impl PollDialog {
         let correct = options
             .iter()
             .any(|option| option.correct.is_active() && !option.entry.text().trim().is_empty());
-        for option in options.iter() {
+        for (index, option) in options.iter().enumerate() {
+            let name = format!("Option {}", index + 1);
+            option.label.set_label(&name);
+            option.entry.update_property(&[gtk::accessible::Property::Label(&name)]);
             option.correct.set_visible(quiz);
             option.remove.set_sensitive(count > MIN_OPTIONS && !self.busy.get());
             option.entry.set_sensitive(!self.busy.get());
@@ -450,6 +472,9 @@ impl PollDialog {
         let ok = !self.question.text().trim().is_empty()
             && filled >= MIN_OPTIONS
             && (!quiz || correct);
+        self.validation.set_label(if self.question.text().trim().is_empty() { "Add a question to continue." }
+            else if filled < MIN_OPTIONS { "Add at least two answers to continue." }
+            else if quiz && !correct { "Select the correct answer for this quiz." } else { "Ready to create." });
         self.create.set_sensitive(ok && !self.busy.get());
     }
 

@@ -21,6 +21,7 @@ pub mod newgroup;
 pub mod poll;
 pub mod polldialog;
 pub mod locationdialog;
+mod geolocation;
 pub mod scheduled;
 pub mod recorder;
 pub mod settings_view;
@@ -36,3 +37,9 @@ pub mod lottie_backend;
 pub mod stories;
 /// Wave 6F: video note recorder.
 pub mod videonote;
+
+mod video_stream;
+
+/// An optional UI callback; owners capture each other weakly where necessary.
+pub type CallbackCell<F> = std::cell::RefCell<Option<std::rc::Rc<F>>>;
+pub type CallbackSlot<F> = std::rc::Rc<CallbackCell<F>>;

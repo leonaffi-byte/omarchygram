@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Settings {
     /// Message timestamps as HH:MM:SS instead of HH:MM.
     pub show_seconds: bool,
@@ -55,6 +56,8 @@ pub struct MediaSettings {
     pub animated_stickers: bool,
     /// false → no map tiles are fetched; location cards show coordinates only.
     pub map_tiles: bool,
+    /// Photon-compatible endpoint; used only for explicit place searches.
+    pub place_search_url: String,
 }
 
 /// Wave 7 voice-call preferences (specs/spec-wave7.md §1.5).
@@ -82,6 +85,7 @@ impl Default for MediaSettings {
             voice_speed: 1.0,
             animated_stickers: true,
             map_tiles: true,
+            place_search_url: "https://photon.komoot.io/api".into(),
         }
     }
 }
@@ -89,6 +93,8 @@ impl Default for MediaSettings {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct UiSettings {
+    /// Closing hides the window while sync and notifications continue.
+    pub keep_running: bool,
     /// Parse **bold** etc. when sending (off = send literally).
     pub markdown_send: bool,
     /// Enter sends (off = Ctrl+Enter sends, Enter inserts a newline).
@@ -96,11 +102,13 @@ pub struct UiSettings {
     pub show_avatars: bool,
     /// 56px chat rows instead of 64px.
     pub compact_list: bool,
+    /// App text scaling, independent of monitor scaling (85–150%).
+    pub text_scale: u32,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
-        UiSettings { markdown_send: true, send_on_enter: true, show_avatars: true, compact_list: false }
+        UiSettings { keep_running: true, markdown_send: true, send_on_enter: true, show_avatars: true, compact_list: false, text_scale: 100 }
     }
 }
 
@@ -158,6 +166,7 @@ pub struct AiSettings {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+#[derive(Default)]
 pub struct OsSettings {
     /// Master switch for the "Omarchy" virtual chat (named actions).
     pub enabled: bool,
@@ -167,25 +176,6 @@ pub struct OsSettings {
     pub actions: BTreeMap<String, String>,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Settings {
-            show_seconds: false,
-            header_clock: false,
-            timestamp_format: String::new(),
-            ghost_mode: false,
-            anti_delete: false,
-            edit_history: false,
-            ai: AiSettings::default(),
-            os: OsSettings::default(),
-            animations: BTreeMap::new(),
-            ui: UiSettings::default(),
-            keys: BTreeMap::new(),
-            media: MediaSettings::default(),
-            calls: CallSettings::default(),
-        }
-    }
-}
 
 impl Default for AiSettings {
     fn default() -> Self {
@@ -200,11 +190,6 @@ impl Default for AiSettings {
     }
 }
 
-impl Default for OsSettings {
-    fn default() -> Self {
-        OsSettings { enabled: false, shell: false, actions: BTreeMap::new() }
-    }
-}
 
 impl Settings {
     /// The strftime format to render message times with.
@@ -242,42 +227,26 @@ pub fn path() -> PathBuf {
         .join("omarchygram/settings.toml")
 }
 
-/// Missing or invalid file → defaults (never fails).
+fn try_load() -> std::io::Result<Settings> {
+    crate::storage::read_table(&path())?.try_into()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid settings; existing file preserved"))
+}
+
+/// Startup can use defaults; a malformed file is never overwritten or hot-reloaded.
 pub fn load() -> Settings {
-    match std::fs::read_to_string(path()) {
-        Ok(text) => match toml::from_str::<Settings>(&text) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("omarchygram: settings.toml invalid, using defaults: {e}");
-                Settings::default()
-            }
-        },
-        Err(_) => Settings::default(),
-    }
+    try_load().unwrap_or_else(|error| {
+        eprintln!("omarchygram: could not load settings: {error}");
+        Settings::default()
+    })
 }
 
 pub fn save(settings: &Settings) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let p = path();
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    let text = toml::to_string_pretty(settings).map_err(std::io::Error::other)?;
-    // Private temp file (holds user command lines), fsync, then rename so a
-    // reader never sees a half-written file and a crash never truncates it.
-    let tmp = p.with_extension("toml.tmp");
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, &p)
+    crate::storage::update_table(&path(), |table| {
+        // Invalid known values are preserved too (not only malformed TOML).
+        let _: Settings = table.clone().try_into().map_err(|_| std::io::Error::other("invalid settings; existing file preserved"))?;
+        crate::storage::merge_table(table, toml::Table::try_from(settings).map_err(std::io::Error::other)?);
+        Ok(())
+    })
 }
 
 type Listener = Rc<dyn Fn(&Settings)>;
@@ -316,12 +285,15 @@ impl SettingsStore {
 
     /// Like `update` but reports a save failure (nothing changes on Err).
     pub fn try_update(&self, f: impl FnOnce(&mut Settings)) -> Result<(), String> {
-        let candidate = {
-            let mut c = self.current.borrow().clone();
-            f(&mut c);
-            c
-        };
-        save(&candidate).map_err(|e| e.to_string())?;
+        let mut candidate = None;
+        crate::storage::update_table(&path(), |table| {
+            let mut fresh: Settings = table.clone().try_into().map_err(|_| std::io::Error::other("invalid settings; existing file preserved"))?;
+            f(&mut fresh);
+            crate::storage::merge_table(table, toml::Table::try_from(&fresh).map_err(std::io::Error::other)?);
+            candidate = Some(fresh);
+            Ok(())
+        }).map_err(|e| e.to_string())?;
+        let candidate = candidate.expect("successful settings update produced a value");
         *self.current.borrow_mut() = candidate.clone();
         self.notify(&candidate);
         Ok(())
@@ -359,7 +331,7 @@ impl SettingsStore {
             let id = glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
                 debounce_inner.borrow_mut().take();
                 if let Some(store) = weak.upgrade() {
-                    let fresh = load();
+                    let Ok(fresh) = try_load() else { return };
                     if fresh != *store.current.borrow() {
                         *store.current.borrow_mut() = fresh.clone();
                         store.notify(&fresh);

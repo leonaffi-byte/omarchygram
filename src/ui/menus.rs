@@ -23,6 +23,8 @@ pub enum ChatAction {
 
 #[derive(Clone, Copy, Debug)]
 pub enum MainMenuAction {
+    Hide,
+    Quit,
     Saved,
     Contacts,
     NewGroup,

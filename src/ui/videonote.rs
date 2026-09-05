@@ -275,11 +275,10 @@ impl VideoRecorderBar {
 
     fn stop_timer(&self) {
         self.started.borrow_mut().take();
-        if let Some(source) = self.timer_source.borrow_mut().take() {
-            if let Some(source) = glib::MainContext::default().find_source_by_id(&source) {
+        if let Some(source) = self.timer_source.borrow_mut().take()
+            && let Some(source) = glib::MainContext::default().find_source_by_id(&source) {
                 source.destroy();
             }
-        }
     }
 
     fn stop_frame_stream(&self) {

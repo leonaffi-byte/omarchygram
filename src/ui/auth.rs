@@ -35,7 +35,7 @@ struct FormState {
     submit_button: gtk::Button,
     error: gtk::Label,
     busy: Cell<bool>,
-    on_submit: RefCell<Option<Rc<dyn Fn(i32, String)>>>,
+    on_submit: crate::ui::CallbackCell<dyn Fn(i32, String)>,
 }
 
 /// "API ID" + "API hash" fields with inline validation — shared by the login
@@ -288,6 +288,8 @@ impl CredentialsFormHandle {
 pub struct AuthView {
     pub widget: gtk::Box,
     title: gtk::Label,
+    progress: gtk::Label,
+    field_label: gtk::Label,
     hint: gtk::Label,
     link: gtk::LinkButton,
     entry: gtk::Entry,
@@ -297,7 +299,13 @@ pub struct AuthView {
     state: Rc<Cell<AuthState>>,
     busy: Rc<Cell<bool>>,
     retry_start: Rc<Cell<bool>>,
-    action: Rc<RefCell<Option<Rc<dyn Fn(AuthAction)>>>>,
+    action: crate::ui::CallbackSlot<dyn Fn(AuthAction)>,
+}
+
+impl Default for AuthView {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AuthView {
@@ -321,6 +329,10 @@ impl AuthView {
         title.add_css_class("omg-auth-title");
         title.set_halign(gtk::Align::Start);
         form.append(&title);
+        let progress = gtk::Label::new(None);
+        progress.add_css_class("omg-small");
+        progress.set_halign(gtk::Align::Start);
+        form.append(&progress);
 
         let hint = gtk::Label::new(None);
         hint.add_css_class("omg-auth-hint");
@@ -335,6 +347,10 @@ impl AuthView {
         link.set_visible(false);
         form.append(&link);
 
+        let field_label = gtk::Label::new(None);
+        field_label.add_css_class("omg-form-label");
+        field_label.set_halign(gtk::Align::Start);
+        form.append(&field_label);
         let entry = gtk::Entry::new();
         entry.set_hexpand(true);
         form.append(&entry);
@@ -358,19 +374,19 @@ impl AuthView {
         let state = Rc::new(Cell::new(AuthState::NeedPhone));
         let busy = Rc::new(Cell::new(false));
         let retry_start = Rc::new(Cell::new(false));
-        let action: Rc<RefCell<Option<Rc<dyn Fn(AuthAction)>>>> = Rc::new(RefCell::new(None));
+        let action: crate::ui::CallbackSlot<dyn Fn(AuthAction)> = Rc::new(RefCell::new(None));
 
         {
-            let entry = entry.clone();
-            let button_for_submit = button.clone();
+            let entry = entry.downgrade();
             let state = state.clone();
             let busy = busy.clone();
             let retry_start = retry_start.clone();
             let action = action.clone();
-            button.connect_clicked(move |_| {
+            button.connect_clicked(move |button| {
+                let Some(entry) = entry.upgrade() else { return };
                 Self::submit(
                     &entry,
-                    &button_for_submit,
+                    button,
                     &state,
                     &busy,
                     &retry_start,
@@ -379,12 +395,13 @@ impl AuthView {
             });
         }
         {
-            let button = button.clone();
+            let button = button.downgrade();
             let state = state.clone();
             let busy = busy.clone();
             let retry_start = retry_start.clone();
             let action = action.clone();
             entry.connect_activate(move |entry| {
+                let Some(button) = button.upgrade() else { return };
                 Self::submit(entry, &button, &state, &busy, &retry_start, &action);
             });
         }
@@ -402,6 +419,8 @@ impl AuthView {
         let view = Self {
             widget,
             title,
+            progress,
+            field_label,
             hint,
             link,
             entry,
@@ -423,7 +442,7 @@ impl AuthView {
         state: &Cell<AuthState>,
         busy: &Cell<bool>,
         retry_start: &Cell<bool>,
-        callback: &RefCell<Option<Rc<dyn Fn(AuthAction)>>>,
+        callback: &crate::ui::CallbackCell<dyn Fn(AuthAction)>,
     ) {
         if busy.get() {
             return;
@@ -464,6 +483,8 @@ impl AuthView {
         self.error.set_visible(false);
         self.hint.set_selectable(false);
         self.hint.remove_css_class("omg-empty-state");
+        self.field_label.set_visible(true);
+        self.progress.set_visible(true);
         let is_password = state == AuthState::NeedPassword;
         self.entry.set_visibility(!is_password);
         // Tell input methods this is a password so they don't record/suggest it.
@@ -480,17 +501,24 @@ impl AuthView {
         match state {
             AuthState::NeedPhone => {
                 self.title.set_label("Sign in");
+                self.progress.set_label("1 · Phone   →   2 · Code   →   3 · Password if needed");
+                self.field_label.set_label("Phone number");
+                self.entry.set_input_purpose(gtk::InputPurpose::Phone);
                 self.hint
                     .set_label("Enter your phone number with country code.");
                 self.entry.set_placeholder_text(Some("+123456789"));
             }
             AuthState::NeedCode => {
                 self.title.set_label("Verification code");
-                self.hint.set_label("Enter the code Telegram sent you.");
+                self.progress.set_label("2 · Code   →   3 · Password if needed");
+                self.field_label.set_label("Telegram code");
+                self.hint.set_label("Check Telegram on a device where you are signed in, or the delivery method Telegram offers for your account.");
                 self.entry.set_placeholder_text(Some("Code"));
             }
             AuthState::NeedPassword => {
                 self.title.set_label("Two-step verification");
+                self.progress.set_label("3 · Password");
+                self.field_label.set_label("Two-step verification password");
                 self.hint.set_label("Enter your Telegram password.");
                 self.entry.set_placeholder_text(Some("Password"));
             }
@@ -507,9 +535,12 @@ impl AuthView {
         self.state.set(AuthState::NeedCredentials);
         self.busy.set(false);
         self.retry_start.set(false);
-        self.title.set_label("Telegram API credentials");
+        self.title.set_label("Connect to Telegram");
+        self.progress.set_label("Setup   →   Phone   →   Code   →   Password if needed");
+        self.progress.set_visible(true);
+        self.field_label.set_visible(false);
         self.hint.set_label(
-            "Omarchygram needs your own Telegram API credentials to connect.\nCreate a free application with your Telegram account, then enter the values below.",
+            "Omarchygram needs your own Telegram API credentials to connect.\nOpen the link below, sign in, choose API development tools, and create an application. Copy its API ID and API hash here. These identify the app; your phone and verification code come next.",
         );
         self.hint.set_selectable(false);
         self.hint.remove_css_class("omg-empty-state");
@@ -524,6 +555,8 @@ impl AuthView {
 
     pub fn show_start_error(&self, message: &str) {
         self.title.set_label("Connection failed");
+        self.progress.set_visible(false);
+        self.field_label.set_visible(false);
         self.hint.set_label("Omarchygram could not start.");
         self.hint.set_selectable(false);
         self.hint.remove_css_class("omg-empty-state");

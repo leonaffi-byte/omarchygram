@@ -1,4 +1,6 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gtk::glib;
@@ -6,6 +8,42 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 
 use crate::tg::Tg;
+
+thread_local! {
+    // Account/photo IDs are part of the immutable filename. Eviction releases
+    // textures; no encoded file copies are retained here.
+    static TEXTURES: RefCell<VecDeque<(PathBuf, i32, gtk::gdk::Texture)>> = const { RefCell::new(VecDeque::new()) };
+}
+const CACHE_BYTES: usize = 16 * 1024 * 1024;
+static DECODERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+pub fn clear_cache() { TEXTURES.with(|cache| cache.borrow_mut().clear()); }
+
+async fn avatar_texture(path: PathBuf, target: i32) -> Option<gtk::gdk::Texture> {
+    let cached = TEXTURES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let index = cache.iter().position(|(p, size, _)| p == &path && *size == target)?;
+        let entry = cache.remove(index)?;
+        let texture = entry.2.clone();
+        cache.push_back(entry);
+        Some(texture)
+    });
+    if cached.is_some() { return cached; }
+    let permit = DECODERS.acquire().await.ok()?;
+    let source = path.clone();
+    let texture = gtk::gio::spawn_blocking(move || {
+        square_pixbuf(&source, target).ok().map(|pixbuf| gtk::gdk::Texture::for_pixbuf(&pixbuf))
+    }).await.ok()??;
+    drop(permit);
+    TEXTURES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.push_back((path, target, texture.clone()));
+        while cache.len() > 128 || cache.iter().map(|(_, size, _)| (*size as usize).pow(2) * 4).sum::<usize>() > CACHE_BYTES {
+            cache.pop_front();
+        }
+    });
+    Some(texture)
+}
 
 #[derive(Clone)]
 pub struct Avatar {
@@ -97,11 +135,9 @@ impl Avatar {
             let (Some(stack), Some(picture)) = (stack.upgrade(), picture.upgrade()) else {
                 return;
             };
-            let target = size.get().saturating_mul(stack.scale_factor()).max(1);
-            let Ok(pixbuf) = square_pixbuf(&path, target) else {
-                return;
-            };
-            let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+            let target = size.get().saturating_mul(stack.scale_factor()).clamp(1, 512);
+            let Some(texture) = avatar_texture(path, target).await else { return };
+            if key.get() != id || current_generation.get() != generation { return; }
             picture.set_paintable(Some(&texture));
             stack.set_visible_child_name("photo");
         });
@@ -143,8 +179,13 @@ fn square_pixbuf(
     path: &std::path::Path,
     target: i32,
 ) -> Result<gtk::gdk_pixbuf::Pixbuf, glib::Error> {
-    let fitted = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, target, target, true)?;
-    let (scaled_width, scaled_height) = cover_dimensions(fitted.width(), fitted.height(), target);
+    let (_, width, height) = gtk::gdk_pixbuf::Pixbuf::file_info(path)
+        .ok_or_else(|| glib::Error::new(gtk::gio::IOErrorEnum::InvalidData, "Invalid avatar"))?;
+    let (scaled_width, scaled_height) = cover_dimensions(width, height, target);
+    // Bound pathological panoramas before allocating a decoded image.
+    let max_edge = target.saturating_mul(8);
+    let scale = f64::from(max_edge) / f64::from(scaled_width.max(scaled_height).max(max_edge));
+    let (scaled_width, scaled_height) = ((f64::from(scaled_width) * scale) as i32, (f64::from(scaled_height) * scale) as i32);
     let scaled =
         gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, scaled_width, scaled_height, true)?;
     let crop_size = target.min(scaled.width()).min(scaled.height()).max(1);

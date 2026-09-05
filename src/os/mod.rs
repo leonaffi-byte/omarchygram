@@ -306,11 +306,10 @@ pub async fn run_action(action: &Action, args: &[String], policy: OsPolicy) -> R
     // Arguments starting with '-' are options for the target program; only
     // allow them when the action documents options in its args hint.
     let allows_options = action.args.contains('-');
-    if !allows_options {
-        if let Some(bad) = args.iter().find(|a| a.starts_with('-')) {
+    if !allows_options
+        && let Some(bad) = args.iter().find(|a| a.starts_with('-')) {
             return Err(format!("`{}` does not take options (got `{bad}`)", action.name));
         }
-    }
     if action.name == "notify" && args.is_empty() {
         return Err("notify needs some text".into());
     }

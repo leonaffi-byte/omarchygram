@@ -380,6 +380,7 @@ mod tests {
             emojis: String::new(),
             connected_at: None,
             end_reason: None,
+                    error: None,
         };
         set_call(Some(&info));
         assert!(WRITER.with(|w| w.borrow().state.call.is_none()));

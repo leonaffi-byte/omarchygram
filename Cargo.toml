@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 # Voice/video calls via the vendored ntgcalls static lib (LGPL-3; see bin/fetch-ntgcalls).
-# Off by default so the app builds small and dependency-light without it.
+# Included by default; --no-default-features is an explicit build without calls.
 default = ["calls"]
 calls = ["dep:ntgcalls"]
 
@@ -29,24 +29,26 @@ opt-level = 3
 libc = "0.2"
 ntgcalls = { version = "=3.0.0-rc01", optional = true }
 async-channel = "2.5.0"
-# Wave 8C: only Local::now/Utc plus Duration/format helpers are used; no chrono
-# serde. `clock` pulls the minimal std time backend, dropping wasm-bindgen/js-sys.
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# Keep the minimal clock backend; serde preserves timestamps in the bounded
+# local history cache without losing formatting or typed message payloads.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 dirs = "6.0.0"
 flate2 = "1"
-grammers-client = { version = "0.10.0", features = ["markdown"] }
-# Wave 6A audio playback (playbin3 with rate control); video goes through GTK's own media backend.
+grammers-client = "0.10.0"
+# GStreamer audio and explicitly owned video pipelines (GTK paintable adapter).
 gstreamer = "0.25"
+gstreamer-app = "0.25"
+gstreamer-video = "0.25"
 grammers-session = "0.10.0"
 grammers-tl-types = "0.10.0"
 gtk4 = { version = "0.11.4", features = ["v4_12"] }
 # Wave 8C: the `image` crate is used only to decode webp (stickers) + png (OSM
 # tiles) and encode png (stickers, maps); photos/avatars go through GdkPixbuf,
 # not this crate. Drop the ~10 unused codecs (gif/tiff/bmp/ico/tga/dds/exr/…);
-# jpeg kept as cheap insurance for any photo path that reaches `image`.
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+# JPEGs continue to decode through GdkPixbuf/GStreamer; no duplicate JPEG codec.
+image = { version = "0.25.10", default-features = false, features = ["png", "webp"] }
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "multipart"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "multipart", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # Wave 6D animated (.tgs) stickers: ThorVG vendored, software rasterizer only

@@ -4,6 +4,7 @@ pub mod local;
 pub mod os;
 pub mod settings;
 pub mod status;
+mod storage;
 pub mod theme;
 pub mod tg;
 pub mod ui;

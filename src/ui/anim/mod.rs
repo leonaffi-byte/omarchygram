@@ -60,326 +60,326 @@ pub const SUBTLE: &[&str] = &[
 pub const EFFECTS: &[EffectSpec] = &[
     EffectSpec {
         id: "typewriter",
-        label: "typewriter",
-        description: "text types out with a block cursor — code: label text grows 1 char/18ms via timeout; cursor = \"▌\" appended, removed 350ms after.",
+        label: "Typewriter",
+        description: "Reveal new message text as if it is being typed.",
         group: Some(RadioGroup::Entry),
     },
     EffectSpec {
         id: "decode",
-        label: "decode",
-        description: "glyphs scramble then settle — code: per-frame label text with random glyphs from `░▒▓#$%@&*+=-<>` for unsettled positions, 16ms.",
+        label: "Scrambled reveal",
+        description: "Scrambled characters settle into each new message.",
         group: Some(RadioGroup::Entry),
     },
     EffectSpec {
         id: "lineprint",
-        label: "lineprint",
-        description: "reveals top-down in steps — code: a `gtk::Revealer` with `SlideDown` 280ms, `set_reveal_child(true)` after add.",
+        label: "Line reveal",
+        description: "Unfold new messages from top to bottom.",
         group: Some(RadioGroup::Entry),
     },
     EffectSpec {
         id: "fadeup",
-        label: "fadeup",
-        description: "soft rise, 160ms — CSS: `omg-anim-fadeup` keyframes opacity 0→1 + `margin-top: 4px→0`.",
+        label: "Soft arrival",
+        description: "New messages fade in with a slight upward movement.",
         group: Some(RadioGroup::Entry),
     },
     EffectSpec {
         id: "instantcursor",
-        label: "instantcursor",
-        description: "instant + cursor blinks twice — code: cursor label blink via 2 timeouts.",
+        label: "Cursor blink",
+        description: "Show messages immediately, then briefly blink a cursor.",
         group: Some(RadioGroup::Entry),
     },
     EffectSpec {
         id: "borderdraw",
-        label: "borderdraw",
-        description: "border traces around — code: animate `border-color` via CSS keyframes cycling `transparent→accent` on each side in sequence (4 keyframe steps).",
+        label: "Traced border",
+        description: "Trace the border around a new message.",
         group: Some(RadioGroup::Entry),
     },
     EffectSpec {
         id: "entrynone",
-        label: "entrynone",
-        description: "hard cut.",
+        label: "Instant arrival",
+        description: "Show new messages without an arrival effect.",
         group: Some(RadioGroup::Entry),
     },
     EffectSpec {
         id: "invert",
-        label: "invert",
-        description: "CSS keyframe 90ms swapping bg/fg.",
+        label: "Send flash",
+        description: "Briefly invert a sent message’s colors.",
         group: Some(RadioGroup::Send),
     },
     EffectSpec {
         id: "ticksweep",
-        label: "ticksweep",
-        description: "a 1px accent box under the bubble grows `margin-end` 100%→0 via CSS.",
+        label: "Send underline",
+        description: "Draw an accent line under a sent message.",
         group: Some(RadioGroup::Send),
     },
     EffectSpec {
         id: "sendspin",
-        label: "sendspin",
-        description: "Send button label cycles ⠋⠙⠹⠸⠼⠴ 60ms until the send resolves.",
+        label: "Sending indicator",
+        description: "Animate the Send button while a message is being delivered.",
         group: Some(RadioGroup::Send),
     },
     EffectSpec {
         id: "sendnone",
-        label: "sendnone",
-        description: "no send feedback.",
+        label: "Quiet sending",
+        description: "Send without an additional visual effect.",
         group: Some(RadioGroup::Send),
     },
     EffectSpec {
         id: "wipe",
-        label: "wipe",
-        description: "overlay dark box slides via `gtk::Revealer` SlideRight in, then out (260ms).",
+        label: "Slide between chats",
+        description: "Slide a cover across the conversation when switching chats.",
         group: Some(RadioGroup::Switch),
     },
     EffectSpec {
         id: "crossfade",
-        label: "crossfade",
-        description: "messages box opacity keyframe 100ms.",
+        label: "Fade between chats",
+        description: "Briefly fade the conversation when switching chats.",
         group: Some(RadioGroup::Switch),
     },
     EffectSpec {
         id: "cascade",
-        label: "cascade",
-        description: "each row `omg-anim-fadeup` with a per-row delay (i*20ms, via timeout adding the class).",
+        label: "Staggered arrival",
+        description: "Reveal conversation rows one after another when switching chats.",
         group: Some(RadioGroup::Switch),
     },
     EffectSpec {
         id: "switchnone",
-        label: "switchnone",
-        description: "no chat-switch effect.",
+        label: "Instant chat switching",
+        description: "Switch conversations without a transition.",
         group: Some(RadioGroup::Switch),
     },
     EffectSpec {
         id: "reactburst",
-        label: "reactburst",
-        description: "chip `omg-anim-pop` (opacity+margin) + 6 tiny `gtk::Label(\"·\")` particles animated outward via margin keyframes then removed.",
+        label: "Reaction burst",
+        description: "Add a small burst around a new reaction.",
         group: None,
     },
     EffectSpec {
         id: "reactroll",
-        label: "reactroll",
-        description: "count label swapped after a 200ms opacity dip.",
+        label: "Reaction count fade",
+        description: "Fade between old and new reaction counts.",
         group: None,
     },
     EffectSpec {
         id: "receiptdraw",
-        label: "receiptdraw",
-        description: "\"✓\" then \"✓✓\" 400ms later with a fade.",
+        label: "Read receipt reveal",
+        description: "Reveal the second check when a sent message is read.",
         group: None,
     },
     EffectSpec {
         id: "editripple",
-        label: "editripple",
-        description: "`box-shadow` keyframe 0→6px transparent-accent 500ms.",
+        label: "Edit highlight",
+        description: "Briefly highlight an edited message.",
         group: None,
     },
     EffectSpec {
         id: "deletedissolve",
-        label: "deletedissolve",
-        description: "6 frames of glyph noise (code) then opacity→0 300ms, caller removes after 500ms.",
+        label: "Delete dissolve",
+        description: "Dissolve a removed message before it disappears.",
         group: None,
     },
     EffectSpec {
         id: "braille",
-        label: "braille",
-        description: "typing label cycles ⠋⠙⠹⠸⠼⠴⠦⠧ 70ms.",
+        label: "Typing spinner",
+        description: "Use a small rotating indicator while someone is typing.",
         group: None,
     },
     EffectSpec {
         id: "ellipsis",
-        label: "ellipsis",
-        description: "\"typing.\" \"..\" \"...\" 240ms.",
+        label: "Typing dots",
+        description: "Animate the dots in the typing indicator.",
         group: None,
     },
     EffectSpec {
         id: "badgepop",
-        label: "badgepop",
-        description: "CSS pop keyframe (opacity + margin).",
+        label: "Unread badge arrival",
+        description: "Briefly animate a new unread badge.",
         group: None,
     },
     EffectSpec {
         id: "badgeroll",
-        label: "badgeroll",
-        description: "old count fades up/out, new fades in from below (two labels in an overflow box, 220ms).",
+        label: "Unread count slide",
+        description: "Slide between old and new unread counts.",
         group: None,
     },
     EffectSpec {
         id: "badgepulse",
-        label: "badgepulse",
-        description: "CSS `box-shadow` glow keyframe 2.4s infinite on badges with count>0.",
+        label: "Unread pulse",
+        description: "Gently pulse badges with unread messages.",
         group: None,
     },
     EffectSpec {
         id: "bellshake",
-        label: "bellshake",
-        description: "row `margin-start` ±3px keyframes 400ms.",
+        label: "Chat nudge",
+        description: "Briefly nudge a chat row when it receives a message.",
         group: None,
     },
     EffectSpec {
         id: "asciiload",
-        label: "asciiload",
-        description: "placeholder text `[▓▓░░░░░░] photo` frames 110ms.",
+        label: "Text loading bar",
+        description: "Show a moving text progress bar while images load.",
         group: None,
     },
     EffectSpec {
         id: "selbaron",
-        label: "selbaron",
-        description: "accent bar widget in the sidebar overlay whose `margin-top` animates to the selected row's y (180ms, tick-interpolated).",
+        label: "Moving selection marker",
+        description: "Slide the sidebar marker to the selected chat.",
         group: None,
     },
     EffectSpec {
         id: "jumprocket",
-        label: "jumprocket",
-        description: "▼ button opacity dip + `margin-bottom` 6px keyframe 400ms.",
+        label: "Latest-message nudge",
+        description: "Animate the button that jumps to the latest message.",
         group: None,
     },
     EffectSpec {
         id: "unreaddivider",
-        label: "unreaddivider",
-        description: "divider row opacity 0→1 + width via revealer 400ms.",
+        label: "Unread divider reveal",
+        description: "Fade in the divider above unread messages.",
         group: None,
     },
     EffectSpec {
         id: "datefloat",
-        label: "datefloat",
-        description: "date chip revealer crossfade, auto-hide 900ms after last scroll.",
+        label: "Floating date",
+        description: "Briefly show the current date while scrolling through messages.",
         group: None,
     },
     EffectSpec {
         id: "chargesend",
-        label: "chargesend",
-        description: "Send button gets a child fill box growing over 600ms (CSS margin keyframe); send fires after.",
+        label: "Hold to send",
+        description: "Show a short filling indicator before sending.",
         group: None,
     },
     EffectSpec {
         id: "attachunfold",
-        label: "attachunfold",
-        description: "popover children each `omg-anim-fadeup` with 40ms stagger.",
+        label: "Attachment menu reveal",
+        description: "Reveal attachment options one after another.",
         group: None,
     },
     EffectSpec {
         id: "equalizer",
-        label: "equalizer",
-        description: "5 tiny boxes in the composer whose heights cycle via tick while the user types (text-changed → 1.5s window).",
+        label: "Typing bars",
+        description: "Animate small bars in the composer as you type.",
         group: None,
     },
     EffectSpec {
         id: "bootlog",
-        label: "bootlog",
-        description: "overlay label appends 7 fixed lines (app name/theme, gtk version, session ok, theme monitor, dialogs ok, updates live, ready) 120ms each, removed 450ms later — runs at launch.",
+        label: "Startup log",
+        description: "Show a brief terminal-style startup sequence.",
         group: None,
     },
     EffectSpec {
         id: "phosphorburn",
-        label: "phosphorburn",
-        description: "new rows get `omg-anim-burn` (color bright→fg + box-shadow glow 1.1s).",
+        label: "Message glow",
+        description: "Briefly brighten new messages before they settle.",
         group: None,
     },
     EffectSpec {
         id: "flicker",
-        label: "flicker",
-        description: "window overlay opacity 0/0.06/0.12 for 2 frames every ~6s.",
+        label: "Screen flicker",
+        description: "Occasionally flicker the window like an old monitor.",
         group: None,
     },
     EffectSpec {
         id: "scanlines",
-        label: "scanlines",
-        description: "permanent overlay DrawingArea (1px lines every 3px at 16% black).",
+        label: "Scanlines",
+        description: "Overlay fine horizontal lines across the window.",
         group: None,
     },
     EffectSpec {
         id: "vignette",
-        label: "vignette",
-        description: "overlay radial darkening, breathing 5s.",
+        label: "Edge shading",
+        description: "Gently darken the edges of the window.",
         group: None,
     },
     EffectSpec {
         id: "staticerror",
-        label: "staticerror",
-        description: "noise DrawingArea 300ms on a failed send (hook `error_flash`).",
+        label: "Error static",
+        description: "Briefly show static when sending fails.",
         group: None,
     },
     EffectSpec {
         id: "cursorcomet",
-        label: "cursorcomet",
-        description: "composer cursor gets `box-shadow` trail class.",
+        label: "Cursor trail",
+        description: "Add a short trail to the composer cursor.",
         group: None,
     },
     EffectSpec {
         id: "thememorph",
-        label: "thememorph",
-        description: "`omg-anim-thememorph` adds `transition: background-color .5s, color .5s, border-color .5s` to the main surfaces (GTK supports transitions on these).",
+        label: "Smooth theme changes",
+        description: "Blend colors when the Omarchy theme changes.",
         group: None,
     },
     EffectSpec {
         id: "poweron",
-        label: "poweron",
-        description: "beam overlay: 2px box widens (margin keyframe) then heightens to full and fades, at launch.",
+        label: "Screen startup",
+        description: "Reveal the window like a monitor powering on.",
         group: None,
     },
     EffectSpec {
         id: "scansweep",
-        label: "scansweep",
-        description: "56px gradient box moves top→bottom via tick 600ms on theme switch (hook `theme_switched`).",
+        label: "Theme sweep",
+        description: "Sweep a highlight down the window after a theme change.",
         group: None,
     },
     EffectSpec {
         id: "composercursor",
-        label: "composercursor",
-        description: "blinking ▌ in the empty composer (CSS blink keyframe 1.06s steps).",
+        label: "Empty composer cursor",
+        description: "Blink a cursor in the empty composer.",
         group: None,
     },
     EffectSpec {
         id: "focusdim",
-        label: "focusdim",
-        description: "root gets `omg-anim-dim` (opacity .72 on side+chat) on window inactive.",
+        label: "Dim inactive window",
+        description: "Dim the conversation when another window has focus.",
         group: None,
     },
     EffectSpec {
         id: "hovertrace",
-        label: "hovertrace",
-        description: "CSS `:hover` underline via `border-bottom` width transition on chat rows (approximate with `border-bottom-color` transition).",
+        label: "Chat hover underline",
+        description: "Underline the chat row under the pointer.",
         group: None,
     },
     EffectSpec {
         id: "glitch",
-        label: "glitch",
-        description: "on hover, row title color flickers accent/yellow 2 frames (CSS keyframe on color).",
+        label: "Chat hover flicker",
+        description: "Briefly flicker a chat title when hovered.",
         group: None,
     },
     EffectSpec {
         id: "matrixrain",
-        label: "matrixrain",
-        description: "DrawingArea behind the empty state (columns of glyphs falling, 66ms tick, only while empty state shown).",
+        label: "Falling characters",
+        description: "Animate falling characters behind the empty conversation.",
         group: None,
     },
     EffectSpec {
         id: "gridshimmer",
-        label: "gridshimmer",
-        description: "empty-state background repeating gradient, `background-position` animated via tick 14s loop.",
+        label: "Moving grid",
+        description: "Animate a subtle grid behind the empty conversation.",
         group: None,
     },
     EffectSpec {
         id: "tsreveal",
-        label: "tsreveal",
-        description: "CSS: `.omg-msg .omg-meta { opacity:0 }`, `:hover` → 1 with .18s transition.",
+        label: "Timestamps on focus",
+        description: "Reveal timestamps when you hover or focus a message.",
         group: None,
     },
     EffectSpec {
         id: "liveclock",
-        label: "liveclock",
-        description: "already exists (wave 1 header clock) — this toggle mirrors `header_clock` (turning either on turns both on).",
+        label: "Header clock",
+        description: "Show a ticking clock in the conversation header.",
         group: None,
     },
     EffectSpec {
         id: "onlinebreathe",
-        label: "onlinebreathe",
-        description: "presence dot (a 6px accent box next to the title, shown for chats with a recent incoming message (<5 min) as a stand-in for backend online state).",
+        label: "Activity indicator",
+        description: "Pulse the chat activity indicator.",
         group: None,
     },
     EffectSpec {
         id: "unreadcomet",
-        label: "unreadcomet",
-        description: "a small accent dot in the sidebar overlay animating from the top to the row's y with a fading trail on a background NewMessage.",
+        label: "Incoming-message marker",
+        description: "Move a small marker toward the chat receiving a message.",
         group: None,
     },
 ];
@@ -451,11 +451,10 @@ impl EffectsCore {
                 tick.finish.take(),
             )
         };
-        if remove {
-            if let Some(callback) = callback {
+        if remove
+            && let Some(callback) = callback {
                 callback.remove();
             }
-        }
         if let (Some(widget), Some(handler)) = (widget.upgrade(), unmap_handler) {
             widget.disconnect(handler);
         }
@@ -515,7 +514,7 @@ impl EffectsCore {
                     tick.active
                         && tick.widget.upgrade().as_ref() == Some(widget)
                         && tick.ids.iter().any(|running| {
-                            ids.iter().any(|requested| running.as_str() == *requested)
+                            ids.contains(&running.as_str())
                         })
                 })
                 .map(|tick| tick.serial)
@@ -1023,9 +1022,7 @@ impl Effects {
         if !self.on("receiptdraw") {
             return None;
         }
-        let Some(label) = label.downcast_ref::<gtk::Label>().cloned() else {
-            return None;
-        };
+        let label = label.downcast_ref::<gtk::Label>().cloned()?;
         label.set_label("✓");
         transient_class(label.upcast_ref(), "omg-run-receipt", 820);
         Some(glib::timeout_add_local_once(
@@ -1076,7 +1073,7 @@ impl Effects {
                     .chars()
                     .enumerate()
                     .map(|(index, character)| {
-                        if character.is_whitespace() || (index + current as usize) % 3 != 0 {
+                        if character.is_whitespace() || !(index + current as usize).is_multiple_of(3) {
                             character
                         } else {
                             ["░", "▒", "▓", "#", "%", "@"][(index + current as usize) % 6]

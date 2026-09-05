@@ -72,8 +72,11 @@ impl Local {
                             Cmd::Chat { prefs, system, messages, respond } => {
                                 let _ = respond.send(ai::chat(&prefs, &system, &messages).await);
                             }
-                            Cmd::Transcribe { prefs, path, respond } => {
-                                let _ = respond.send(ai::transcribe(&prefs, &path).await);
+                            Cmd::Transcribe { prefs, path, mut respond } => {
+                                tokio::select! {
+                                    _ = respond.closed() => {},
+                                    result = ai::transcribe(&prefs, &path) => { let _ = respond.send(result); }
+                                }
                             }
                             Cmd::OsRun { action, args, policy, respond } => {
                                 let _ = respond.send(os::run_action(&action, &args, policy).await);

@@ -341,6 +341,7 @@ struct MockState {
     folders: Vec<Folder>,
     /// Commands that already failed once (OMG_MOCK_FAIL_ONCE).
     failed_once: HashSet<&'static str>,
+    cached_chats: HashSet<i64>,
     // ----- wave 6 -----
     /// Scheduled messages per chat (`Msg::scheduled`, `ts` = send time).
     scheduled: HashMap<i64, Vec<Msg>>,
@@ -817,6 +818,7 @@ impl MockState {
             contacts,
             folders,
             failed_once: HashSet::new(),
+            cached_chats: HashSet::new(),
             call: None,
             call_gen: 0,
             scheduled,
@@ -999,7 +1001,13 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
 pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_channel::Sender<Event>) {
     // Shared with spawned tasks (delayed replies, downloads). Never held
     // across an await.
-    let st = Arc::new(Mutex::new(MockState::new()));
+    let mut state = MockState::new();
+    if env_flag("OMG_MOCK_LONG_PIN")
+        && let Some(message) = state.history.get_mut(&5).and_then(|messages| messages.iter_mut().find(|m| m.id == 501)) {
+            message.text = (1..=40).map(|n| format!("Line {n}: This pinned announcement contains details that remain available when expanded.")).collect::<Vec<_>>().join("\n");
+            message.markdown = message.text.clone();
+    }
+    let st = Arc::new(Mutex::new(state));
 
     // OMG_MOCK_LIVE_MS=<ms>: after a 4 s grace period, Marta types for ~1.4 s
     // and sends a short message every <ms> — demo recordings use it to show
@@ -1062,6 +1070,7 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
                     emojis: String::new(),
                     connected_at: None,
                     end_reason: None,
+                    error: None,
                 });
                 st.call.clone().unwrap()
             };
@@ -1101,6 +1110,7 @@ pub async fn run(mut cmds: mpsc::UnboundedReceiver<Command>, events: async_chann
     }
 
     while let Some(cmd) = cmds.recv().await {
+        if matches!(cmd, Command::Shutdown) { break; }
         // Mirror the real backend: every command runs concurrently, so the
         // UI's ordering rules get exercised offline too. OMG_MOCK_LATENCY_MS
         // adds a delay before each data command to force out-of-order
@@ -1141,18 +1151,18 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
     if !matches!(
         cmd,
         Command::Start(_)
+            | Command::GetCachedHistory { .. }
             | Command::SubmitCredentials { .. }
             | Command::SubmitPhone(..)
             | Command::SubmitCode(..)
             | Command::SubmitPassword(..)
-    ) {
-        if let Some(ms) = std::env::var("OMG_MOCK_LATENCY_MS")
+    )
+        && let Some(ms) = std::env::var("OMG_MOCK_LATENCY_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
         {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
-    }
     let env_on = |n: &str| std::env::var(n).is_ok_and(|v| !v.is_empty());
     // Test hooks: OMG_MOCK_SLOW=Cmd,Cmd delays those commands 1.5s;
     // OMG_MOCK_FAIL_ONCE=Cmd,Cmd fails the first call of each listed command.
@@ -1168,6 +1178,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
         return;
     }
     match cmd {
+        Command::Shutdown => {},
         Command::Start(tx) => {
             // OMG_MOCK_NEED_CREDS=1 starts at the credentials form;
             // OMG_MOCK_AUTH=1 lets the auth screens be walked offline.
@@ -1234,12 +1245,18 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             out.sort_by_key(|c| (std::cmp::Reverse(c.pinned), std::cmp::Reverse(c.last_time)));
             let _ = tx.send(Ok(out));
         }
+        Command::SetOnline(_, respond) => { let _ = respond.send(Ok(())); }
+        Command::GetCachedHistory { chat_id, respond } => {
+            let state = st.lock().unwrap();
+            let _ = respond.send(Ok(if state.cached_chats.contains(&chat_id) { state.messages_of(chat_id) } else { Vec::new() }));
+        }
         Command::GetHistory {
             chat_id,
             before_id,
             respond,
         } => {
-            let st = st.lock().unwrap();
+            let mut st = st.lock().unwrap();
+            if before_id.is_none() { st.cached_chats.insert(chat_id); }
             let msgs = st.messages_of(chat_id);
             let mut result = match before_id {
                 None => msgs,
@@ -1412,8 +1429,8 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     ..fmt_msg(st.next_id, chat_id, &title, "You", &caption, t(0), true)
                 };
                 st.sent_files.insert(sent.id, path);
-                let sent = st.push(chat_id, sent);
-                sent
+
+                st.push(chat_id, sent)
             };
             schedule_read(st.clone(), &events, chat_id, sent.id);
             let _ = respond.send(Ok(sent));
@@ -1434,8 +1451,8 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     ..msg(st.next_id, chat_id, &title, "You", "", t(0), true)
                 };
                 st.sent_files.insert(sent.id, path);
-                let sent = st.push(chat_id, sent);
-                sent
+
+                st.push(chat_id, sent)
             };
             schedule_read(st.clone(), &events, chat_id, sent.id);
             let _ = respond.send(Ok(sent));
@@ -1798,6 +1815,14 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             pinned,
             respond,
         } => {
+            if let Some((forum, topic_id)) = split_topic_chat_id(chat_id) {
+                let ok = st.lock().unwrap().topics.get_mut(&forum)
+                    .and_then(|topics| topics.iter_mut().find(|topic| topic.id == topic_id))
+                    .map(|topic| topic.pinned = pinned).is_some();
+                let _ = respond.send(if ok { Ok(()) } else { Err("Topic unavailable".into()) });
+                let _ = events.send(Event::TopicsChanged { forum_id: forum }).await;
+                return;
+            }
             let ok = st
                 .lock()
                 .unwrap()
@@ -1817,6 +1842,14 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             mode,
             respond,
         } => {
+            if let Some((forum, topic_id)) = split_topic_chat_id(chat_id) {
+                let ok = st.lock().unwrap().topics.get_mut(&forum)
+                    .and_then(|topics| topics.iter_mut().find(|topic| topic.id == topic_id))
+                    .map(|topic| topic.muted = mode != MuteMode::Unmute).is_some();
+                let _ = respond.send(if ok { Ok(()) } else { Err("Topic unavailable".into()) });
+                let _ = events.send(Event::TopicsChanged { forum_id: forum }).await;
+                return;
+            }
             let ok = st
                 .lock()
                 .unwrap()
@@ -1836,6 +1869,10 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             archived,
             respond,
         } => {
+            if split_topic_chat_id(chat_id).is_some() {
+                let _ = respond.send(Err("This action is available for the whole forum only".into()));
+                return;
+            }
             let ok = st
                 .lock()
                 .unwrap()
@@ -1855,6 +1892,10 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             unread,
             respond,
         } => {
+            if split_topic_chat_id(chat_id).is_some() {
+                let _ = respond.send(Err("This action is available for the whole forum only".into()));
+                return;
+            }
             let ok = st
                 .lock()
                 .unwrap()
@@ -1870,6 +1911,11 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             });
         }
         Command::DeleteChat { chat_id, respond } => {
+            if let Some((forum, topic)) = split_topic_chat_id(chat_id) {
+                if topic == 1 { let _ = respond.send(Err("General cannot be deleted".into())); return; }
+                if let Some(topics) = st.lock().unwrap().topics.get_mut(&forum) { topics.retain(|t| t.id != topic); }
+                let _ = events.send(Event::TopicsChanged { forum_id: forum }).await;
+            }
             {
                 let mut st = st.lock().unwrap();
                 st.chats.remove(&chat_id);
@@ -1895,6 +1941,13 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             reply_to,
             respond,
         } => {
+            if let Some((forum, topic_id)) = split_topic_chat_id(chat_id) {
+                let ok = st.lock().unwrap().topics.get_mut(&forum)
+                    .and_then(|topics| topics.iter_mut().find(|t| t.id == topic_id))
+                    .map(|t| { t.draft = text.clone(); t.draft_reply_to = reply_to; }).is_some();
+                let _ = respond.send(if ok { Ok(()) } else { Err("Topic unavailable".into()) });
+                return;
+            }
             // The reply target is part of the real draft; the mock keeps only the text.
             let _keep = reply_to;
             let ok = st
@@ -2454,6 +2507,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                         last_time: Some(Local::now()),
                         pinned: false,
                         closed: false,
+                        ..Topic::default()
                     };
                     st.history.entry(topic.chat_id).or_default();
                     st.topics.entry(forum_id).or_default().push(topic.clone());
@@ -2480,8 +2534,8 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     ..msg(st.next_id, chat_id, &title, "You", "", t(0), true)
                 };
                 st.sent_files.insert(sent.id, path);
-                let sent = st.push(chat_id, sent);
-                sent
+
+                st.push(chat_id, sent)
             };
             schedule_read(st.clone(), &events, chat_id, sent.id);
             let _ = respond.send(Ok(sent));
@@ -2647,6 +2701,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                             emojis: String::new(),
                             connected_at: None,
                             end_reason: None,
+                    error: None,
                         });
                         Ok(st.call.clone().unwrap())
                     }
@@ -2724,6 +2779,14 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             if let Some(info) = changed {
                 let _ = events.send(Event::CallChanged(info)).await;
             }
+        }
+        Command::ImportLegacyArchive { respond, .. } => { let _ = respond.send(Ok(12)); }
+        Command::CallSetDevices { call_id, respond, .. } => {
+            let active = st.lock().unwrap().call.as_ref().is_some_and(|call| call.id == call_id && call.phase == CallPhase::Active);
+            let _ = respond.send(if active { Ok(()) } else { Err("The call is no longer connected".into()) });
+        }
+        Command::SearchPlaces { query, respond } => {
+            let _ = respond.send(Ok(if query.trim().is_empty() { Vec::new() } else { vec![super::Place { name: format!("{query}, Berlin (mock)"), point: GeoPoint { lat: 52.52, lon: 13.405 } }] }));
         }
         Command::CallDevicesList(tx) => {
             let _ = tx.send(Ok(CallDevices {
@@ -3028,6 +3091,7 @@ fn forum_fixture() -> (Vec<Topic>, Vec<(i64, Vec<Msg>)>) {
         last_time: None,
         pinned,
         closed,
+        ..Topic::default()
     };
     let topics = vec![
         topic(1, "General", "", false, false),
@@ -3193,11 +3257,10 @@ fn schedule_reply(
                     e.text = "(mock reply) got it — actually, make that thursday".into();
                     e.markdown = to_markdown(&e.text, &e.spans);
                     e.edited = true;
-                    if let Some(msgs) = st.history.get_mut(&chat_id) {
-                        if let Some(m) = msgs.iter_mut().find(|m| m.id == reply_id) {
+                    if let Some(msgs) = st.history.get_mut(&chat_id)
+                        && let Some(m) = msgs.iter_mut().find(|m| m.id == reply_id) {
                             *m = e.clone();
                         }
-                    }
                     e
                 };
                 let _ = events.send(Event::MessageChanged(edited)).await;

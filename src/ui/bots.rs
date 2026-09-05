@@ -97,10 +97,12 @@ pub fn update_keyboard(
 ) {
     clear_keyboard(slot);
     slot.append(&build_keyboard(keyboard, msg_id, action, bot_username));
+    slot.set_visible(!keyboard.rows.is_empty());
 }
 
 /// Drop the keyboard under a message that no longer has one.
 pub fn clear_keyboard(slot: &gtk::Box) {
+    slot.set_visible(false);
     while let Some(child) = slot.first_child() {
         slot.remove(&child);
     }

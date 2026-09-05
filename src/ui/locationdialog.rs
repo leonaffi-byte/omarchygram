@@ -40,7 +40,7 @@ const MAX_ZOOM: u8 = 17;
 const CELL: u32 = 96;
 /// "Share live for" entries: label plus the period `send_live_location` wants.
 const LIVE_CHOICES: [(&str, Option<u32>); 4] = [
-    ("Off", None),
+    ("Static · one point", None),
     ("15 min", Some(900)),
     ("1 h", Some(3_600)),
     ("8 h", Some(28_800)),
@@ -61,6 +61,7 @@ pub struct LocationDialog {
     live_row: gtk::Box,
     live: gtk::DropDown,
     send: gtk::Button,
+    confirm_point: gtk::CheckButton,
     tg: Tg,
     point: Cell<GeoPoint>,
     zoom: Cell<u8>,
@@ -77,6 +78,13 @@ pub struct LocationDialog {
     busy: Cell<bool>,
     action: RefCell<Option<Callback>>,
     self_weak: RefCell<Weak<LocationDialog>>,
+    map_debounce: RefCell<Option<glib::SourceId>>,
+    lookup_generation: Cell<u64>,
+    lookup_task: RefCell<Option<glib::JoinHandle<()>>>,
+    place_entry: gtk::Entry,
+    place_results: gtk::Box,
+    lookup_status: gtk::Label,
+    discovery: gtk::Expander,
 }
 
 impl LocationDialog {
@@ -97,7 +105,11 @@ impl LocationDialog {
         card.set_vexpand(true);
         card.set_valign(gtk::Align::Center);
         card.set_size_request(360, -1);
-        widget.append(&card);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_vexpand(true);
+        scroll.set_child(Some(&card));
+        widget.append(&scroll);
 
         let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let heading_label = gtk::Label::new(Some("Share location"));
@@ -111,6 +123,24 @@ impl LocationDialog {
         heading.append(&close);
         card.append(&heading);
 
+        let discovery = gtk::Expander::new(Some("Find a place or use current location"));
+        let lookup = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let place_entry = gtk::Entry::new();
+        place_entry.set_placeholder_text(Some("Place name or address"));
+        place_entry.update_property(&[gtk::accessible::Property::Label("Place name or address")]);
+        place_entry.set_hexpand(true);
+        let search_places = gtk::Button::with_label("Search");
+        search_row.append(&place_entry); search_row.append(&search_places); lookup.append(&search_row);
+        let disclosure = gtk::Label::new(Some("Search sends this text to your place provider (Photon by komoot by default). Map data © OpenStreetMap contributors."));
+        disclosure.set_wrap(true); disclosure.set_max_width_chars(48); disclosure.set_xalign(0.0); disclosure.add_css_class("omg-small"); lookup.append(&disclosure);
+        let place_results = gtk::Box::new(gtk::Orientation::Vertical, 4); lookup.append(&place_results);
+        let current_location = gtk::Button::with_label("Use current location");
+        current_location.set_tooltip_text(Some("Request a location from your system; check the pin before sharing"));
+        lookup.append(&current_location);
+        let lookup_status = gtk::Label::new(None); lookup_status.set_wrap(true); lookup_status.set_max_width_chars(48); lookup_status.set_xalign(0.0); lookup.append(&lookup_status);
+        discovery.set_child(Some(&lookup)); card.append(&discovery);
+
         let coords = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let lat = gtk::Entry::new();
         lat.set_placeholder_text(Some("Latitude"));
@@ -120,8 +150,19 @@ impl LocationDialog {
         lon.set_placeholder_text(Some("Longitude"));
         lon.set_hexpand(true);
         lon.set_tooltip_text(Some("Longitude, −180 to 180"));
-        coords.append(&lat);
-        coords.append(&lon);
+        for (name, entry) in [("Latitude", &lat), ("Longitude", &lon)] {
+            let field = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            field.set_hexpand(true);
+            let label = gtk::Label::new(Some(name));
+            label.add_css_class("omg-form-label");
+            label.set_halign(gtk::Align::Start);
+            field.append(&label);
+            entry.set_width_chars(12);
+            entry.set_max_width_chars(16);
+            entry.update_property(&[gtk::accessible::Property::Label(name)]);
+            field.append(entry);
+            coords.append(&field);
+        }
         card.append(&coords);
 
         let error = gtk::Label::new(None);
@@ -172,8 +213,16 @@ impl LocationDialog {
         map_error.set_visible(false);
         card.append(&map_error);
 
+        let confirm_point = gtk::CheckButton::with_label("Share the selected pin");
+        card.append(&confirm_point);
+        let guidance = gtk::Label::new(Some("Choose a point on the map, edit the coordinates, or confirm the pin. Live sharing lasts for the selected period; update your position from the message menu."));
+        guidance.add_css_class("omg-small");
+        guidance.set_wrap(true);
+        guidance.set_max_width_chars(48);
+        guidance.set_halign(gtk::Align::Start);
+        card.append(&guidance);
         let live_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let live_label = gtk::Label::new(Some("Share live for"));
+        let live_label = gtk::Label::new(Some("Sharing mode"));
         live_label.set_halign(gtk::Align::Start);
         live_label.set_hexpand(true);
         live_row.append(&live_label);
@@ -210,6 +259,7 @@ impl LocationDialog {
             live_row,
             live,
             send,
+            confirm_point,
             tg,
             point: Cell::new(DEFAULT_POINT),
             zoom: Cell::new(DEFAULT_ZOOM),
@@ -222,9 +272,29 @@ impl LocationDialog {
             busy: Cell::new(false),
             action: RefCell::new(None),
             self_weak: RefCell::new(Weak::new()),
+            map_debounce: RefCell::new(None),
+            lookup_generation: Cell::new(0), lookup_task: RefCell::new(None),
+            place_entry, place_results, lookup_status, discovery,
         });
         *this.self_weak.borrow_mut() = Rc::downgrade(&this);
+        {
+            let weak = Rc::downgrade(&this);
+            search_places.connect_clicked(move |_| { if let Some(this) = weak.upgrade() { this.search_places(); } });
+            let weak = Rc::downgrade(&this);
+            this.place_entry.connect_activate(move |_| { if let Some(this) = weak.upgrade() { this.search_places(); } });
+            let weak = Rc::downgrade(&this);
+            current_location.connect_clicked(move |_| { if let Some(this) = weak.upgrade() { this.current_location(); } });
+        }
 
+
+        {
+            let weak = Rc::downgrade(&this);
+            this.confirm_point.connect_toggled(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.send.set_sensitive(!this.busy.get() && this.confirm_point.is_active() && this.read_point().is_some());
+                }
+            });
+        }
         for index in 0..9 {
             let picture = gtk::Picture::new();
             picture.set_content_fit(gtk::ContentFit::Cover);
@@ -296,7 +366,7 @@ impl LocationDialog {
             let weak = Rc::downgrade(&this);
             this.send.connect_clicked(move |_| {
                 let Some(this) = weak.upgrade() else { return };
-                if this.busy.get() {
+                if this.busy.get() || !this.confirm_point.is_active() {
                     return;
                 }
                 let Some(point) = this.read_point() else { return };
@@ -329,6 +399,7 @@ impl LocationDialog {
     /// `last` is the remembered point from ui-state, `map_tiles` the
     /// `settings.media.map_tiles` toggle (off → no network fetch, no grid).
     pub fn begin(&self, last: Option<(f64, f64)>, map_tiles: bool) {
+        self.reset_lookup();
         self.bump();
         self.is_update.set(false);
         self.heading_label.set_label("Share location");
@@ -346,12 +417,14 @@ impl LocationDialog {
             .map(|(lat, lon)| GeoPoint { lat, lon })
             .filter(|point| in_range(point.lat, point.lon))
             .unwrap_or(DEFAULT_POINT);
+        self.confirm_point.set_active(false);
         self.set_point(point);
         self.widget.set_visible(true);
         self.lat.grab_focus();
     }
 
     pub fn begin_update(&self, point: GeoPoint, map_tiles: bool) {
+        self.reset_lookup();
         self.bump();
         self.is_update.set(true);
         self.heading_label.set_label("Update position");
@@ -364,12 +437,15 @@ impl LocationDialog {
         self.map_error.set_label("");
         self.map_error.set_visible(false);
         self.zoom.set(DEFAULT_ZOOM);
+        self.confirm_point.set_active(false);
         self.set_point(point);
         self.widget.set_visible(true);
         self.lat.grab_focus();
     }
 
     pub fn close(&self) {
+        self.reset_lookup();
+        if let Some(source) = self.map_debounce.borrow_mut().take() { source.remove(); }
         if !self.widget.is_visible() {
             return;
         }
@@ -388,13 +464,16 @@ impl LocationDialog {
 
     pub fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
+        if busy { self.cancel_lookup(); }
+        self.discovery.set_sensitive(!busy);
         let default_label = if self.is_update.get() { "Update" } else { "Send" };
         self.send.set_label(if busy { "Sending…" } else { default_label });
         self.lat.set_sensitive(!busy);
         self.lon.set_sensitive(!busy);
         self.live.set_sensitive(!busy);
         self.grid.set_sensitive(!busy);
-        self.send.set_sensitive(!busy && self.read_point().is_some());
+        self.send.set_sensitive(!busy && self.confirm_point.is_active() && self.read_point().is_some());
+        self.confirm_point.set_sensitive(!busy);
     }
 
     pub fn show_error(&self, error: &str) {
@@ -419,13 +498,82 @@ impl LocationDialog {
         in_range(lat, lon).then_some(GeoPoint { lat, lon })
     }
 
+    fn cancel_lookup(&self) {
+        self.lookup_generation.set(self.lookup_generation.get().wrapping_add(1));
+        if let Some(task) = self.lookup_task.borrow_mut().take() { task.abort(); }
+    }
+
+    fn reset_lookup(&self) {
+        self.cancel_lookup();
+        self.discovery.set_expanded(false);
+        self.place_entry.set_text(""); self.lookup_status.set_label("");
+        move_focus_outside(self.place_results.upcast_ref());
+        while let Some(child) = self.place_results.first_child() { self.place_results.remove(&child); }
+    }
+
+    fn search_places(self: &Rc<Self>) {
+        self.cancel_lookup();
+        let query = self.place_entry.text().trim().to_string();
+        if query.is_empty() { self.lookup_status.set_label("Enter a place name or address"); return; }
+        let generation = self.lookup_generation.get();
+        self.lookup_status.set_label("Searching places…");
+        move_focus_outside(self.place_results.upcast_ref());
+        while let Some(child) = self.place_results.first_child() { self.place_results.remove(&child); }
+        let weak = Rc::downgrade(self); let tg = self.tg.clone();
+        *self.lookup_task.borrow_mut() = Some(glib::MainContext::default().spawn_local(async move {
+            let result = tg.search_places(&query).await;
+            let Some(this) = weak.upgrade().filter(|this| this.is_open() && this.lookup_generation.get() == generation) else { return };
+            this.lookup_task.borrow_mut().take();
+            match result {
+                Ok(places) => {
+                    this.lookup_status.set_label(if places.is_empty() { "No matching places. Try a city name or coordinates." } else { "Choose a result, then check the pin." });
+                    for place in places {
+                        let button = gtk::Button::new(); let label = gtk::Label::new(Some(&place.name));
+                        label.set_wrap(true); label.set_max_width_chars(44); label.set_xalign(0.0); button.set_child(Some(&label));
+                        let weak = Rc::downgrade(&this);
+                        button.connect_clicked(move |_| {
+                            if let Some(this) = weak.upgrade() {
+                                this.cancel_lookup(); this.confirm_point.set_active(true); this.set_point(place.point);
+                                this.lookup_status.set_label(&format!("Selected: {}", place.name));
+                            }
+                        });
+                        this.place_results.append(&button);
+                    }
+                }
+                Err(error) => this.lookup_status.set_label(&error),
+            }
+        }));
+    }
+
+    fn current_location(self: &Rc<Self>) {
+        self.cancel_lookup();
+        let generation = self.lookup_generation.get();
+        self.lookup_status.set_label("Requesting system location…");
+        let weak = Rc::downgrade(self); let mock = self.tg.is_mock;
+        *self.lookup_task.borrow_mut() = Some(glib::MainContext::default().spawn_local(async move {
+            let result = if mock { Ok((DEFAULT_POINT, 100.0)) } else { super::geolocation::current().await };
+            let Some(this) = weak.upgrade().filter(|this| this.is_open() && this.lookup_generation.get() == generation) else { return };
+            this.lookup_task.borrow_mut().take();
+            match result {
+                Ok((point, accuracy)) => {
+                    this.confirm_point.set_active(false); this.set_point(point);
+                    this.lookup_status.set_label(&if accuracy.is_finite() && accuracy > 0.0 { format!("Estimated accuracy: {accuracy:.0} m. Check the pin and confirm it before sharing.") } else { "Check the pin and confirm it before sharing.".into() });
+                }
+                Err(error) => this.lookup_status.set_label(&error),
+            }
+        }));
+    }
+
     fn entries_changed(&self) {
         if self.updating.get() {
             return;
         }
+        self.cancel_lookup();
         match self.read_point() {
             Some(point) => {
+                self.confirm_point.set_active(true);
                 self.point.set(point);
+                self.confirm_point.set_label(Some(&format!("Share pin at {:.5}, {:.5}", point.lat, point.lon)));
                 self.error.set_label("");
                 self.error.set_visible(false);
                 self.send.set_sensitive(!self.busy.get());
@@ -448,7 +596,8 @@ impl LocationDialog {
         self.updating.set(false);
         self.error.set_label("");
         self.error.set_visible(false);
-        self.send.set_sensitive(!self.busy.get());
+        self.confirm_point.set_label(Some(&format!("Share pin at {:.5}, {:.5}", point.lat, point.lon)));
+        self.send.set_sensitive(!self.busy.get() && self.confirm_point.is_active());
         self.refresh_grid();
     }
 
@@ -491,6 +640,7 @@ impl LocationDialog {
     }
 
     fn pick_cell(&self, index: usize) {
+        self.confirm_point.set_active(true);
         if self.busy.get() {
             return;
         }
@@ -498,6 +648,18 @@ impl LocationDialog {
     }
 
     fn refresh_grid(&self) {
+        if let Some(source) = self.map_debounce.borrow_mut().take() { source.remove(); }
+        self.bump(); // Invalidate old requests as soon as the selection changes.
+        let weak = self.self_weak.borrow().clone();
+        *self.map_debounce.borrow_mut() = Some(glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+            if let Some(this) = weak.upgrade() {
+                this.map_debounce.borrow_mut().take();
+                if this.widget.is_visible() { this.load_grid(); }
+            }
+        }));
+    }
+
+    fn load_grid(&self) {
         self.update_zoom_controls();
         self.grid.set_visible(self.map_tiles.get());
         self.map_error.set_label("");
@@ -562,7 +724,14 @@ impl LocationDialog {
 
     // ----- probe helpers -----
 
+    pub fn probe_search_places(self: &Rc<Self>, query: &str) { self.discovery.set_expanded(true); self.place_entry.set_text(query); self.search_places(); }
+    pub fn probe_place_count(&self) -> usize { let mut n = 0; let mut child = self.place_results.first_child(); while let Some(next) = child { n += 1; child = next.next_sibling(); } n }
+    pub fn probe_pick_place(&self) { if let Some(button) = self.place_results.first_child().and_downcast::<gtk::Button>() { button.emit_clicked(); } }
+    pub fn probe_current_location(self: &Rc<Self>) { self.current_location(); }
+    pub fn probe_location_status(&self) -> String { self.lookup_status.text().to_string() }
+
     pub fn probe_set_point(&self, lat: f64, lon: f64) {
+        self.confirm_point.set_active(true);
         self.set_point(GeoPoint { lat, lon });
     }
 
@@ -593,6 +762,8 @@ impl LocationDialog {
     pub fn probe_set_live(&self, index: u32) {
         self.live.set_selected(index);
     }
+
+    pub fn probe_confirm_point(&self) { self.confirm_point.set_active(true); }
 
     pub fn probe_send(&self) {
         self.send.emit_clicked();

@@ -53,7 +53,7 @@ fn coords_text(lat: f64, lon: f64) -> String {
 /// dedicated source slot and drained with the row.
 pub fn build_geo(
     message: &Msg,
-    action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    action: crate::ui::CallbackSlot<dyn Fn(MessageAction)>,
     live_source: Rc<RefCell<Option<glib::SourceId>>>,
     map_tiles: bool,
 ) -> (gtk::Widget, Option<gtk::Box>, Option<gtk::Label>) {
@@ -290,7 +290,7 @@ fn descendant_named(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
 /// Build the contact card (§3.2).
 pub fn build_contact(
     message: &Msg,
-    action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    action: crate::ui::CallbackSlot<dyn Fn(MessageAction)>,
     added: bool,
 ) -> gtk::Widget {
     let card = gtk::Box::new(gtk::Orientation::Horizontal, 8);

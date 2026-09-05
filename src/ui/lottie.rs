@@ -238,12 +238,11 @@ fn apply(
         }
         Command::Play(id) => {
             wanted.insert(id);
-            if let Some(animation) = live.get_mut(&id) {
-                if !animation.playing {
+            if let Some(animation) = live.get_mut(&id)
+                && !animation.playing {
                     animation.playing = true;
                     animation.due = Instant::now() + animation.interval;
                 }
-            }
         }
         Command::Pause(id) => {
             wanted.remove(&id);
@@ -354,8 +353,8 @@ struct StickerInner {
     frame: Cell<usize>,
     frames: Cell<u64>,
     error: RefCell<Option<String>>,
-    ready_callback: RefCell<Option<Rc<dyn Fn()>>>,
-    error_callback: RefCell<Option<Rc<dyn Fn(String)>>>,
+    ready_callback: crate::ui::CallbackCell<dyn Fn()>,
+    error_callback: crate::ui::CallbackCell<dyn Fn(String)>,
 }
 
 impl Drop for StickerInner {

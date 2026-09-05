@@ -98,9 +98,9 @@ struct Keys {
 fn load_keys() -> Keys {
     let mut k = Keys::default();
     let path = crate::tg::paths::config_file();
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(t) = text.parse::<toml::Table>() {
-            if let Some(ai) = t.get("ai").and_then(|v| v.as_table()) {
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && let Ok(t) = text.parse::<toml::Table>()
+            && let Some(ai) = t.get("ai").and_then(|v| v.as_table()) {
                 let g = |n: &str| ai.get(n).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
                 k.anthropic = g("anthropic_api_key");
                 k.openai = g("openai_api_key");
@@ -108,8 +108,6 @@ fn load_keys() -> Keys {
                 k.gemini = g("gemini_api_key");
                 k.whisper_model = g("whisper_model");
             }
-        }
-    }
     let env = |n: &str| std::env::var(n).ok().filter(|s| !s.is_empty());
     k.anthropic = k.anthropic.or_else(|| env("ANTHROPIC_API_KEY"));
     k.openai = k.openai.or_else(|| env("OPENAI_API_KEY"));
@@ -190,11 +188,10 @@ fn whisper_model(keys: &Keys) -> Option<PathBuf> {
 }
 
 fn shellexpand(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(h) = dirs::home_dir() {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(h) = dirs::home_dir() {
             return h.join(rest).to_string_lossy().to_string();
         }
-    }
     s.to_string()
 }
 
@@ -258,12 +255,11 @@ async fn pick_chat(prefs: &Prefs, keys: &Keys) -> Result<(&'static str, String),
     for id in candidates {
         match id {
             "ollama" => {
-                if let Some(models) = ollama_models(prefs).await {
-                    if let Some(first) = models.first() {
+                if let Some(models) = ollama_models(prefs).await
+                    && let Some(first) = models.first() {
                         let m = if prefs.chat_model.is_empty() { first.clone() } else { prefs.chat_model.clone() };
                         return Ok(("ollama", m));
                     }
-                }
             }
             "anthropic" if keys.anthropic.is_some() => return Ok(("anthropic", model("claude-opus-5"))),
             "openai" if keys.openai.is_some() => return Ok(("openai", model("gpt-4o-mini"))),
@@ -471,6 +467,8 @@ async fn ollama_chat(prefs: &Prefs, model: &str, system: &str, messages: &[ChatM
 
 /// Transcribe an audio file (Telegram voice notes are .oga/.ogg opus).
 pub async fn transcribe(prefs: &Prefs, path: &Path) -> Result<Transcript, String> {
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let _slot = SLOTS.acquire().await.map_err(|_| "Transcription service stopped".to_string())?;
     if mock_ai() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         return Ok(Transcript {
@@ -519,7 +517,6 @@ pub async fn transcribe(prefs: &Prefs, path: &Path) -> Result<Transcript, String
 }
 
 async fn audio_api(name: &str, base: &str, key: &str, model: &str, path: &Path) -> Result<String, String> {
-    let bytes = tokio::fs::read(path).await.map_err(|e| format!("read audio: {e}"))?;
     // Never leak chat/message ids (the cache filename) to a vendor.
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("ogg");
     let fname = format!("audio.{ext}");
@@ -530,7 +527,7 @@ async fn audio_api(name: &str, base: &str, key: &str, model: &str, path: &Path) 
         Some("m4a") | Some("mp4") => "audio/mp4",
         _ => "application/octet-stream",
     };
-    let part = reqwest::multipart::Part::bytes(bytes).file_name(fname).mime_str(mime).map_err(|e| e.to_string())?;
+    let part = reqwest::multipart::Part::file(path).await.map_err(|e| format!("read audio: {e}"))?.file_name(fname).mime_str(mime).map_err(|e| e.to_string())?;
     let form = reqwest::multipart::Form::new().text("model", model.to_string()).part("file", part);
     let resp = client()?
         .post(format!("{base}/audio/transcriptions"))
@@ -568,34 +565,22 @@ async fn whisper_local(bin: &Path, model: &Path, path: &Path) -> Result<String, 
     }
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let wav = TempWav(dir.join(format!("transcribe-{}-{seq}.wav", std::process::id())));
-    let ff = tokio::time::timeout(
-        Duration::from_secs(120),
+    let ff = process_output(
         tokio::process::Command::new("ffmpeg")
             .args(["-nostdin", "-y", "-loglevel", "error", "-i"])
             .arg(path)
             .args(["-ar", "16000", "-ac", "1", "-f", "wav"])
-            .arg(&wav.0)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| "ffmpeg timed out".to_string())?
-    .map_err(|e| format!("ffmpeg: {e}"))?;
+            .arg(&wav.0), Duration::from_secs(120), "ffmpeg",
+    ).await?;
     if !ff.status.success() {
         return Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&ff.stderr).trim()));
     }
-    let out = tokio::time::timeout(
-        Duration::from_secs(300),
+    let out = process_output(
         tokio::process::Command::new(bin)
             .arg("-m").arg(model)
             .arg("-f").arg(&wav.0)
-            .args(["-nt", "-np"])
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| "whisper timed out".to_string())?
-    .map_err(|e| format!("whisper: {e}"))?;
+            .args(["-nt", "-np"]), Duration::from_secs(300), "whisper",
+    ).await?;
     if !out.status.success() {
         return Err(format!("whisper failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -609,4 +594,25 @@ async fn whisper_local(bin: &Path, model: &Path, path: &Path) -> Result<String, 
         return Err("whisper produced no text".into());
     }
     Ok(text)
+}
+
+/// Bound subprocess output while draining both pipes concurrently. Dropping
+/// this future (cancel/timeout) kills the owned process before removing its WAV.
+async fn process_output(command: &mut tokio::process::Command, timeout: Duration, name: &str) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    async fn read(mut pipe: impl tokio::io::AsyncRead + Unpin, limit: u64) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        (&mut pipe).take(limit + 1).read_to_end(&mut bytes).await?;
+        if bytes.len() as u64 > limit { return Err(std::io::Error::other("process output exceeds limit")); }
+        Ok(bytes)
+    }
+    let mut child = command.kill_on_drop(true).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().map_err(|e| format!("{name}: {e}"))?;
+    let stdout = child.stdout.take().ok_or_else(|| "process stdout unavailable".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "process stderr unavailable".to_string())?;
+    let (status, stdout, stderr) = tokio::time::timeout(timeout, async {
+        tokio::try_join!(child.wait(), read(stdout, 8 * 1024 * 1024), read(stderr, 256 * 1024))
+    }).await.map_err(|_| format!("{name} timed out"))?.map_err(|e| format!("{name}: {e}"))?;
+    Ok(std::process::Output { status, stdout, stderr })
 }

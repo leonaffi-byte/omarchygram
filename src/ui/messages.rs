@@ -69,11 +69,7 @@ mod bubble_clamp_imp {
 
     impl WidgetImpl for BubbleClamp {
         fn request_mode(&self) -> gtk::SizeRequestMode {
-            self.child
-                .borrow()
-                .as_ref()
-                .map(gtk::prelude::WidgetExt::request_mode)
-                .unwrap_or(gtk::SizeRequestMode::ConstantSize)
+            gtk::SizeRequestMode::HeightForWidth
         }
 
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
@@ -95,12 +91,12 @@ mod bubble_clamp_imp {
             } else {
                 // Height must be measured at the width the child will really
                 // get (the clamped one), or wrapped text is cut off.
-                let width = if for_size > 0 {
-                    self.child_width(&child, for_size, target)
-                } else {
-                    for_size
-                };
-                child.measure(orientation, width)
+                let width = self.child_width(&child, if for_size > 0 { for_size } else { target }, target);
+                let (minimum, natural, min_baseline, nat_baseline) = child.measure(orientation, width);
+                // The bubble's own allocation clamps its width. A scrollable
+                // parent must reserve the full height at that width, or rows
+                // can extend beyond its scroll range after photos load.
+                (minimum.max(natural), minimum.max(natural), min_baseline, nat_baseline)
             }
         }
 
@@ -180,28 +176,24 @@ mod photo_clamp_imp {
 
     impl WidgetImpl for PhotoClamp {
         fn request_mode(&self) -> gtk::SizeRequestMode {
-            self.child
-                .borrow()
-                .as_ref()
-                .map(gtk::prelude::WidgetExt::request_mode)
-                .unwrap_or(gtk::SizeRequestMode::ConstantSize)
+            gtk::SizeRequestMode::HeightForWidth
         }
 
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
             let Some(child) = self.child.borrow().as_ref().cloned() else {
                 return (0, 0, -1, -1);
             };
-            let (minimum, natural, min_baseline, nat_baseline) =
-                child.measure(orientation, for_size);
             if orientation == gtk::Orientation::Horizontal {
-                (
-                    minimum,
-                    natural.min(320).max(minimum),
-                    min_baseline,
-                    nat_baseline,
-                )
+                let (_, natural, _, _) = child.measure(orientation, -1);
+                // GtkPicture with can-shrink reports a zero minimum. Giving
+                // that straight to a scrolling GtkBox collapses photo-only
+                // messages to their timestamp, despite a loaded texture.
+                (natural.clamp(1, 160), natural.clamp(1, 320), -1, -1)
             } else {
-                (minimum, natural, min_baseline, nat_baseline)
+                let width = if for_size < 0 { 320 } else { for_size.clamp(1, 320) };
+                let (_, natural, _, _) = child.measure(orientation, width);
+                let height = natural.clamp(1, 360);
+                (if for_size < 0 { 1 } else { height }, height, -1, -1)
             }
         }
 
@@ -244,6 +236,7 @@ fn bubble_width_limit(parent_width: Option<i32>) -> i32 {
 
 #[derive(Clone)]
 pub enum MessageAction {
+    Switcher,
     Submit,
     Mic,
     Stickers,
@@ -312,6 +305,7 @@ pub enum MessageAction {
     },
     UnpinMessage(i32),
     RetryPinned,
+    RetryHistory,
     Delete(i32),
     Media(i32),
     MediaAutoplay(i32),
@@ -456,6 +450,8 @@ struct MessagesInner {
     search_retry: gtk::Button,
     pinned_bar: gtk::Box,
     pinned_text: gtk::Label,
+    pinned_expand: gtk::Button,
+    pinned_expanded: Cell<bool>,
     pinned_message: RefCell<Option<Msg>>,
     pinned_more: gtk::Button,
     pinned_retry: gtk::Button,
@@ -470,6 +466,12 @@ struct MessagesInner {
     pane_width: Rc<Cell<i32>>,
     probe_pane_width: Cell<Option<i32>>,
     loading: gtk::Label,
+    history_refreshing: Cell<bool>,
+    history_changed: RefCell<HashSet<i32>>,
+    history_removed: RefCell<HashSet<i32>>,
+    history_status: gtk::Box,
+    history_status_text: gtk::Label,
+    history_retry: gtk::Button,
     paging_spinner: gtk::Spinner,
     error: gtk::Label,
     draft_retry: gtk::Button,
@@ -499,7 +501,7 @@ struct MessagesInner {
     recorder: RecorderBar,
     video_recorder: VideoRecorderBar,
     store: RefCell<MessageStore>,
-    action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    action: crate::ui::CallbackSlot<dyn Fn(MessageAction)>,
     time_format: RefCell<String>,
     edit_history: Cell<bool>,
     detached: Cell<bool>,
@@ -522,6 +524,7 @@ struct MessagesInner {
     send_spin: RefCell<Option<glib::SourceId>>,
     date_timeout: RefCell<Option<glib::SourceId>>,
     scroll_epoch: Cell<u64>,
+    scroll_callback_generation: Cell<u64>,
     upper_handler: RefCell<Option<glib::SignalHandlerId>>,
     upper_tick: RefCell<Option<gtk::TickCallbackId>>,
     context_popover: RefCell<Option<gtk::Popover>>,
@@ -594,7 +597,7 @@ impl MessagesView {
         header.append(&header_avatar.widget);
         let identity = gtk::Box::new(gtk::Orientation::Vertical, 0);
         identity.set_hexpand(true);
-        let header_title = gtk::Label::new(Some("Select a chat"));
+        let header_title = gtk::Label::new(Some("Omarchygram"));
         header_title.add_css_class("omg-chat-title");
         header_title.set_halign(gtk::Align::Start);
         header_title.set_hexpand(true);
@@ -686,8 +689,12 @@ impl MessagesView {
         let search_entry = gtk::SearchEntry::new();
         search_entry.set_placeholder_text(Some("Search in chat"));
         search_entry.set_hexpand(true);
+        search_entry.set_valign(gtk::Align::Center);
+        search_entry.set_width_chars(8);
         search_bar.append(&search_entry);
-        let search_position = gtk::Label::new(Some("No results"));
+        let search_position = gtk::Label::new(None);
+        search_position.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        search_position.set_max_width_chars(12);
         search_position.add_css_class("omg-small");
         search_bar.append(&search_position);
         let search_previous = gtk::Button::with_label(icons::LEFT);
@@ -700,6 +707,7 @@ impl MessagesView {
         search_bar.append(&search_next);
         let search_older = gtk::Button::with_label("Load older");
         search_older.add_css_class("omg-menu-item");
+        search_older.set_tooltip_text(Some("Load older search results"));
         search_older.set_visible(false);
         search_bar.append(&search_older);
         let search_retry = gtk::Button::with_label("Retry");
@@ -716,6 +724,7 @@ impl MessagesView {
         pinned_bar.add_css_class("omg-pinned-bar");
         pinned_bar.set_visible(false);
         let pinned_icon = gtk::Label::new(Some(icons::PIN));
+        pinned_icon.set_valign(gtk::Align::Start);
         pinned_icon.add_css_class("omg-muted");
         pinned_bar.append(&pinned_icon);
         let pinned_copy = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -725,17 +734,34 @@ impl MessagesView {
         pinned_title.add_css_class("omg-small");
         pinned_copy.append(&pinned_title);
         let pinned_text = gtk::Label::new(None);
-        pinned_text.set_halign(gtk::Align::Start);
+        pinned_text.set_halign(gtk::Align::Fill);
+        pinned_text.set_xalign(0.0);
+        pinned_text.set_wrap(true);
+        pinned_text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        pinned_text.set_lines(4);
         pinned_text.set_ellipsize(gtk::pango::EllipsizeMode::End);
         pinned_text.add_css_class("omg-muted");
-        pinned_copy.append(&pinned_text);
+        let pinned_scroll = gtk::ScrolledWindow::new();
+        pinned_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        pinned_scroll.set_propagate_natural_height(true);
+        pinned_scroll.set_max_content_height(240);
+        pinned_scroll.set_child(Some(&pinned_text));
+        pinned_copy.append(&pinned_scroll);
         pinned_bar.append(&pinned_copy);
+        let pinned_expand = gtk::Button::with_label("Expand");
+        pinned_expand.add_css_class("omg-menu-item");
+        pinned_expand.set_valign(gtk::Align::Start);
+        pinned_expand.set_visible(false);
+        pinned_expand.set_tooltip_text(Some("Expand the full pinned message"));
+        pinned_bar.append(&pinned_expand);
         let pinned_more = gtk::Button::with_label(icons::MORE);
         pinned_more.add_css_class("omg-icon-button");
+        pinned_more.set_valign(gtk::Align::Start);
         pinned_more.set_tooltip_text(Some("Pinned message actions"));
         pinned_bar.append(&pinned_more);
         let pinned_retry = gtk::Button::with_label("Retry");
         pinned_retry.add_css_class("omg-primary");
+        pinned_retry.set_valign(gtk::Align::Start);
         pinned_retry.set_visible(false);
         pinned_bar.append(&pinned_retry);
         widget.append(&pinned_bar);
@@ -769,7 +795,8 @@ impl MessagesView {
         middle.set_hexpand(true);
         middle.set_vexpand(true);
         middle.add_overlay(scheduled.panel_widget());
-        let loading = gtk::Label::new(Some("Select a chat"));
+        let loading = gtk::Label::new(None);
+        loading.set_markup("Choose a conversation to begin\n<a href=\"switch-chat\">Find a chat · Ctrl+K</a>");
         loading.add_css_class("omg-empty-state");
         loading.set_halign(gtk::Align::Center);
         loading.set_valign(gtk::Align::Center);
@@ -790,6 +817,21 @@ impl MessagesView {
         middle.add_overlay(&date_chip);
         middle.add_overlay(&bottom_button);
         widget.append(&middle);
+
+        let history_status = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        history_status.add_css_class("omg-history-status");
+        history_status.set_visible(false);
+        let history_status_text = gtk::Label::new(Some("Updating messages…"));
+        history_status_text.set_hexpand(true);
+        history_status_text.set_xalign(0.0);
+        history_status_text.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        history_status_text.add_css_class("omg-muted");
+        history_status.append(&history_status_text);
+        let history_retry = gtk::Button::with_label("Retry");
+        history_retry.add_css_class("omg-primary");
+        history_retry.set_visible(false);
+        history_status.append(&history_retry);
+        widget.append(&history_status);
 
         let error = gtk::Label::new(None);
         error.add_css_class("omg-error");
@@ -871,6 +913,7 @@ impl MessagesView {
 
         let composer_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         composer_box.add_css_class("omg-composer");
+        composer_box.set_visible(false);
         let attach = gtk::Button::with_label(icons::ATTACH);
         attach.add_css_class("omg-attach");
         attach.set_tooltip_text(Some("Attach"));
@@ -882,10 +925,12 @@ impl MessagesView {
         emoji.add_css_class("omg-attach");
         emoji.set_tooltip_text(Some("Emoji"));
         emoji.set_sensitive(false);
+        emoji.set_valign(gtk::Align::End);
         composer_box.append(&emoji);
         let sticker = gtk::Button::with_label(icons::STICKER);
         sticker.add_css_class("omg-attach");
         sticker.set_tooltip_text(Some("Stickers and GIFs"));
+        sticker.set_valign(gtk::Align::End);
         sticker.set_sensitive(false);
         composer_box.append(&sticker);
 
@@ -959,7 +1004,15 @@ impl MessagesView {
         composer_box.append(&send);
         widget.append(&composer_box);
 
-        let action: Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>> = Rc::new(RefCell::new(None));
+        let action: crate::ui::CallbackSlot<dyn Fn(MessageAction)> = Rc::new(RefCell::new(None));
+        {
+            let action = action.clone();
+            loading.connect_activate_link(move |_, uri| {
+                if uri == "switch-chat"
+                    && let Some(callback) = action.borrow().as_ref().cloned() { callback(MessageAction::Switcher); }
+                glib::Propagation::Stop
+            });
+        }
         {
             let action_cb = action.clone();
             let scheduled = scheduled.clone();
@@ -1029,6 +1082,8 @@ impl MessagesView {
             search_retry,
             pinned_bar,
             pinned_text,
+            pinned_expand,
+            pinned_expanded: Cell::new(false),
             pinned_message: RefCell::new(None),
             pinned_more,
             pinned_retry,
@@ -1043,6 +1098,12 @@ impl MessagesView {
             pane_width: pane_width.clone(),
             probe_pane_width: Cell::new(None),
             loading,
+            history_refreshing: Cell::new(false),
+            history_changed: RefCell::new(HashSet::new()),
+            history_removed: RefCell::new(HashSet::new()),
+            history_status,
+            history_status_text,
+            history_retry,
             paging_spinner,
             error,
             draft_retry,
@@ -1095,6 +1156,7 @@ impl MessagesView {
             send_spin: RefCell::new(None),
             date_timeout: RefCell::new(None),
             scroll_epoch: Cell::new(0),
+            scroll_callback_generation: Cell::new(0),
             upper_handler: RefCell::new(None),
             upper_tick: RefCell::new(None),
             context_popover: RefCell::new(None),
@@ -1148,6 +1210,9 @@ impl MessagesView {
                 };
                 let width = inner.probe_pane_width.get().unwrap_or_else(|| pane.width());
                 apply_pane_width(&inner, width);
+                if inner.pinned_message.borrow().is_some() && inner.pinned_bar.is_mapped() {
+                    inner.pinned_expand.set_visible(inner.pinned_expanded.get() || inner.pinned_text.layout().is_ellipsized());
+                }
                 glib::ControlFlow::Continue
             });
         }
@@ -1159,6 +1224,15 @@ impl MessagesView {
             selection_forward,
             selection_cancel,
         );
+        {
+            let weak = Rc::downgrade(&view.inner);
+            view.inner.history_retry.connect_clicked(move |_| {
+                if let Some(inner) = weak.upgrade()
+                    && let Some(callback) = inner.action.borrow().as_ref().cloned() {
+                    callback(MessageAction::RetryHistory);
+                }
+            });
+        }
         {
             let weak = Rc::downgrade(&view.inner);
             let on_choose = Rc::new(move |text: String| {
@@ -1176,10 +1250,11 @@ impl MessagesView {
             let inner = view.inner.clone();
             let popover = super::bots::CommandPopover::new(&inner.composer, on_choose);
             *inner.command_popover.borrow_mut() = Some(popover);
-            let key_inner = inner.clone();
+            let key_inner = Rc::downgrade(&inner);
             let key = gtk::EventControllerKey::new();
             key.set_propagation_phase(gtk::PropagationPhase::Capture);
             key.connect_key_pressed(move |_, keyval, _, _| {
+                let Some(key_inner) = key_inner.upgrade() else { return glib::Propagation::Proceed };
                 let handled = key_inner
                     .command_popover
                     .borrow()
@@ -1206,14 +1281,15 @@ impl MessagesView {
         selection_cancel: gtk::Button,
     ) {
         {
-            let this = self.clone();
+            let weak = Rc::downgrade(&self.inner);
             self.inner.attach.connect_clicked(move |_| {
-                this.show_attach_menu();
+                if let Some(inner) = weak.upgrade() { MessagesView::of(&inner).show_attach_menu(); }
             });
         }
         {
-            let inner = self.inner.clone();
+            let weak = Rc::downgrade(&self.inner);
             self.inner.emoji.connect_clicked(move |button| {
+                let Some(inner) = weak.upgrade() else { return };
                 inner.composer_popover.dismiss();
                 let chooser = gtk::EmojiChooser::new();
                 let buffer = inner.composer.buffer();
@@ -1306,7 +1382,7 @@ impl MessagesView {
             // Ctrl+Shift+Enter in the composer, open the send-later picker.
             // Spec §7.1: secondary click or long press on MIC, and
             // Ctrl+Shift+V in the composer, start a video note.
-            let this = self.clone();
+            let weak = Rc::downgrade(&self.inner);
             let action = self.inner.action.clone();
             let composer = self.inner.composer.clone();
             let gesture = gtk::GestureClick::new();
@@ -1322,12 +1398,12 @@ impl MessagesView {
                         callback(MessageAction::VideoNoteStart);
                     }
                 } else {
-                    this.show_send_later();
+                    if let Some(inner) = weak.upgrade() { MessagesView::of(&inner).show_send_later(); }
                 }
             });
             self.inner.send.add_controller(gesture);
 
-            let this = self.clone();
+            let weak = Rc::downgrade(&self.inner);
             let action = self.inner.action.clone();
             let composer = self.inner.composer.clone();
             let long = gtk::GestureLongPress::new();
@@ -1342,7 +1418,7 @@ impl MessagesView {
                         callback(MessageAction::VideoNoteStart);
                     }
                 } else {
-                    this.show_send_later();
+                    if let Some(inner) = weak.upgrade() { MessagesView::of(&inner).show_send_later(); }
                 }
             });
             self.inner.send.add_controller(long);
@@ -1353,9 +1429,9 @@ impl MessagesView {
                 let Some(trigger) = gtk::ShortcutTrigger::parse_string(accel) else {
                     continue;
                 };
-                let this = self.clone();
+                let weak = Rc::downgrade(&self.inner);
                 let action = gtk::CallbackAction::new(move |_, _| {
-                    this.show_send_later();
+                    if let Some(inner) = weak.upgrade() { MessagesView::of(&inner).show_send_later(); }
                     glib::Propagation::Stop
                 });
                 shortcuts.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
@@ -1452,26 +1528,45 @@ impl MessagesView {
             });
         }
         {
-            let inner = self.inner.clone();
+            let weak = Rc::downgrade(&self.inner);
             self.inner.header_more.connect_clicked(move |button| {
+                let Some(inner) = weak.upgrade() else { return };
                 MessagesView::show_header_menu(&inner, button);
             });
         }
         {
-            let inner = self.inner.clone();
+            let weak = Rc::downgrade(&self.inner);
             let click = gtk::GestureClick::new();
             click.connect_released(move |_, _, _, _| {
-                if let Some(message) = inner.pinned_message.borrow().as_ref() {
-                    if let Some(callback) = inner.action.borrow().as_ref().cloned() {
+                let Some(inner) = weak.upgrade() else { return };
+                if inner.pinned_expanded.get() { return; }
+                if let Some(message) = inner.pinned_message.borrow().as_ref()
+                    && let Some(callback) = inner.action.borrow().as_ref().cloned() {
                         callback(MessageAction::JumpToMessage(message.id));
                     }
-                }
             });
             self.inner.pinned_bar.add_controller(click);
         }
         {
-            let inner = self.inner.clone();
+            let weak = Rc::downgrade(&self.inner);
+            self.inner.pinned_expand.connect_clicked(move |button| {
+                let Some(inner) = weak.upgrade() else { return };
+                let expanded = !inner.pinned_expanded.get();
+                inner.pinned_expanded.set(expanded);
+                if let Some(message) = inner.pinned_message.borrow().as_ref() {
+                    let text = if message.text.is_empty() { media_title(message) } else { message.text.clone() };
+                    inner.pinned_text.set_label(&if expanded { text } else { collapsed_pin_text(&text) });
+                }
+                inner.pinned_text.set_lines(if expanded { -1 } else { 4 });
+                inner.pinned_text.set_ellipsize(if expanded { gtk::pango::EllipsizeMode::None } else { gtk::pango::EllipsizeMode::End });
+                button.set_label(if expanded { "Collapse" } else { "Expand" });
+                button.set_tooltip_text(Some(if expanded { "Collapse to four lines" } else { "Expand the full pinned message" }));
+            });
+        }
+        {
+            let weak = Rc::downgrade(&self.inner);
             self.inner.pinned_more.connect_clicked(move |button| {
+                let Some(inner) = weak.upgrade() else { return };
                 let Some(msg_id) = inner
                     .pinned_message
                     .borrow()
@@ -1506,23 +1601,22 @@ impl MessagesView {
         }
 
         {
-            let inner = self.inner.clone();
-            let effects = self.inner.effects.clone();
-            let cursor = self.inner.composer_cursor.clone();
-            let equalizer = self.inner.equalizer.clone();
+            let weak = Rc::downgrade(&self.inner);
+
             self.inner.composer.buffer().connect_changed(move |buffer| {
+                let Some(inner) = weak.upgrade() else { return };
                 let empty = buffer
                     .text(&buffer.start_iter(), &buffer.end_iter(), true)
                     .is_empty();
-                effects.composer_idle(cursor.upcast_ref(), empty);
-                effects.composer_typing(&equalizer, !empty);
+                inner.effects.composer_idle(inner.composer_cursor.upcast_ref(), empty);
+                inner.effects.composer_typing(&inner.equalizer, !empty);
                 inner.composer_placeholder.set_visible(empty);
                 inner
                     .send_label
                     .set_label(if empty { icons::MIC } else { icons::SEND });
                 inner
                     .send
-                    .set_tooltip_text(Some(if empty { "Voice message" } else { "Send" }));
+                    .set_tooltip_text(Some(if empty { "Voice message · right-click for video" } else { if inner.settings.borrow().as_ref().is_none_or(|store| store.get().ui.send_on_enter) { "Send · Enter (Shift+Enter for a new line)" } else { "Send · Ctrl+Enter (Enter for a new line)" } }));
                 if empty {
                     inner.send.remove_css_class("omg-primary");
                     inner.send.add_css_class("omg-icon-button");
@@ -1540,8 +1634,9 @@ impl MessagesView {
         }
 
         {
-            let inner = self.inner.clone();
+            let weak = Rc::downgrade(&self.inner);
             self.inner.drop_target.connect_drop(move |_, value, _, _| {
+                let Some(inner) = weak.upgrade() else { return false };
                 if inner.busy.get() {
                     return false;
                 }
@@ -1561,9 +1656,10 @@ impl MessagesView {
         }
 
         {
-            let inner = self.inner.clone();
+            let weak = Rc::downgrade(&self.inner);
             let adjustment = self.inner.scroll.vadjustment();
             adjustment.connect_value_changed(move |adjustment| {
+                let Some(inner) = weak.upgrade() else { return };
                 // Wave 6D: scrolling a sticker out of view pauses it.
                 sync_lottie_visibility(&inner);
                 MessagesView::of(&inner).player_visibility_throttled();
@@ -1598,11 +1694,10 @@ impl MessagesView {
                     },
                 );
                 *inner.date_timeout.borrow_mut() = Some(source);
-                if adjustment.value() <= 4.0 && !inner.paging.get() && !inner.exhausted.get() {
-                    if let Some(callback) = inner.action.borrow().as_ref().cloned() {
+                if adjustment.value() <= 4.0 && !inner.paging.get() && !inner.exhausted.get()
+                    && let Some(callback) = inner.action.borrow().as_ref().cloned() {
                         callback(MessageAction::Paginate);
                     }
-                }
             });
         }
 
@@ -1610,11 +1705,13 @@ impl MessagesView {
             // Rows resize as their media lands, so the viewport contents change
             // without any scrolling: re-check which players and Lottie
             // stickers are on screen after the adjustment settles.
-            let inner = self.inner.clone();
+            let weak = Rc::downgrade(&self.inner);
             self.inner
                 .scroll
                 .vadjustment()
-                .connect_changed(move |_| MessagesView::of(&inner).player_visibility_throttled());
+                .connect_changed(move |_| {
+                    if let Some(inner) = weak.upgrade() { MessagesView::of(&inner).player_visibility_throttled(); }
+                });
         }
     }
 
@@ -1851,8 +1948,11 @@ impl MessagesView {
 
     pub fn set_search_loading(&self, loading: bool) {
         self.inner.search_position.remove_css_class("omg-error");
+        self.inner.search_position.set_tooltip_text(None);
         self.inner.search_position.set_label(if loading {
             "Searching…"
+        } else if self.search_text().trim().is_empty() {
+            ""
         } else {
             "No results"
         });
@@ -1865,14 +1965,17 @@ impl MessagesView {
         self.inner.search_retry.set_visible(false);
         self.inner
             .search_position
-            .set_label(&search_position(index, ids.len()));
+            .set_label(&if self.search_text().trim().is_empty() { String::new() } else { search_position(index, ids.len()) });
+        let has_query = !self.search_text().trim().is_empty();
+        self.inner.search_previous.set_visible(has_query);
+        self.inner.search_next.set_visible(has_query);
         self.inner
             .search_previous
             .set_sensitive(index.is_some_and(|index| index > 0));
         self.inner
             .search_next
             .set_sensitive(index.is_some_and(|index| index + 1 < ids.len()));
-        self.inner.search_older.set_visible(has_older);
+        self.inner.search_older.set_visible(has_query && has_older);
         self.inner.search_older.set_sensitive(true);
         self.clear_search_highlights();
         let store = self.inner.store.borrow();
@@ -1891,6 +1994,7 @@ impl MessagesView {
             self.clear_search_highlights();
         }
         self.inner.search_position.set_label(message);
+        self.inner.search_position.set_tooltip_text(Some(message));
         self.inner.search_position.add_css_class("omg-error");
         self.inner.search_retry.set_visible(true);
         self.inner.search_older.set_sensitive(false);
@@ -1905,6 +2009,13 @@ impl MessagesView {
     }
 
     pub fn set_pinned_message(&self, message: Option<Msg>) {
+        if self.inner.pinned_message.borrow().as_ref().map(|m| m.id) != message.as_ref().map(|m| m.id) {
+            self.inner.pinned_expanded.set(false);
+            self.inner.pinned_text.set_lines(4);
+            self.inner.pinned_text.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            self.inner.pinned_expand.set_label("Expand");
+        }
+        self.inner.pinned_expand.set_visible(false);
         self.move_focus_before_removal(&self.inner.pinned_bar);
         self.inner.pinned_popover.dismiss();
         self.inner.pinned_retry.set_visible(false);
@@ -1917,7 +2028,7 @@ impl MessagesView {
             } else {
                 message.text.clone()
             };
-            self.inner.pinned_text.set_label(&snippet(&preview, 90));
+            self.inner.pinned_text.set_label(&if self.inner.pinned_expanded.get() { preview } else { collapsed_pin_text(&preview) });
             self.inner.pinned_bar.set_visible(true);
         } else {
             self.inner.pinned_text.set_label("");
@@ -1926,6 +2037,7 @@ impl MessagesView {
     }
 
     pub fn begin_pinned(&self) {
+        self.set_pinned_message(None);
         self.move_focus_before_removal(&self.inner.pinned_bar);
         self.inner.pinned_popover.dismiss();
         self.inner.pinned_message.borrow_mut().take();
@@ -1937,6 +2049,7 @@ impl MessagesView {
     }
 
     pub fn fail_pinned(&self, error: &str) {
+        self.set_pinned_message(None);
         self.inner.pinned_message.borrow_mut().take();
         self.inner.pinned_text.add_css_class("omg-error");
         self.inner.pinned_text.set_label(error);
@@ -1957,6 +2070,13 @@ impl MessagesView {
         self.inner.pinned_bar.is_visible()
     }
 
+    pub fn probe_pinned_metrics(&self) -> (bool, bool, i32, i32) {
+        (self.inner.pinned_expand.is_visible(), self.inner.pinned_expanded.get(),
+            self.inner.pinned_text.height(), self.inner.pinned_bar.height())
+    }
+
+    pub fn trigger_pinned_expand(&self) { self.inner.pinned_expand.emit_clicked(); }
+
     pub fn pinned_retry_visible(&self) -> bool {
         self.inner.pinned_retry.is_visible()
     }
@@ -1966,11 +2086,10 @@ impl MessagesView {
     }
 
     pub fn trigger_pinned(&self) {
-        if let Some(message) = self.inner.pinned_message.borrow().as_ref() {
-            if let Some(callback) = self.inner.action.borrow().as_ref().cloned() {
+        if let Some(message) = self.inner.pinned_message.borrow().as_ref()
+            && let Some(callback) = self.inner.action.borrow().as_ref().cloned() {
                 callback(MessageAction::JumpToMessage(message.id));
             }
-        }
     }
 
     pub fn set_available_reactions(&self, reactions: Vec<String>) {
@@ -2058,6 +2177,7 @@ impl MessagesView {
     }
 
     fn cancel_pending_scroll(&self) {
+        self.inner.scroll_callback_generation.set(self.inner.scroll_callback_generation.get().wrapping_add(1));
         let adjustment = self.inner.scroll.vadjustment();
         if let Some(handler) = self.inner.upper_handler.borrow_mut().take() {
             adjustment.disconnect(handler);
@@ -2099,6 +2219,18 @@ impl MessagesView {
         F: FnOnce(&gtk::Adjustment, bool) + 'static,
     {
         self.cancel_pending_scroll();
+        // Adjustment notifications are emitted during viewport allocation.
+        // Scroll after that allocation, so GTK installs the new transform too.
+        let generation = self.inner.scroll_callback_generation.get();
+        let weak = Rc::downgrade(&self.inner);
+        let callback = move |adjustment: &gtk::Adjustment, changed: bool| {
+            let adjustment = adjustment.clone();
+            glib::idle_add_local_once(move || {
+                if weak.upgrade().is_some_and(|inner| inner.scroll_callback_generation.get() == generation) {
+                    callback(&adjustment, changed);
+                }
+            });
+        };
         let adjustment = self.inner.scroll.vadjustment();
         let epoch = self.inner.scroll_epoch.get();
         if (adjustment.upper() - saved_upper).abs() > f64::EPSILON {
@@ -2163,6 +2295,18 @@ impl MessagesView {
         F: FnOnce(&gtk::Adjustment) + 'static,
     {
         self.cancel_pending_scroll();
+        // Adjustment notifications are emitted during viewport allocation.
+        // Scroll after that allocation, so GTK installs the new transform too.
+        let generation = self.inner.scroll_callback_generation.get();
+        let weak = Rc::downgrade(&self.inner);
+        let callback = move |adjustment: &gtk::Adjustment| {
+            let adjustment = adjustment.clone();
+            glib::idle_add_local_once(move || {
+                if weak.upgrade().is_some_and(|inner| inner.scroll_callback_generation.get() == generation) {
+                    callback(&adjustment);
+                }
+            });
+        };
         let adjustment = self.inner.scroll.vadjustment();
         let epoch = self.inner.scroll_epoch.get();
         let callback = Rc::new(RefCell::new(Some(callback)));
@@ -2204,6 +2348,9 @@ impl MessagesView {
     }
 
     pub fn reset_chat(&self, chat_id: i64, title: &str, epoch: u64) {
+        self.inner.history_changed.borrow_mut().clear();
+        self.inner.history_removed.borrow_mut().clear();
+        self.finish_history_status();
         self.exit_selection_mode();
         self.hide_recorder();
         self.reset_players();
@@ -2269,6 +2416,7 @@ impl MessagesView {
     }
 
     pub fn clear_selection(&self, epoch: u64) {
+        self.finish_history_status();
         self.exit_selection_mode();
         self.hide_recorder();
         self.move_focus_before_removal(&self.widget);
@@ -2294,12 +2442,12 @@ impl MessagesView {
         self.inner.read_outbox.set(0);
         self.clear_rows();
         *self.inner.store.borrow_mut() = MessageStore::default();
-        self.inner.header_title.set_label("Select a chat");
+        self.inner.header_title.set_label("Omarchygram");
         self.inner.header_actions.set_visible(false);
         self.inner.header_call.set_visible(false);
         self.inner.header_summary.borrow_mut().take();
         self.inner.base_status.borrow_mut().clear();
-        self.inner.loading.set_label("Select a chat");
+        self.inner.loading.set_markup("Choose a conversation to begin\n<a href=\"switch-chat\">Find a chat · Ctrl+K</a>");
         self.inner.loading.set_visible(true);
         self.inner.paging_spinner.stop();
         self.inner.paging_spinner.set_visible(false);
@@ -2317,6 +2465,7 @@ impl MessagesView {
             .effects
             .empty_state(&self.inner.empty_effects, true);
         self.set_start_mode(false);
+        self.inner.composer_box.set_visible(false);
         self.inner.bot_commands.borrow_mut().clear();
         self.inner.bot_username.borrow_mut().clear();
     }
@@ -2326,6 +2475,9 @@ impl MessagesView {
     /// preserves the composer draft, reply/edit mode, and busy sensitivity
     /// (C5/C13). `detached` is left to the caller.
     pub fn reset_history(&self, chat_id: i64, epoch: u64) {
+        self.inner.history_changed.borrow_mut().clear();
+        self.inner.history_removed.borrow_mut().clear();
+        self.finish_history_status();
         self.reset_players();
         self.move_focus_before_removal(&self.widget);
         self.cancel_pending_scroll();
@@ -2356,7 +2508,9 @@ impl MessagesView {
             .empty_state(&self.inner.empty_effects, false);
     }
 
-    pub fn finish_initial(&self, messages: Vec<Msg>) -> Vec<i32> {
+    pub fn finish_initial(&self, mut messages: Vec<Msg>) -> Vec<i32> {
+        self.preserve_history_events(&mut messages);
+        self.finish_history_status();
         self.inner
             .initial_render_count
             .set(self.inner.initial_render_count.get().wrapping_add(1));
@@ -2387,7 +2541,66 @@ impl MessagesView {
         inserted
     }
 
+    pub fn begin_history_load(&self) {
+        self.inner.history_changed.borrow_mut().clear();
+        self.inner.history_removed.borrow_mut().clear();
+        self.inner.history_refreshing.set(true);
+    }
+
+    fn preserve_history_events(&self, messages: &mut Vec<Msg>) {
+        messages.retain(|m| !self.inner.history_removed.borrow().contains(&m.id));
+        for message in messages {
+            if self.inner.history_changed.borrow().contains(&message.id)
+                && let Some(current) = self.message(message.id) { *message = current; }
+        }
+    }
+
+    pub fn finish_cached(&self, messages: Vec<Msg>) -> Vec<i32> {
+        let inserted = self.finish_initial(messages);
+        self.inner.history_refreshing.set(true);
+        self.inner.history_status_text.set_label("Updating messages…");
+        self.inner.history_retry.set_visible(false);
+        self.inner.history_status.set_visible(true);
+        inserted
+    }
+
+    fn finish_history_status(&self) {
+        self.inner.history_refreshing.set(false);
+        self.inner.history_status.set_visible(false);
+        self.inner.history_retry.set_visible(false);
+    }
+
+    /// Replace the cached page with the authoritative range, preserving
+    /// intervening live events, pending sends and the reader's scroll position.
+    pub fn finish_refreshed(&self, mut messages: Vec<Msg>, cached: &[Msg]) -> Vec<i32> {
+        if cached.is_empty() { return self.finish_initial(messages); }
+        self.preserve_history_events(&mut messages);
+        let adjustment = self.inner.scroll.vadjustment();
+        let saved_value = adjustment.value();
+        let stick = self.inner.stick_to_bottom.get();
+        for old in cached {
+            let current = self.message(old.id);
+            if let Some(fresh) = messages.iter_mut().find(|m| m.id == old.id) {
+                if let Some(current) = current.filter(|m| m != old) { *fresh = current; }
+            } else if current.as_ref() == Some(old) {
+                self.remove(old.id);
+            }
+        }
+        let inserted = self.merge(messages, false, false);
+        self.refresh_reply_bar();
+        self.finish_history_status();
+        self.inner.loading.set_visible(self.inner.store.borrow().order.is_empty());
+        self.inner.loading.set_label("No messages yet");
+        self.after_next_upper_or_tick(move |adjustment| {
+            adjustment.set_value(if stick { (adjustment.upper() - adjustment.page_size()).max(0.0) } else { saved_value });
+        });
+        inserted
+    }
+
+    pub fn history_is_refreshing(&self) -> bool { self.inner.history_refreshing.get() }
+
     pub fn merge_event(&self, message: Msg) -> Vec<i32> {
+        self.inner.history_changed.borrow_mut().insert(message.id);
         // Detached (jumped-to historical page): merge into the store but never
         // auto-scroll; the ▼ button stays visible (C4).
         let should_stick = self.inner.stick_to_bottom.get() && !self.inner.detached.get();
@@ -2430,7 +2643,7 @@ impl MessagesView {
     }
 
     pub fn begin_page(&self) -> Option<i32> {
-        if self.inner.loading.is_visible()
+        if self.inner.history_refreshing.get() || self.inner.loading.is_visible()
             || self.inner.paging.get()
             || self.inner.exhausted.get()
             || self.inner.suppress_paging.get()
@@ -2478,11 +2691,14 @@ impl MessagesView {
     }
 
     pub fn fail_initial(&self, message: &str) {
+        self.inner.history_refreshing.set(false);
+        self.inner.history_status_text.set_label(message);
+        self.inner.history_status.set_visible(true);
+        self.inner.history_retry.set_visible(true);
         self.inner.loading.set_visible(false);
         self.inner.paging_spinner.stop();
         self.inner.paging_spinner.set_visible(false);
         self.inner.suppress_paging.set(false);
-        self.show_error(message);
     }
 
     pub fn trigger_pagination(&self) {
@@ -2646,6 +2862,7 @@ impl MessagesView {
         } else {
             gtk::Align::Start
         });
+        media_slot.set_visible(message.media.is_some());
         content.append(&media_slot);
 
         let animation_sources = Rc::new(RefCell::new(Vec::new()));
@@ -2794,11 +3011,10 @@ impl MessagesView {
         receipt.add_css_class("omg-msg-time");
         receipt.set_visible(message.outgoing);
         meta.append(&receipt);
-        if message.outgoing && is_live && self.inner.effects.on("receiptdraw") {
-            if let Some(source) = self.inner.effects.receipt_drawn(receipt.upcast_ref()) {
+        if message.outgoing && is_live && self.inner.effects.on("receiptdraw")
+            && let Some(source) = self.inner.effects.receipt_drawn(receipt.upcast_ref()) {
                 animation_sources.borrow_mut().push(source);
             }
-        }
         meta.append(&deleted_tag);
         meta.add_css_class("omg-meta");
         content.append(&meta);
@@ -2812,9 +3028,8 @@ impl MessagesView {
         reaction_anchor.set_tooltip_text(Some("React"));
         {
             let inner = Rc::downgrade(&self.inner);
-            let anchor = reaction_anchor.clone();
             let msg_id = message.id;
-            reaction_anchor.connect_clicked(move |_| {
+            reaction_anchor.connect_clicked(move |anchor| {
                 let Some(inner) = inner.upgrade() else { return };
                 // Context-menu "…" activates this stable row-owned button.
                 // Focus it before the old popover is unparented (A26).
@@ -2831,12 +3046,13 @@ impl MessagesView {
                     }
                 });
                 *inner.probe_reaction_chooser.borrow_mut() = Some(chooser.clone());
-                inner.reaction_popover.show(&anchor, chooser.upcast());
+                inner.reaction_popover.show(anchor, chooser.upcast());
             });
         }
-        reactions.append(&reaction_anchor);
+        meta.prepend(&reaction_anchor);
 
         let aux_slot = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        aux_slot.set_visible(false);
         content.append(&aux_slot);
 
         let keyboard_slot = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -2854,6 +3070,7 @@ impl MessagesView {
             let widget = super::bots::build_keyboard(keyboard, message.id, action, bot_username);
             keyboard_slot.append(&widget);
         }
+        keyboard_slot.set_visible(keyboard_slot.first_child().is_some());
         content.append(&keyboard_slot);
 
         let gesture = gtk::GestureClick::new();
@@ -3052,7 +3269,7 @@ impl MessagesView {
         // focus. Move it to the stable composer before rebuilding or clearing
         // the keyboard subtree (GTK4 teardown rule).
         self.move_focus_before_removal(&row.keyboard_slot);
-        if message.keyboard.is_some() {
+        if let Some(keyboard) = &message.keyboard {
             let action: Rc<dyn Fn(MessageAction)> = Rc::new({
                 let a = self.inner.action.clone();
                 move |message_action| {
@@ -3064,7 +3281,7 @@ impl MessagesView {
             let bot_username = self.inner.bot_username.clone();
             super::bots::update_keyboard(
                 &row.keyboard_slot,
-                message.keyboard.as_ref().unwrap(),
+                keyboard,
                 message.id,
                 action,
                 bot_username,
@@ -3080,9 +3297,7 @@ impl MessagesView {
         if matches!(message.media, Some(MediaKind::Location | MediaKind::Venue)) {
             let moved = message.location.as_ref().map(|location| location.point) != old_point;
             let live = message.location.as_ref().and_then(|location| location.live.as_ref());
-            if moved || live.is_none() {
-                self.rebuild_card(&message);
-            } else if !row.media_slot.first_child().is_some_and(|card| {
+            if moved || live.is_none() || !row.media_slot.first_child().is_some_and(|card| {
                 crate::ui::cards::update_geo_live(
                     &card,
                     &message,
@@ -3108,26 +3323,32 @@ impl MessagesView {
     }
 
     fn reorder_rows(&self) {
-        let rows: Vec<(Msg, BubbleClamp, gtk::Label)> = {
+        // Compute grouping while borrowing messages, then release the store
+        // before touching widgets. No history-sized copies of text/media/polls.
+        let rows = {
             let store = self.inner.store.borrow();
-            store
-                .order
-                .iter()
-                .filter_map(|id| {
-                    store.entries.get(id).map(|entry| {
-                        (
-                            entry.msg.clone(),
-                            entry.row.widget.clone(),
-                            entry.row.sender.clone(),
-                        )
-                    })
-                })
-                .collect()
+            let mut previous: Option<&Msg> = None;
+            store.order.iter().filter_map(|id| store.entries.get(id)).map(|entry| {
+                let message = &entry.msg;
+                let date = message.ts.date_naive();
+                let new_day = previous.is_none_or(|p| p.ts.date_naive() != date);
+                let same_sender = previous.is_some_and(|p| {
+                    !new_day && p.outgoing == message.outgoing
+                        && match (p.sender_id, message.sender_id) {
+                            (Some(a), Some(b)) => a == b,
+                            (None, None) => p.sender == message.sender,
+                            _ => false,
+                        }
+                        && message.ts.signed_duration_since(p.ts).num_minutes().abs() <= 5
+                });
+                let show_sender = self.inner.chat_kind.get() == ChatKind::Group
+                    && !message.outgoing && message.sender != "You" && !message.sender.is_empty() && !same_sender;
+                let margin = if previous.is_none() { 0 } else if same_sender { 4 } else { 12 };
+                previous = Some(message);
+                (date, new_day, show_sender, margin, entry.row.widget.clone(), entry.row.sender.clone())
+            }).collect::<Vec<_>>()
         };
-        let used_dates: std::collections::HashSet<chrono::NaiveDate> = rows
-            .iter()
-            .map(|(message, _, _)| message.ts.date_naive())
-            .collect();
+        let used_dates: HashSet<chrono::NaiveDate> = rows.iter().map(|row| row.0).collect();
         let unused = self
             .inner
             .day_separators
@@ -3144,12 +3365,7 @@ impl MessagesView {
             self.inner.day_separators.borrow_mut().remove(&date);
         }
         let mut previous: Option<gtk::Widget> = None;
-        let mut previous_message: Option<Msg> = None;
-        for (message, row, sender) in rows {
-            let date = message.ts.date_naive();
-            let new_day = previous_message
-                .as_ref()
-                .is_none_or(|previous| previous.ts.date_naive() != date);
+        for (date, new_day, show_sender, margin, row, sender) in rows {
             if new_day {
                 let separator = self
                     .inner
@@ -3169,74 +3385,42 @@ impl MessagesView {
                 if separator.parent().is_none() {
                     self.inner.list.append(&separator);
                 }
-                self.inner
-                    .list
-                    .reorder_child_after(&separator, previous.as_ref());
+                if separator.prev_sibling() != previous {
+                    self.inner.list.reorder_child_after(&separator, previous.as_ref());
+                }
                 previous = Some(separator.upcast());
             }
-            let same_sender = previous_message.as_ref().is_some_and(|previous| {
-                previous.ts.date_naive() == date
-                    && previous.outgoing == message.outgoing
-                    && sender_identity(previous) == sender_identity(&message)
-                    && message
-                        .ts
-                        .signed_duration_since(previous.ts)
-                        .num_minutes()
-                        .abs()
-                        <= 5
-            });
-            let can_show_sender = self.inner.chat_kind.get() == ChatKind::Group
-                && !message.outgoing
-                && message.sender != "You"
-                && !message.sender.is_empty();
-            sender.set_visible(can_show_sender && !same_sender);
-            row.set_margin_top(if previous_message.is_some() && same_sender {
-                4
-            } else if previous_message.is_some() {
-                12
-            } else {
-                0
-            });
+            sender.set_visible(show_sender);
+            row.set_margin_top(margin);
             if row.parent().is_none() {
                 self.inner.list.append(&row);
             }
-            self.inner.list.reorder_child_after(&row, previous.as_ref());
+            if row.prev_sibling() != previous { self.inner.list.reorder_child_after(&row, previous.as_ref()); }
             previous = Some(row.clone().upcast());
-            previous_message = Some(message);
         }
     }
 
     fn refresh_quotes(&self) {
-        let (quoted, rows) = {
+        // Only copy the preview of actually referenced messages. A new message
+        // used to duplicate every loaded message's text and formatting here.
+        let rows = {
             let store = self.inner.store.borrow();
-            let mut quoted = self.inner.quote_cache.borrow().clone();
-            quoted.extend(
-                store
-                    .entries
-                    .iter()
-                    .map(|(&id, entry)| (id, (entry.msg.sender.clone(), entry.msg.text.clone()))),
-            );
-            let rows: Vec<(Option<i32>, gtk::Label)> = store
-                .entries
-                .values()
-                .map(|entry| (entry.msg.reply_to, entry.row.quote.clone()))
-                .collect();
-            (quoted, rows)
+            let cache = self.inner.quote_cache.borrow();
+            store.entries.values().map(|entry| {
+                let label = entry.msg.reply_to.map(|id| {
+                    let source = store.entries.get(&id).map(|entry| (entry.msg.sender.as_str(), entry.msg.text.as_str()))
+                        .or_else(|| cache.get(&id).map(|(sender,text)| (sender.as_str(),text.as_str())));
+                    source.map(|(sender,text)| format!("{}: {}", if sender.is_empty() { "Unknown" } else { sender }, snippet(text,60)))
+                        .unwrap_or_else(|| "replied message".into())
+                });
+                (entry.row.quote.clone(),label)
+            }).collect::<Vec<_>>()
         };
-        for (reply_to, quote) in rows {
-            let Some(reply_to) = reply_to else {
-                quote.set_visible(false);
-                continue;
-            };
-            let label = quoted
-                .get(&reply_to)
-                .map(|(sender, text)| {
-                    let sender = if sender.is_empty() { "Unknown" } else { sender };
-                    format!("{}: {}", sender, snippet(text, 60))
-                })
-                .unwrap_or_else(|| "replied message".to_string());
-            quote.set_label(&label);
-            quote.set_visible(true);
+        for (quote, label) in rows {
+            if let Some(label) = label {
+                if quote.label() != label { quote.set_label(&label); }
+                quote.set_visible(true);
+            } else { quote.set_visible(false); }
         }
     }
 
@@ -3353,7 +3537,8 @@ impl MessagesView {
                 state.add_css_class("omg-muted");
                 quick.append(&state);
             }
-            for emoji in reactions.iter().take(7).cloned() {
+            for emoji in reactions.iter().take(7) {
+                let emoji = String::clone(emoji);
                 let button = gtk::Button::with_label(&emoji);
                 button.add_css_class("omg-reaction");
                 let action = inner.action.clone();
@@ -3527,6 +3712,10 @@ impl MessagesView {
             ("Chat info", ChatAction::Info, false),
         ];
         for (label, action, danger) in actions {
+            let topic = crate::tg::split_topic_chat_id(summary.id);
+            if topic.is_some() && matches!(action, ChatAction::MarkUnread(_) | ChatAction::Archive(_)) { continue; }
+            if topic.is_some_and(|(_, id)| id == 1) && matches!(action, ChatAction::Delete) { continue; }
+            let label = if topic.is_some() && matches!(action, ChatAction::Delete) { "Delete topic" } else { label };
             let menu_button = menus::button(label, danger);
             let inner_weak = Rc::downgrade(inner);
             let popover_weak = popover.downgrade();
@@ -3560,11 +3749,10 @@ impl MessagesView {
             if let Some(popover) = popover_for_day.upgrade() {
                 popover.popdown();
             }
-            if let Some(date) = calendar_day_end(calendar) {
-                if let Some(callback) = action_callback.borrow().as_ref().cloned() {
+            if let Some(date) = calendar_day_end(calendar)
+                && let Some(callback) = action_callback.borrow().as_ref().cloned() {
                     callback(MessageAction::JumpToDate(date));
                 }
-            }
         });
         calendar_popover.set_child(Some(&calendar));
         inner
@@ -3672,11 +3860,10 @@ impl MessagesView {
     fn release_composer_focus(&self) {
         let composer: gtk::Widget = self.inner.composer.clone().upcast();
         let focused = composer.is_focus() || composer.focus_child().is_some();
-        if focused {
-            if let Some(window) = composer.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
+        if focused
+            && let Some(window) = composer.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
                 gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
             }
-        }
     }
 
     pub fn begin_selection(&self, msg_id: i32) -> bool {
@@ -3975,11 +4162,10 @@ impl MessagesView {
 
     pub fn expire_live_location(&self, msg_id: i32) {
         if let Some(mut message) = self.message(msg_id) {
-            if let Some(ref mut loc) = message.location {
-                if let Some(ref mut live) = loc.live {
+            if let Some(ref mut loc) = message.location
+                && let Some(ref mut live) = loc.live {
                     live.stopped = true;
                 }
-            }
             self.merge_event(message);
         }
     }
@@ -3990,20 +4176,18 @@ impl MessagesView {
         };
         let mut child = widget.first_child();
         while let Some(btn) = child {
-            if let Some(button) = btn.downcast_ref::<gtk::Button>() {
-                if let Some(lbl) = button.child().and_then(|c| {
+            if let Some(button) = btn.downcast_ref::<gtk::Button>()
+                && let Some(lbl) = button.child().and_then(|c| {
                     if let Some(box_widget) = c.downcast_ref::<gtk::Box>() {
                         box_widget.last_child().and_then(|l| l.downcast::<gtk::Label>().ok())
                     } else {
                         c.downcast::<gtk::Label>().ok()
                     }
-                }) {
-                    if lbl.text().contains(text) {
+                })
+                    && lbl.text().contains(text) {
                         button.emit_clicked();
                         return true;
                     }
-                }
-            }
             child = btn.next_sibling();
         }
         false
@@ -4284,6 +4468,7 @@ impl MessagesView {
             }
             None => super::bots::clear_keyboard(&slot),
         }
+        slot.set_visible(slot.first_child().is_some());
     }
 
     fn dismiss_command_popover(inner: &Rc<MessagesInner>) {
@@ -4374,6 +4559,7 @@ impl MessagesView {
     }
 
     pub fn remove(&self, msg_id: i32) -> Option<Msg> {
+        self.inner.history_removed.borrow_mut().insert(msg_id);
         self.drop_selection_ids(&[msg_id]);
         self.dismiss_row_popovers();
         self.inner.pending_messages.borrow_mut().remove(&msg_id);
@@ -4425,6 +4611,7 @@ impl MessagesView {
     }
 
     pub fn mark_deleted(&self, msg_id: i32) -> bool {
+        self.inner.history_changed.borrow_mut().insert(msg_id);
         self.drop_selection_ids(&[msg_id]);
         let row = {
             let mut store = self.inner.store.borrow_mut();
@@ -4475,6 +4662,8 @@ impl MessagesView {
             .any(|entry| entry.msg.text == text)
     }
 
+    pub fn is_empty(&self) -> bool { self.inner.store.borrow().order.is_empty() }
+
     pub fn len(&self) -> usize {
         self.inner.store.borrow().order.len()
     }
@@ -4484,7 +4673,7 @@ impl MessagesView {
     }
 
     pub fn is_empty_state(&self) -> bool {
-        self.inner.loading.is_visible() && self.inner.loading.label() == "Select a chat"
+        self.inner.loading.is_visible() && self.inner.store.borrow().chat_id.is_none()
     }
 
     pub fn aux_contains(&self, msg_id: i32, needle: &str) -> bool {
@@ -4530,7 +4719,7 @@ impl MessagesView {
     pub fn keyboard_button_labels(&self, msg_id: i32) -> Vec<String> {
         self.keyboard_buttons(msg_id)
             .iter()
-            .map(|button| base_label(button))
+            .map(base_label)
             .collect()
     }
 
@@ -4715,6 +4904,14 @@ impl MessagesView {
             .entries
             .get(&msg_id)
             .map(|entry| entry.media_state.clone())
+    }
+
+    pub fn image_is_allocated(&self, msg_id: i32) -> bool {
+        self.inner.store.borrow().entries.get(&msg_id).is_some_and(|entry| {
+            let slot = &entry.row.media_slot;
+            slot.is_visible() && slot.width() > 0 && slot.height() > 0
+                && slot.first_child().is_some_and(|child| child.is::<PhotoClamp>() && child.width() > 0 && child.height() > 0)
+        })
     }
 
     pub fn media_retryable(&self, msg_id: i32) -> bool {
@@ -4933,11 +5130,10 @@ impl MessagesView {
         let quick = contents.first_child()?.downcast::<gtk::Box>().ok()?;
         let mut child = quick.first_child();
         while let Some(widget) = child {
-            if let Ok(button) = widget.clone().downcast::<gtk::Button>() {
-                if button.label().as_deref() == Some(label) {
+            if let Ok(button) = widget.clone().downcast::<gtk::Button>()
+                && button.label().as_deref() == Some(label) {
                     return Some(button);
                 }
-            }
             child = widget.next_sibling();
         }
         None
@@ -5411,6 +5607,10 @@ impl MessagesView {
             return;
         };
         self.move_focus_before_removal(&widget);
+        if let Some(entry) = self.inner.store.borrow_mut().entries.get_mut(&msg_id) {
+            entry.msg.poll = Some(poll.clone());
+        }
+        self.inner.history_changed.borrow_mut().insert(msg_id);
         crate::ui::poll::update(&widget, &poll, msg_id, &self.inner.action.clone());
     }
 
@@ -6516,6 +6716,7 @@ impl MessagesView {
                 slot.append(&aux_label(&format!("{prefix}{value}"), false));
             }
         }
+        slot.set_visible(slot.first_child().is_some());
         true
     }
 
@@ -6529,6 +6730,7 @@ impl MessagesView {
             .map(|entry| entry.row.aux_slot.clone());
         let Some(slot) = slot else { return false };
         slot.append(&aux_label(message, true));
+        slot.set_visible(slot.first_child().is_some());
         true
     }
 
@@ -6545,6 +6747,7 @@ impl MessagesView {
             while let Some(child) = slot.first_child() {
                 slot.remove(&child);
             }
+            slot.set_visible(false);
         }
     }
 
@@ -6732,6 +6935,7 @@ impl MessagesView {
 
 fn apply_pane_width(inner: &MessagesInner, width: i32) {
     if width > 0 && inner.pane_width.replace(width) != width {
+        inner.search_older.set_label(if width < 600 { icons::DOWN } else { "Load older" });
         for entry in inner.store.borrow().entries.values() {
             entry.row.widget.queue_resize();
         }
@@ -6746,17 +6950,14 @@ fn row_visible_in(inner: &Rc<MessagesInner>, msg_id: i32) -> bool {
         .get(&msg_id)
         .map(|entry| entry.row.widget.clone());
     let Some(row) = row else { return false };
-    // Row bounds are in the list's (unscrolled) coordinates, so the visible
-    // rectangle is the vertical adjustment's window (like the date chip).
-    let Some(bounds) = row.compute_bounds(&inner.list) else {
+    // Use the actual viewport transform, including GTK's current allocation,
+    // instead of assuming the adjustment value has already been painted.
+    let Some(bounds) = row.compute_bounds(&inner.scroll) else {
         return false;
     };
-    let adjustment = inner.scroll.vadjustment();
-    let page = adjustment.page_size();
-    let top = adjustment.value();
-    page > 0.0
-        && f64::from(bounds.y() + bounds.height()) > top
-        && f64::from(bounds.y()) < top + page
+    inner.scroll.height() > 0
+        && bounds.y() + bounds.height() > 0.0
+        && bounds.y() < inner.scroll.height() as f32
 }
 
 /// Re-pins a stuck-to-bottom view once the grown row has been allocated.
@@ -6924,13 +7125,6 @@ fn presence_text(presence: Presence, now: DateTime<Local>) -> String {
     }
 }
 
-fn sender_identity(message: &Msg) -> String {
-    message
-        .sender_id
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| message.sender.clone())
-}
-
 fn sender_color_index(message: &Msg) -> usize {
     if let Some(sender_id) = message.sender_id {
         return sender_id.rem_euclid(7) as usize;
@@ -6986,7 +7180,7 @@ fn message_label(text: &str) -> gtk::Label {
 fn formatted_message_label(
     message: &Msg,
     revealed: &Rc<RefCell<HashSet<(usize, usize)>>>,
-    action: &Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    action: &crate::ui::CallbackSlot<dyn Fn(MessageAction)>,
     darker_background: &str,
 ) -> gtk::Label {
     let label = message_label(&message.text);
@@ -7110,7 +7304,7 @@ fn set_text_block_style(block: &gtk::Box, message: &Msg) {
 fn render_web_preview(
     slot: &gtk::Box,
     message: &Msg,
-    action: &Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    action: &crate::ui::CallbackSlot<dyn Fn(MessageAction)>,
 ) {
     while let Some(child) = slot.first_child() {
         slot.remove(&child);
@@ -7291,6 +7485,10 @@ fn child_at_index(widget: &gtk::Widget, index: usize) -> Option<gtk::Widget> {
     None
 }
 
+// Pango's negative line limit applies per paragraph. Flatten only the preview
+// so embedded newlines cannot bypass the four-line limit; expansion uses Msg.
+fn collapsed_pin_text(text: &str) -> String { text.split_whitespace().collect::<Vec<_>>().join(" ") }
+
 pub fn search_position(index: Option<usize>, total: usize) -> String {
     match (index, total) {
         (Some(index), total) if index < total => format!("{} of {total}", index + 1),
@@ -7336,7 +7534,7 @@ fn update_reactions(
     row: &MessageRow,
     message: &Msg,
     effects: &Effects,
-    action: &Rc<RefCell<Option<Rc<dyn Fn(MessageAction)>>>>,
+    action: &crate::ui::CallbackSlot<dyn Fn(MessageAction)>,
     animate: bool,
 ) {
     let mut buttons = row.reaction_buttons.borrow_mut();
@@ -7395,7 +7593,7 @@ fn update_reactions(
         }
     }
     row.reaction_anchor.set_visible(true);
-    row.reactions.set_visible(true);
+    row.reactions.set_visible(!message.reactions.is_empty());
 }
 
 fn set_deleted_rendering(row: &MessageRow, deleted: bool) {

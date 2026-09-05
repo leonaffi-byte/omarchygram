@@ -29,6 +29,18 @@ async fn start_reports_ready() {
 }
 
 #[tokio::test]
+async fn shutdown_stops_all_backend_clones_and_is_repeatable() {
+    let tg = started_mock().await;
+    let other = tg.clone();
+    tokio::time::timeout(EVENT_WAIT, async {
+        tokio::join!(tg.shutdown(), other.shutdown());
+    }).await.expect("all shutdown callers must observe completed teardown");
+    assert!(other.get_dialogs().await.is_err(), "a stopped backend cannot accept requests");
+    assert!(tg.events.is_closed(), "shutdown must finish background event producers");
+    tokio::time::timeout(EVENT_WAIT, tg.shutdown()).await.expect("repeated shutdown completes");
+}
+
+#[tokio::test]
 async fn dialogs_are_the_mock_chats_newest_first() {
     let tg = started_mock().await;
 
@@ -496,6 +508,8 @@ async fn outgoing_call_rings_connects_mutes_and_hangs_up() {
     })
     .await;
     assert_eq!(muted.phase, CallPhase::Active);
+    tg.call_set_devices(active.id, "mock-mic-usb".into(), "mock-out-hdmi".into()).await.expect("switch active call devices");
+    assert!(tg.call_set_devices(active.id + 1, String::new(), String::new()).await.is_err(), "stale device changes must be rejected");
     // A second call while active is refused.
     assert!(tg.call_start(2).await.is_err());
     // Hang up ends the call.
@@ -515,4 +529,45 @@ async fn calling_a_bot_is_refused_and_devices_list() {
     assert!(tg.call_start(bot).await.is_err(), "cannot call a bot");
     let devices = tg.call_devices().await.expect("devices");
     assert!(!devices.input.is_empty() && !devices.output.is_empty());
+}
+
+#[tokio::test]
+async fn topic_actions_never_mutate_the_forum_or_other_topics() {
+    use omarchygram::tg::MuteMode;
+    let tg = started_mock().await;
+    let forum = chat_titled(&tg, "Omarchy Forum").await;
+    let topics = tg.get_topics(forum).await.unwrap();
+    let topic = topics.iter().find(|topic| topic.id != 1 && !topic.pinned).unwrap();
+    let other = topics.iter().find(|candidate| candidate.id != topic.id).unwrap();
+    let parent_before = tg.get_dialogs().await.unwrap().into_iter().find(|chat| chat.id == forum).unwrap();
+    let other_history = tg.get_history(other.chat_id, None).await.unwrap();
+    tg.set_muted(topic.chat_id, MuteMode::Forever).await.unwrap();
+    tg.set_pinned(topic.chat_id, true).await.unwrap();
+    tg.save_draft(topic.chat_id, "topic draft", Some(123)).await.unwrap();
+    assert!(tg.set_archived(topic.chat_id, true).await.is_err());
+    assert!(tg.mark_unread(topic.chat_id, true).await.is_err());
+    let changed = tg.get_topics(forum).await.unwrap().into_iter().find(|entry| entry.id == topic.id).unwrap();
+    assert!(changed.muted && changed.pinned);
+    assert_eq!(changed.draft, "topic draft");
+    assert_eq!(changed.draft_reply_to, Some(123));
+    let parent_after = tg.get_dialogs().await.unwrap().into_iter().find(|chat| chat.id == forum).unwrap();
+    assert_eq!((parent_before.muted,parent_before.pinned,parent_before.draft), (parent_after.muted,parent_after.pinned,parent_after.draft));
+    tg.clear_history(topic.chat_id).await.unwrap();
+    assert!(tg.get_history(topic.chat_id, None).await.unwrap().is_empty());
+    assert_eq!(tg.get_history(other.chat_id, None).await.unwrap(), other_history);
+    assert!(tg.get_topics(forum).await.unwrap().iter().any(|entry| entry.id == topic.id));
+    tg.delete_chat(topic.chat_id).await.unwrap();
+    assert!(!tg.get_topics(forum).await.unwrap().iter().any(|entry| entry.id == topic.id));
+    assert!(tg.get_dialogs().await.unwrap().iter().any(|chat| chat.id == forum));
+    assert!(tg.delete_chat(topic_chat_id(forum, 1)).await.is_err());
+}
+
+#[tokio::test]
+async fn recent_history_is_available_without_another_server_load() {
+    let tg = started_mock().await;
+    assert!(tg.get_cached_history(1).await.unwrap().is_empty());
+    let messages = tg.get_history(1, None).await.unwrap();
+    assert_eq!(tg.get_cached_history(1).await.unwrap(), messages);
+    assert!(tg.get_cached_history(2).await.unwrap().is_empty());
+    tg.shutdown().await;
 }

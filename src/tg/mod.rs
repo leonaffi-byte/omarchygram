@@ -10,10 +10,13 @@
 //! methods below; the UI must compile against nothing else.
 
 mod archive;
+mod history_cache;
 mod calls;
 mod markdown;
 mod mock;
 mod real;
+mod places;
+pub use places::Place;
 
 use std::path::PathBuf;
 
@@ -138,7 +141,19 @@ pub struct ChatSummary {
     pub story_ring: StoryRing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl ChatSummary {
+    pub fn identity(&self) -> String {
+        let kind = match self.kind {
+            ChatKind::User => "Person", ChatKind::Bot => "Bot", ChatKind::Group => "Group",
+            ChatKind::Channel => "Channel", ChatKind::Saved => "Saved Messages",
+        };
+        if self.username.is_empty() { format!("{kind} · {}", self.id) }
+        else { format!("@{} · {kind}", self.username) }
+    }
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MediaKind {
     Photo,
     Sticker,
@@ -164,13 +179,13 @@ pub enum MediaKind {
 
 // ===================== wave 6: typed media payloads =====================
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct GeoPoint {
     pub lat: f64,
     pub lon: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LiveLocation {
     pub period_secs: u32,
     pub expires: DateTime<Local>,
@@ -181,7 +196,7 @@ pub struct LiveLocation {
     pub stopped: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct LocationInfo {
     pub point: GeoPoint,
     /// Venue only.
@@ -191,7 +206,7 @@ pub struct LocationInfo {
     pub live: Option<LiveLocation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ContactCard {
     pub first_name: String,
     pub last_name: String,
@@ -200,14 +215,14 @@ pub struct ContactCard {
     pub user_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DiceInfo {
     pub emoji: String,
     /// 0 = still rolling (the final value arrives as MessageChanged).
     pub value: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct PollOption {
     pub text: String,
     pub voters: i32,
@@ -217,7 +232,7 @@ pub struct PollOption {
     pub correct: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Poll {
     pub id: i64,
     pub question: String,
@@ -249,7 +264,7 @@ pub struct PollDraft {
     pub solution: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ButtonKind {
     Callback(Vec<u8>),
     Url(String),
@@ -258,13 +273,13 @@ pub enum ButtonKind {
     Other,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct KeyButton {
     pub text: String,
     pub kind: ButtonKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Keyboard {
     pub rows: Vec<Vec<KeyButton>>,
 }
@@ -292,6 +307,10 @@ pub struct Topic {
     pub last_time: Option<DateTime<Local>>,
     pub pinned: bool,
     pub closed: bool,
+    pub muted: bool,
+    pub draft: String,
+    pub draft_reply_to: Option<i32>,
+    pub read_outbox_max_id: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -364,7 +383,7 @@ pub fn msg_in_chat(msg: &Msg, open_chat_id: i64) -> bool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Reaction {
     pub emoji: String,
     pub count: i32,
@@ -373,7 +392,7 @@ pub struct Reaction {
 }
 
 /// Text formatting. Offsets are CHAR indices into `Msg::text`, half-open.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SpanKind {
     Bold,
     Italic,
@@ -390,14 +409,14 @@ pub enum SpanKind {
     Blockquote,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
     pub kind: SpanKind,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WebPreview {
     pub url: String,
     pub site_name: String,
@@ -405,7 +424,7 @@ pub struct WebPreview {
     pub description: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Msg {
     pub id: i32,
     pub chat_id: i64,
@@ -676,6 +695,8 @@ pub struct CallInfo {
     pub connected_at: Option<DateTime<Local>>,
     /// Set only in `Ended`.
     pub end_reason: Option<CallEndReason>,
+    /// Sanitized actionable failure detail; never carries key material.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -738,6 +759,7 @@ pub type TgError = String;
 type Reply<T> = oneshot::Sender<Result<T, TgError>>;
 
 enum Command {
+    Shutdown,
     Start(Reply<AuthState>),
     SubmitCredentials { api_id: i32, api_hash: String, respond: Reply<AuthState> },
     SubmitPhone(String, Reply<AuthState>),
@@ -747,6 +769,7 @@ enum Command {
     GetMe(Reply<Me>),
     GetDialogs(Reply<Vec<ChatSummary>>),
     GetHistory { chat_id: i64, before_id: Option<i32>, respond: Reply<Vec<Msg>> },
+    GetCachedHistory { chat_id: i64, respond: Reply<Vec<Msg>> },
     GetMessages { chat_id: i64, ids: Vec<i32>, respond: Reply<Vec<Msg>> },
     DownloadMedia { chat_id: i64, msg_id: i32, respond: Reply<Option<PathBuf>> },
     DownloadAvatar { chat_id: i64, respond: Reply<Option<PathBuf>> },
@@ -766,6 +789,7 @@ enum Command {
         respond: Reply<()>,
     },
     SetFlags(BackendFlags, Reply<()>),
+    SetOnline(bool, Reply<()>),
     GetHistoryAtDate { chat_id: i64, date: DateTime<Local>, respond: Reply<Vec<Msg>> },
     GetEditHistory { chat_id: i64, msg_id: i32, respond: Reply<Vec<MsgVersion>> },
     SearchMessages { chat_id: i64, query: String, before_id: Option<i32>, respond: Reply<Vec<Msg>> },
@@ -822,12 +846,16 @@ enum Command {
     CallHangUp(Reply<()>),
     CallSetMuted { muted: bool, respond: Reply<()> },
     CallDevicesList(Reply<CallDevices>),
+    SearchPlaces { query: String, respond: Reply<Vec<Place>> },
+    CallSetDevices { call_id: i64, input: String, output: String, respond: Reply<()> },
+    ImportLegacyArchive { account_id: i64, respond: Reply<u64> },
 }
 
 impl Command {
     /// Variant name, for the mock's OMG_MOCK_SLOW / OMG_MOCK_FAIL_ONCE hooks.
     fn name(&self) -> &'static str {
         match self {
+            Command::Shutdown => "Shutdown",
             Command::Start(_) => "Start",
             Command::SubmitCredentials { .. } => "SubmitCredentials",
             Command::SubmitPhone(..) => "SubmitPhone",
@@ -837,6 +865,7 @@ impl Command {
             Command::GetMe(_) => "GetMe",
             Command::GetDialogs(_) => "GetDialogs",
             Command::GetHistory { .. } => "GetHistory",
+            Command::GetCachedHistory { .. } => "GetCachedHistory",
             Command::GetMessages { .. } => "GetMessages",
             Command::DownloadMedia { .. } => "DownloadMedia",
             Command::DownloadAvatar { .. } => "DownloadAvatar",
@@ -850,6 +879,7 @@ impl Command {
             Command::ForwardMessages { .. } => "ForwardMessages",
             Command::MarkRead { .. } => "MarkRead",
             Command::SetFlags(..) => "SetFlags",
+            Command::SetOnline(..) => "SetOnline",
             Command::GetHistoryAtDate { .. } => "GetHistoryAtDate",
             Command::GetEditHistory { .. } => "GetEditHistory",
             Command::SearchMessages { .. } => "SearchMessages",
@@ -904,6 +934,9 @@ impl Command {
             Command::CallHangUp(_) => "CallHangUp",
             Command::CallSetMuted { .. } => "CallSetMuted",
             Command::CallDevicesList(_) => "CallDevicesList",
+            Command::SearchPlaces { .. } => "SearchPlaces",
+            Command::CallSetDevices { .. } => "CallSetDevices",
+            Command::ImportLegacyArchive { .. } => "ImportLegacyArchive",
         }
     }
 }
@@ -913,6 +946,7 @@ impl Command {
 fn reject(cmd: Command, e: &str) {
     let e = e.to_string();
     match cmd {
+        Command::Shutdown => {},
         Command::Start(tx) | Command::SubmitPhone(_, tx) | Command::SubmitCode(_, tx) | Command::SubmitPassword(_, tx) | Command::LogOut(tx) => {
             drop(tx.send(Err(e)))
         }
@@ -920,6 +954,7 @@ fn reject(cmd: Command, e: &str) {
         Command::GetMe(tx) => drop(tx.send(Err(e))),
         Command::GetDialogs(tx) => drop(tx.send(Err(e))),
         Command::GetHistory { respond, .. }
+        | Command::GetCachedHistory { respond, .. }
         | Command::GetMessages { respond, .. }
         | Command::GetHistoryAtDate { respond, .. }
         | Command::SearchMessages { respond, .. }
@@ -947,7 +982,7 @@ fn reject(cmd: Command, e: &str) {
         | Command::DeleteChat { respond, .. }
         | Command::ClearHistory { respond, .. }
         | Command::SaveDraft { respond, .. } => drop(respond.send(Err(e))),
-        Command::SetFlags(_, tx) => drop(tx.send(Err(e))),
+        Command::SetFlags(_, tx) | Command::SetOnline(_, tx) => drop(tx.send(Err(e))),
         Command::GetEditHistory { respond, .. } => drop(respond.send(Err(e))),
         Command::GetPinnedMessage { respond, .. } => drop(respond.send(Err(e))),
         Command::GetAvailableReactions(tx) => drop(tx.send(Err(e))),
@@ -974,6 +1009,9 @@ fn reject(cmd: Command, e: &str) {
         | Command::CallSetMuted { respond, .. } => drop(respond.send(Err(e))),
         Command::CallAccept(tx) | Command::CallHangUp(tx) => drop(tx.send(Err(e))),
         Command::CallDevicesList(tx) => drop(tx.send(Err(e))),
+        Command::SearchPlaces { respond, .. } => drop(respond.send(Err(e))),
+        Command::CallSetDevices { respond, .. } => drop(respond.send(Err(e))),
+        Command::ImportLegacyArchive { respond, .. } => drop(respond.send(Err(e))),
         Command::SendPoll { respond, .. }
         | Command::SendLocation { respond, .. }
         | Command::SendVideoNote { respond, .. }
@@ -991,6 +1029,7 @@ fn reject(cmd: Command, e: &str) {
 #[derive(Clone)]
 pub struct Tg {
     cmds: mpsc::UnboundedSender<Command>,
+    stopped: async_channel::Receiver<()>,
     /// Clone the receiver only once; a single Shell-owned event loop is the model.
     pub events: async_channel::Receiver<Event>,
     pub is_mock: bool,
@@ -1019,7 +1058,11 @@ impl Tg {
     fn spawn(mock: bool) -> Tg {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = async_channel::unbounded();
+        let (stopped_tx, stopped_rx) = async_channel::bounded::<()>(1);
         std::thread::spawn(move || {
+            // Close only after every runtime task and native service is gone.
+            // No values are sent: all cloned receivers observe the same close.
+            let _stopped = stopped_tx;
             // Wave 8B: a personal 1:1 client is network-bound, not CPU-bound —
             // 2 workers instead of one-per-core (was 16 here) saves ~14 idle
             // threads with no throughput loss (data commands still spawn freely).
@@ -1036,12 +1079,20 @@ impl Tg {
         });
         Tg {
             cmds: cmd_tx,
+            stopped: stopped_rx,
             events: event_rx,
             is_mock: mock,
         }
     }
 
     // ----- auth -----
+
+    /// Stop the backend and wait for its runtime and native call service to
+    /// finish. Preserves the authorized session; safe to call from clones.
+    pub async fn shutdown(&self) {
+        let _ = self.cmds.send(Command::Shutdown);
+        let _ = self.stopped.recv().await;
+    }
 
     pub async fn start(&self) -> Result<AuthState, TgError> {
         roundtrip!(self, Command::Start)
@@ -1080,7 +1131,7 @@ impl Tg {
 
     // ----- dialogs & history -----
 
-    /// Up to 200 dialogs, pinned first then newest first; archived ones are
+    /// All dialogs, pinned first then newest first; archived ones are
     /// included and flagged.
     pub async fn get_dialogs(&self) -> Result<Vec<ChatSummary>, TgError> {
         roundtrip!(self, Command::GetDialogs)
@@ -1090,6 +1141,12 @@ impl Tg {
     /// page means there is nothing older.
     pub async fn get_history(&self, chat_id: i64, before_id: Option<i32>) -> Result<Vec<Msg>, TgError> {
         roundtrip!(self, |tx| Command::GetHistory { chat_id, before_id, respond: tx })
+    }
+
+    /// A bounded local snapshot for immediate display while get_history
+    /// refreshes. Empty on a miss; never performs a Telegram request.
+    pub async fn get_cached_history(&self, chat_id: i64) -> Result<Vec<Msg>, TgError> {
+        roundtrip!(self, |respond| Command::GetCachedHistory { chat_id, respond })
     }
 
     /// Specific messages by id (reply quotes, jump targets). Missing ids are
@@ -1181,6 +1238,12 @@ impl Tg {
     /// whenever settings change; idempotent.
     pub async fn set_flags(&self, flags: BackendFlags) -> Result<(), TgError> {
         roundtrip!(self, |tx| Command::SetFlags(flags, tx))
+    }
+
+    /// App activity controls presence independently of the network connection.
+    /// Ghost mode always overrides an online request.
+    pub async fn set_online(&self, online: bool) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::SetOnline(online, tx))
     }
 
     // ----- search -----
@@ -1461,6 +1524,18 @@ impl Tg {
 
     /// Audio devices for the settings page; the first entry of each list is
     /// the system default.
+    pub async fn import_legacy_archive(&self, account_id: i64) -> Result<u64, TgError> {
+        roundtrip!(self, |tx| Command::ImportLegacyArchive { account_id, respond: tx })
+    }
+
+    pub async fn call_set_devices(&self, call_id: i64, input: String, output: String) -> Result<(), TgError> {
+        roundtrip!(self, |tx| Command::CallSetDevices { call_id, input, output, respond: tx })
+    }
+
+    pub async fn search_places(&self, query: &str) -> Result<Vec<Place>, TgError> {
+        roundtrip!(self, |tx| Command::SearchPlaces { query: query.into(), respond: tx })
+    }
+
     pub async fn call_devices(&self) -> Result<CallDevices, TgError> {
         roundtrip!(self, Command::CallDevicesList)
     }

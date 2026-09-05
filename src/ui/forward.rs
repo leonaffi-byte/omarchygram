@@ -40,6 +40,7 @@ pub struct ForwardDialog {
     search: gtk::SearchEntry,
     list: gtk::Box,
     state_label: gtk::Label,
+    preview: gtk::Label,
     submit: gtk::Button,
     state: Rc<RefCell<State>>,
     action: Rc<RefCell<Option<Callback>>>,
@@ -54,6 +55,7 @@ impl Clone for ForwardDialog {
             search: self.search.clone(),
             list: self.list.clone(),
             state_label: self.state_label.clone(),
+            preview: self.preview.clone(),
             submit: self.submit.clone(),
             state: self.state.clone(),
             action: self.action.clone(),
@@ -91,6 +93,12 @@ impl ForwardDialog {
         heading.append(&close);
         card.append(&heading);
 
+        let preview = gtk::Label::new(None);
+        preview.set_wrap(true);
+        preview.set_xalign(0.0);
+        preview.set_max_width_chars(48);
+        preview.add_css_class("omg-muted");
+        card.append(&preview);
         let search = gtk::SearchEntry::new();
         search.set_placeholder_text(Some("Search chats"));
         card.append(&search);
@@ -175,6 +183,7 @@ impl ForwardDialog {
             search,
             list,
             state_label,
+            preview,
             submit,
             state,
             action,
@@ -185,6 +194,8 @@ impl ForwardDialog {
     pub fn set_action(&self, callback: Callback) {
         *self.action.borrow_mut() = Some(callback);
     }
+
+    pub fn set_preview(&self, text: &str) { self.preview.set_label(text); }
 
     pub fn present(
         &self,
@@ -337,7 +348,18 @@ fn rebuild_rows(
             continue;
         }
         shown += 1;
-        let check = gtk::CheckButton::with_label(&chat.title);
+        let check = gtk::CheckButton::new();
+        let details = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let title = gtk::Label::new(Some(&chat.title));
+        title.set_xalign(0.0);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        details.append(&title);
+        let identity = gtk::Label::new(Some(&chat.identity()));
+        identity.set_xalign(0.0);
+        identity.add_css_class("omg-muted");
+        details.append(&identity);
+        check.set_child(Some(&details));
+        check.update_property(&[gtk::accessible::Property::Label(&format!("{}, {}", chat.title, chat.identity()))]);
         check.add_css_class("omg-forward-row");
         check.set_active(state.borrow().selected.contains(&chat.id));
         let state_for_toggle = state.clone();
@@ -350,6 +372,7 @@ fn rebuild_rows(
                 state.selected.remove(&chat.id);
             }
             submit_for_toggle.set_sensitive(!state.selected.is_empty());
+            submit_for_toggle.set_label(&format!("Forward to {} chat{}", state.selected.len(), if state.selected.len() == 1 { "" } else { "s" }));
         });
         list.append(&check);
     }
@@ -360,7 +383,11 @@ fn rebuild_rows(
         empty.set_halign(gtk::Align::Start);
         list.append(&empty);
     }
-    submit.set_sensitive(!state.borrow().selected.is_empty());
+    let count = state.borrow().selected.len();
+    submit.set_sensitive(count > 0);
+    if !submit.label().is_some_and(|label| label == "Retry") {
+        submit.set_label(&format!("Forward to {count} chat{}", if count == 1 { "" } else { "s" }));
+    }
 }
 
 impl Default for ForwardDialog {

@@ -58,20 +58,15 @@ pub enum OpenIntent {
 
 thread_local! {
     static REGISTRY: RefCell<HashMap<i32, PlayerHandle>> = RefCell::new(HashMap::new());
-    // GTK 4.22 can deadlock while finalizing its GStreamer MediaFile backend.
-    // Keep one deliberately leaked stream per stable row/media identity, and
-    // reuse that stream when history rebuilds the same message row. The path
-    // is data on the entry, not part of its identity: a re-download retargets
-    // the retained stream instead of allocating another pipeline.
-    static MEDIA_POOL: RefCell<HashMap<(i64, i32), RetainedMedia>> = RefCell::new(HashMap::new());
-    // Logout rotates the active identity map without unref'ing its entries.
-    // This prevents cross-account reuse while preserving the GTK finalize
-    // workaround documented in CLAUDE.md.
-    static RETIRED_MEDIA: RefCell<Vec<RetainedMedia>> = const { RefCell::new(Vec::new()) };
+    // GTK 4.22 finalization can deadlock. Retain a bounded set of reusable
+    // native decoders, never a new pipeline for every visited message.
+    static MEDIA_POOL: RefCell<Vec<RetainedMedia>> = const { RefCell::new(Vec::new()) };
     static FULLSCREEN: RefCell<Option<Rc<Fullscreen>>> = const { RefCell::new(None) };
 }
 
 struct RetainedMedia {
+    owner: std::rc::Weak<VideoPlayer>,
+    identity: (i64, i32),
     path: PathBuf,
     media: gtk::MediaFile,
 }
@@ -130,13 +125,16 @@ pub fn stop_all() {
 /// `stop_all()` must run first so no row still has handlers or a paintable
 /// attached to these streams.
 pub fn retire_media_session() {
-    let retained: Vec<RetainedMedia> = MEDIA_POOL
-        .try_with(|pool| pool.borrow_mut().drain().map(|(_, entry)| entry).collect())
-        .unwrap_or_default();
-    for entry in &retained {
-        entry.media.pause();
-    }
-    let _ = RETIRED_MEDIA.try_with(|retired| retired.borrow_mut().extend(retained));
+    super::avatar::clear_cache();
+    let _ = MEDIA_POOL.try_with(|pool| {
+        for entry in pool.borrow_mut().iter_mut() {
+            entry.media.pause();
+            entry.media.set_filename(None::<&Path>);
+            entry.path.clear();
+            entry.identity = (0, 0);
+            entry.owner = std::rc::Weak::new();
+        }
+    });
 }
 
 /// Pause every *other* player that produces sound. Muted autoplaying loops
@@ -150,8 +148,9 @@ pub fn activate(msg_id: i32) {
 }
 
 pub fn visibility_tick(is_visible: &dyn Fn(i32) -> bool) {
+    let fullscreen = fullscreen_msg_id();
     for (id, handle) in handles() {
-        if is_visible(id) {
+        if fullscreen == Some(id) || is_visible(id) {
             handle.on_visible();
         } else {
             handle.on_hidden();
@@ -208,46 +207,49 @@ pub fn reconcile_autoplay(
 /// already returned `Break` raises a GLib CRITICAL (fatal under the gate).
 fn drop_source(slot: &RefCell<Option<glib::SourceId>>) {
     let id = slot.borrow_mut().take();
-    if let Some(id) = id {
-        if let Some(source) = glib::MainContext::default().find_source_by_id(&id) {
+    if let Some(id) = id
+        && let Some(source) = glib::MainContext::default().find_source_by_id(&id) {
             source.destroy();
         }
-    }
 }
 
-/// Fetch the retained GTK stream for a stable chat/message identity.
-/// The extra forgotten reference is intentional: it prevents GTK's known
-/// finalize deadlock, while the map makes the leak bounded to one per row.
-fn pooled_media(chat_id: i64, msg_id: i32, path: &Path) -> (gtk::MediaFile, bool) {
-    MEDIA_POOL
-        .try_with(|pool| {
-            let mut pool = pool.borrow_mut();
-            let identity = (chat_id, msg_id);
-            if let Some(entry) = pool.get_mut(&identity) {
-                if entry.path != path {
-                    entry.media.pause();
-                    entry.media.set_filename(Some(path));
-                    entry.path = path.to_path_buf();
-                }
-                return (entry.media.clone(), true);
+/// Reuse a released decoder, or reclaim a paused row's decoder after freezing
+/// its poster. The fixed ceiling also covers unusually large media histories.
+fn pooled_media(owner: &Rc<VideoPlayer>, path: &Path) -> (gtk::MediaFile, bool) {
+    const MAX_DECODERS: usize = 32;
+    MEDIA_POOL.with(|pool| {
+        let identity = (owner.chat_id, owner.msg_id);
+        let candidate = {
+            let entries = pool.borrow();
+            entries.iter().position(|e| e.identity == identity)
+                .or_else(|| entries.iter().position(|e| e.owner.upgrade().is_none_or(|o| o.media.borrow().is_none())))
+                .or_else(|| (entries.len() >= MAX_DECODERS).then(|| {
+                    entries.iter().position(|e| e.owner.upgrade().is_none_or(|o| !o.playing.get()))
+                        .unwrap_or_else(|| entries.iter().position(|e| e.identity.1 != fullscreen_msg_id().unwrap_or(0)).unwrap_or(0))
+                }))
+        };
+        if let Some(index) = candidate {
+            let previous = pool.borrow()[index].owner.upgrade();
+            if let Some(previous) = previous { previous.release_stream(); }
+            let mut entries = pool.borrow_mut();
+            let entry = &mut entries[index];
+            entry.media.pause();
+            if entry.path != path || entry.media.file().is_none() {
+                entry.media.set_filename(Some(path));
+                entry.path = path.to_owned();
             }
-            let media = gtk::MediaFile::for_filename(path);
-            std::mem::forget(media.clone());
-            pool.insert(
-                identity,
-                RetainedMedia {
-                    path: path.to_path_buf(),
-                    media: media.clone(),
-                },
-            );
-            (media, false)
-        })
-        .unwrap_or_else(|_| {
-            let media = gtk::MediaFile::for_filename(path);
-            std::mem::forget(media.clone());
-            (media, false)
-        })
+            entry.identity = identity;
+            entry.owner = Rc::downgrade(owner);
+            return (entry.media.clone(), true);
+        }
+        let media = super::video_stream::for_filename(path);
+        // Pool slots retain only a bounded, reusable stream wrapper.
+        pool.borrow_mut().push(RetainedMedia { owner: Rc::downgrade(owner), identity, path: path.to_owned(), media: media.clone() });
+        (media, false)
+    })
 }
+
+pub fn retained_decoder_count() -> usize { MEDIA_POOL.with(|pool| pool.borrow().len()) }
 
 fn fmt_time(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
@@ -512,11 +514,10 @@ impl AudioPlayer {
             return Some(sink);
         }
         for factory in ["autoaudiosink", "pipewiresink", "fakesink"] {
-            if gst::ElementFactory::find(factory).is_some() {
-                if let Ok(sink) = gst::ElementFactory::make(factory).build() {
+            if gst::ElementFactory::find(factory).is_some()
+                && let Ok(sink) = gst::ElementFactory::make(factory).build() {
                     return Some(sink);
                 }
-            }
         }
         None
     }
@@ -561,11 +562,10 @@ impl AudioPlayer {
                     }
                     gst::MessageView::Eos(_) => this.rewind(),
                     gst::MessageView::StateChanged(changed) => {
-                        if changed.current() == gst::State::Playing {
-                            if let Some(rate) = this.pending_rate.take() {
+                        if changed.current() == gst::State::Playing
+                            && let Some(rate) = this.pending_rate.take() {
                                 this.set_rate(rate);
                             }
-                        }
                         this.refresh();
                     }
                     gst::MessageView::DurationChanged(_) => this.refresh(),
@@ -801,6 +801,7 @@ struct VideoPlayer {
     action: Rc<dyn Fn(MessageAction)>,
     media: RefCell<Option<gtk::MediaFile>>,
     path: RefCell<Option<PathBuf>>,
+    saved_position: Cell<i64>,
     error_handler: RefCell<Option<glib::SignalHandlerId>>,
     playing_handler: RefCell<Option<glib::SignalHandlerId>>,
     tick: RefCell<Option<glib::SourceId>>,
@@ -931,6 +932,7 @@ impl VideoPlayer {
             action: action.clone(),
             media: RefCell::new(None),
             path: RefCell::new(None),
+            saved_position: Cell::new(0),
             error_handler: RefCell::new(None),
             playing_handler: RefCell::new(None),
             tick: RefCell::new(None),
@@ -1010,7 +1012,7 @@ impl VideoPlayer {
             PlayerState::Error
         } else if self.playing.get() {
             PlayerState::Playing
-        } else if self.media.borrow().is_some() {
+        } else if self.path.borrow().is_some() {
             PlayerState::Paused
         } else {
             PlayerState::None
@@ -1044,14 +1046,13 @@ impl VideoPlayer {
     /// stopped but never destroyed: one leaked reference per distinct media
     /// identity that was actually opened, reused across row rebuilds.
     fn stream_for(self: &Rc<Self>, path: &Path) -> gtk::MediaFile {
-        if let Some(existing) = self.media.borrow().clone() {
-            if self.path.borrow().as_deref() == Some(path) {
+        if let Some(existing) = self.media.borrow().clone()
+            && self.path.borrow().as_deref() == Some(path) {
                 return existing;
             }
-        }
         self.disconnect_media_handlers();
         self.picture.set_paintable(gtk::gdk::Paintable::NONE);
-        let (media, reused) = pooled_media(self.chat_id, self.msg_id, path);
+        let (media, reused) = pooled_media(self, path);
         self.reused_stream.set(reused);
         let weak = Rc::downgrade(self);
         let error_handler = media.connect_error_notify(move |stream| {
@@ -1061,15 +1062,14 @@ impl VideoPlayer {
         });
         let weak = Rc::downgrade(self);
         let playing_handler = media.connect_playing_notify(move |stream| {
-            if let Some(this) = weak.upgrade() {
-                if !this.failed.get() {
+            if let Some(this) = weak.upgrade()
+                && !this.failed.get() {
                     this.playing.set(stream.is_playing());
                     if !stream.is_playing() {
                         drop_source(&this.tick);
                     }
                     this.update_glyphs();
                 }
-            }
         });
         *self.error_handler.borrow_mut() = Some(error_handler);
         *self.playing_handler.borrow_mut() = Some(playing_handler);
@@ -1096,6 +1096,7 @@ impl VideoPlayer {
         self.resume_on_visible.set(false);
         self.policy_paused.set(false);
         self.intent.set(intent);
+        self.saved_position.set(0);
         let media = self.stream_for(path);
         if let Some(error) = media.error() {
             self.show_error(&error_text(&error), false);
@@ -1240,8 +1241,16 @@ impl VideoPlayer {
     }
 
     fn resume(self: &Rc<Self>) {
-        let media = self.media.borrow().clone();
-        let Some(media) = media else { return };
+        let existing = self.media.borrow().clone();
+        let media = if let Some(media) = existing { media } else {
+            let path = self.path.borrow().clone();
+            let Some(path) = path else { return };
+            let media = self.stream_for(&path);
+            media.set_muted(self.muted.get());
+            media.set_loop(matches!(self.kind, MediaKind::Gif | MediaKind::Sticker));
+            super::video_stream::seek_when_ready(&media, self.saved_position.get());
+            media
+        };
         if media.is_ended() && media.is_seekable() {
             media.seek(0);
         }
@@ -1310,6 +1319,7 @@ impl VideoPlayer {
             );
             self.pause();
         }
+        if fullscreen_msg_id() != Some(self.msg_id) { self.release_stream(); }
     }
 
     fn on_visible(self: &Rc<Self>) {
@@ -1375,6 +1385,18 @@ impl VideoPlayer {
         }
         self.playing.set(false);
         self.resume_on_visible.set(false);
+    }
+
+    fn release_stream(&self) {
+        let media = self.media.borrow().clone();
+        let Some(media) = media else { return };
+        self.saved_position.set(media.timestamp());
+        let poster = media.current_image();
+        self.disconnect_media_handlers();
+        self.pause();
+        self.picture.set_paintable(Some(&poster));
+        self.media.borrow_mut().take();
+        media.set_filename(None::<&Path>);
     }
 
     fn teardown(&self) {

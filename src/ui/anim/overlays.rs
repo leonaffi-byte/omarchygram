@@ -24,26 +24,22 @@ pub(super) fn sync_permanent(core: &EffectsCore) {
     if let Some(scanlines) = &state.scanlines {
         scanlines.set_visible(core.on("scanlines"));
     }
-    if !core.on("vignette") {
-        if let Some(vignette) = state.vignette.take() {
+    if !core.on("vignette")
+        && let Some(vignette) = state.vignette.take() {
             remove_from_overlay(&vignette);
         }
-    }
-    if !core.on("flicker") {
-        if let Some(flicker) = state.flicker.take() {
+    if !core.on("flicker")
+        && let Some(flicker) = state.flicker.take() {
             remove_from_overlay(&flicker);
         }
-    }
-    if !core.on("matrixrain") {
-        if let Some(matrix) = state.matrix.take() {
+    if !core.on("matrixrain")
+        && let Some(matrix) = state.matrix.take() {
             remove_from_overlay(&matrix);
         }
-    }
-    if !core.on("gridshimmer") {
-        if let Some(grid) = state.grid.take() {
+    if !core.on("gridshimmer")
+        && let Some(grid) = state.grid.take() {
             remove_from_overlay(&grid);
         }
-    }
 }
 
 fn remove_from_overlay(widget: &impl IsA<gtk::Widget>) {
@@ -238,11 +234,10 @@ fn boot_log(effects: &Effects, host: &gtk::Overlay) {
         };
         // Switched off mid-run (e.g. the Purist preset): take the panel down now.
         if !core.on("bootlog") {
-            if let (Some(panel), Some(host)) = (panel_weak.upgrade(), host_weak.upgrade()) {
-                if panel.parent().is_some() {
+            if let (Some(panel), Some(host)) = (panel_weak.upgrade(), host_weak.upgrade())
+                && panel.parent().is_some() {
                     host.remove_overlay(&panel);
                 }
-            }
             return glib::ControlFlow::Break;
         }
         let current = index.get();
@@ -250,11 +245,10 @@ fn boot_log(effects: &Effects, host: &gtk::Overlay) {
             let panel_weak = panel_weak.clone();
             let host_weak = host_weak.clone();
             glib::timeout_add_local_once(Duration::from_millis(450), move || {
-                if let (Some(panel), Some(host)) = (panel_weak.upgrade(), host_weak.upgrade()) {
-                    if panel.parent().is_some() {
+                if let (Some(panel), Some(host)) = (panel_weak.upgrade(), host_weak.upgrade())
+                    && panel.parent().is_some() {
                         host.remove_overlay(&panel);
                     }
-                }
             });
             return glib::ControlFlow::Break;
         }
