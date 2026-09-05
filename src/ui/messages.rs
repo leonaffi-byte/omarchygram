@@ -285,6 +285,7 @@ pub enum MessageAction {
     },
     OpenLink(String),
     OpenMention(i64),
+    OpenSender(i32),
     Vote { msg_id: i32, options: Vec<usize> },
     RetractVote(i32),
     AddContact(i32),
@@ -2827,7 +2828,18 @@ impl MessagesView {
             && !message.outgoing
             && !message.sender.is_empty()
             && message.sender != "You";
-        let sender = gtk::Label::new(Some(&message.sender));
+        let sender = gtk::Label::new(None);
+        sender.set_markup(&sender_markup(message));
+        sender.set_tooltip_text(message.sender_id.filter(|id| *id > 0).map(|_| "View profile"));
+        {
+            let action = self.inner.action.clone();
+            let msg_id = message.id;
+            sender.connect_activate_link(move |_, _| {
+                let callback = action.borrow().clone();
+                if let Some(callback) = callback { callback(MessageAction::OpenSender(msg_id)); }
+                glib::Propagation::Stop
+            });
+        }
         sender.add_css_class("omg-msg-sender");
         sender.add_css_class(&format!("omg-c{}", sender_color_index(message)));
         sender.set_halign(gtk::Align::Start);
@@ -3194,7 +3206,8 @@ impl MessagesView {
                 .unwrap_or_default(),
         );
         row.forwarded.set_visible(message.forwarded_from.is_some());
-        row.sender.set_label(&message.sender);
+        row.sender.set_markup(&sender_markup(&message));
+        row.sender.set_tooltip_text(message.sender_id.filter(|id| *id > 0).map(|_| "View profile"));
         row.sender.set_visible(
             self.inner.chat_kind.get() == ChatKind::Group
                 && !message.outgoing
@@ -4501,6 +4514,11 @@ impl MessagesView {
         }
     }
 
+    pub fn probe_open_sender(&self, msg_id: i32) -> bool {
+        let sender = self.inner.store.borrow().entries.get(&msg_id).map(|entry| entry.row.sender.clone());
+        sender.is_some_and(|sender| sender.emit_by_name::<bool>("activate-link", &[&"profile"]))
+    }
+
     pub fn message(&self, msg_id: i32) -> Option<Msg> {
         self.inner
             .store
@@ -4878,6 +4896,7 @@ impl MessagesView {
             entry.media_retryable = false;
             (kind, entry.media_generation, entry.row.media_button.clone())
         };
+        player::download_started(msg_id);
         if let Some(button) = button {
             button.set_sensitive(false);
         }
@@ -4886,7 +4905,7 @@ impl MessagesView {
 
     /// Invalidate any older completion and return this row to a downloadable
     /// state (used when a live location moves).
-    fn reset_media(&self, msg_id: i32) -> bool {
+    pub(super) fn reset_media(&self, msg_id: i32) -> bool {
         let mut store = self.inner.store.borrow_mut();
         let Some(entry) = store.entries.get_mut(&msg_id) else {
             return false;
@@ -4895,6 +4914,15 @@ impl MessagesView {
         entry.media_state = MediaState::NotStarted;
         entry.media_retryable = false;
         true
+    }
+
+    pub(super) fn retry_failed_playback(&self, msg_id: i32) {
+        let mut store = self.inner.store.borrow_mut();
+        if let Some(entry) = store.entries.get_mut(&msg_id) {
+            entry.media_generation = entry.media_generation.wrapping_add(1);
+            entry.media_state = MediaState::Failed;
+            entry.media_retryable = true;
+        }
     }
 
     pub fn media_state(&self, msg_id: i32) -> Option<MediaState> {
@@ -5313,6 +5341,7 @@ impl MessagesView {
             entry.media_state = MediaState::Done(path.clone());
             (entry.row.media_button.clone(), entry.msg.clone())
         };
+        player::download_ready(msg_id);
         if let Some(button) = button {
             button.set_sensitive(true);
         }
@@ -7643,6 +7672,14 @@ fn snippet(text: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+
+fn sender_markup(message: &Msg) -> String {
+    let name = glib::markup_escape_text(&message.sender);
+    if message.sender_id.is_some_and(|id| id > 0) {
+        format!("<a href=\"profile\">{name}</a>")
+    } else { name.to_string() }
 }
 
 #[cfg(test)]

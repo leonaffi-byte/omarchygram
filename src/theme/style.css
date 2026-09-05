@@ -1418,6 +1418,7 @@ popover.omg-sticker-popover > contents {
 }
 
 .omg-contacts-dialog,
+.omg-profile-dialog,
 .omg-new-group-dialog {
   background-color: var(--bg-dark);
   color: var(--fg);
@@ -2133,3 +2134,15 @@ button.omg-reaction-anchor { min-width: 16px; min-height: 16px; padding: 0 4px; 
 .omg-switcher list { background-color: var(--bg-dark); color: var(--fg); }
 .omg-switcher row:selected, .omg-switcher row:selected:focus { background-color: var(--selection); color: var(--fg); }
 .omg-switcher row:hover { background-color: var(--bg-lighter); }
+
+/* Profile controls share the conversation's typography and accent. */
+button.omg-profile-photo {
+  background: transparent;
+  border: 0;
+  padding: 4px;
+  border-radius: 100px;
+}
+button.omg-profile-photo:hover { background-color: var(--bg-lighter); }
+button.omg-profile-photo:focus-visible { outline: 2px solid var(--accent); }
+.omg-msg-sender link { color: inherit; text-decoration: none; }
+.omg-msg-sender link:hover { text-decoration: underline; }

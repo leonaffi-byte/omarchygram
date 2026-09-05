@@ -339,8 +339,8 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             messages.retain(|m| !m.deleted || ctx.flags.lock().unwrap().anti_delete);
             let _ = respond.send(Ok(messages));
         }
-        Command::DownloadMedia { chat_id, msg_id, respond } => {
-            let _ = respond.send(download_media(&client, &ctx, chat_id, msg_id).await);
+        Command::DownloadMedia { chat_id, msg_id, redownload, respond } => {
+            let _ = respond.send(download_media(&client, &ctx, chat_id, msg_id, redownload).await);
         }
         Command::SendText { chat_id, text, reply_to, respond } => {
             reply_message(&ctx, respond, send_text(&client, &ctx, chat_id, &text, reply_to).await);
@@ -375,8 +375,8 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
         Command::GetMessages { chat_id, ids, respond } => {
             let _ = respond.send(get_messages(&client, &ctx, chat_id, &ids).await);
         }
-        Command::DownloadAvatar { chat_id, respond } => {
-            let _ = respond.send(download_avatar(&client, &ctx, chat_id).await);
+        Command::DownloadAvatar { chat_id, big, refresh, respond } => {
+            let _ = respond.send(download_avatar(&client, &ctx, chat_id, big, refresh).await);
         }
         Command::SendVoice { chat_id, path, duration, respond } => {
             reply_message(&ctx, respond, send_voice(&client, &ctx, chat_id, &path, duration).await);
@@ -439,6 +439,11 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
         }
         Command::SaveDraft { chat_id, text, reply_to, respond } => {
             let _ = respond.send(save_draft(&client, &ctx, chat_id, &text, reply_to).await);
+        }
+        Command::GetUserProfile { user_id, source, respond } => {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(20), get_user_profile(&client, &ctx, user_id, source))
+                .await.unwrap_or_else(|_| Err("Loading profile timed out; try again".into()));
+            let _ = respond.send(result);
         }
         Command::GetChatInfo { chat_id, respond } => {
             let _ = respond.send(get_chat_info(&client, &ctx, chat_id).await);
@@ -1221,24 +1226,85 @@ async fn download_media(
     ctx: &Arc<Ctx>,
     chat_id: i64,
     msg_id: i32,
+    redownload: bool,
 ) -> Result<Option<PathBuf>, TgError> {
     let (chat_id, _) = real_chat(chat_id);
-    let media = { ctx.media.lock().unwrap().get(&(chat_id, msg_id)).cloned() };
-    let Some(media) = media else {
+    if redownload {
+        // Restrict deletion to this account/message's completed cache files;
+        // acquire the same lock as a writer before invalidating each entry.
+        for path in cached_media_files(ctx.media_dir(), chat_id, msg_id).await? {
+            let _guard = ctx.download_lock(&path).await;
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("Could not refresh the media cache".into()),
+            }
+        }
+    }
+    let media = if redownload { None } else { ctx.media.lock().unwrap().get(&(chat_id, msg_id)).cloned() };
+    if media.is_none() {
         // Cached history can render before Telegram repopulates media refs.
         // Reuse only a completed file for this account/chat/message.
-        let dir = ctx.media_dir();
-        return tokio::task::spawn_blocking(move || {
-            let prefix = format!("{chat_id}_{msg_id}.");
-            Ok(std::fs::read_dir(dir).into_iter().flatten().flatten().find_map(|entry| {
-                let name = entry.file_name();
-                let ext = name.to_str()?.strip_prefix(&prefix)?;
-                if !(1..=8).contains(&ext.len()) || !ext.chars().all(|c| c.is_ascii_alphanumeric()) { return None; }
-                let path = entry.path();
-                (entry.file_type().ok()?.is_file() && complete_file(&path)).then_some(path)
-            }))
-        }).await.map_err(|_| "Media cache unavailable".to_string())?;
-    };
+        let cached = cached_media_files(ctx.media_dir(), chat_id, msg_id).await?.into_iter().next();
+        if cached.is_some() { return Ok(cached); }
+    }
+    with_fresh_media(
+        media,
+        || async {
+            // A history snapshot has no Telegram file references. Fetch just
+            // this message, also replacing references that Telegram expired.
+            let peer = ctx.peer(chat_id)?;
+            let fetched = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                client.get_messages_by_id(peer, &[msg_id]),
+            ).await.map_err(|_| "Loading media details timed out; try again".to_string())?
+                .map_err(|e| format!("Could not load media details: {e}"))?;
+            let Some(message) = fetched.into_iter().flatten().next() else { return Ok(None) };
+            register_media(ctx, &message, chat_id);
+            Ok(message.media())
+        },
+        |media| download_media_reference(client, ctx, chat_id, msg_id, media),
+    ).await
+}
+
+async fn cached_media_files(dir: PathBuf, chat_id: i64, msg_id: i32) -> Result<Vec<PathBuf>, TgError> {
+    tokio::task::spawn_blocking(move || {
+        let prefix = format!("{chat_id}_{msg_id}.");
+        std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|entry| {
+            let name = entry.file_name();
+            let ext = name.to_str()?.strip_prefix(&prefix)?;
+            if !(1..=8).contains(&ext.len()) || !ext.chars().all(|c| c.is_ascii_alphanumeric()) { return None; }
+            let path = entry.path();
+            (entry.file_type().ok()?.is_file() && complete_file(&path)).then_some(path)
+        }).collect()
+    }).await.map_err(|_| "Media cache unavailable".into())
+}
+
+/// A cache miss is not evidence that media is unavailable. Refresh metadata
+/// before deciding, and retry an expired Telegram reference exactly once.
+async fn with_fresh_media<T, F, R, FF, RF>(
+    reference: Option<T>, mut refresh: F, mut download: R,
+) -> Result<Option<PathBuf>, TgError>
+where
+    F: FnMut() -> FF,
+    FF: std::future::Future<Output = Result<Option<T>, TgError>>,
+    R: FnMut(T) -> RF,
+    RF: std::future::Future<Output = Result<Option<PathBuf>, TgError>>,
+{
+    let reference = match reference { Some(reference) => Some(reference), None => refresh().await? };
+    let Some(reference) = reference else { return Ok(None) };
+    match download(reference).await {
+        Err(error) if error.contains("FILE_REFERENCE_") => {
+            let Some(reference) = refresh().await? else { return Ok(None) };
+            download(reference).await
+        }
+        result => result,
+    }
+}
+
+async fn download_media_reference(
+    client: &Client, ctx: &Arc<Ctx>, chat_id: i64, msg_id: i32, media: Media,
+) -> Result<Option<PathBuf>, TgError> {
     // Locations render as a map; nothing to download from Telegram.
     let point = match &media {
         Media::Geo(g) => Some(GeoPoint { lat: g.raw.lat, lon: g.raw.long }),
@@ -1292,6 +1358,8 @@ async fn download_complete<D: grammers_client::media::Downloadable>(
     if complete_file(path) { return Ok(()); }
     let _permit = ctx.download_slots.acquire().await.map_err(|_| "download service stopped")?;
     let pending = crate::storage::PendingFile::new(path).map_err(|e| e.to_string())?;
+    // Keep grammers' parallel downloader and allow large files on slow
+    // links; a total-transfer deadline would restart them indefinitely.
     client.download_media(media, pending.path()).await.map_err(|e| format!("download failed: {e}"))?;
     if !complete_file(pending.path()) { return Err("download returned an empty file; try again".into()); }
     let destination = path.to_owned();
@@ -1693,6 +1761,18 @@ async fn refetch_for_reactions(
 }
 
 async fn remember_from_message(ctx: &Ctx, m: &Message, chat_id: i64) {
+    // This is a local/session-cache lookup, never a contact-list request.
+    // Keep group senders addressable even when they have no private dialog.
+    if let Some(sender) = m.sender()
+        && let Ok(Some(reference)) = m.sender_ref().await {
+        let id = sender.id().bot_api_dialog_id_unchecked();
+        let facts = describe_peer(sender);
+        ctx.remember(id, reference, sender.name());
+        if let Some(photo) = facts.photo_id { ctx.photos.lock().unwrap().insert(id, photo); }
+        ctx.meta.lock().unwrap().entry(id).or_insert(DialogMeta {
+            kind: facts.kind, contact: facts.contact, muted: false, unread: false, archived: false,
+        });
+    }
     // Always refresh: a message can carry a newer access hash or a renamed title.
     if let Ok(Some(peer_ref)) = m.peer_ref().await {
         let title = m.peer().and_then(|p| p.name()).map(str::to_string);
@@ -2072,26 +2152,39 @@ fn private_dir(dir: &std::path::Path) -> Result<(), TgError> {
     Ok(())
 }
 
-async fn download_avatar(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<Option<PathBuf>, TgError> {
+async fn download_avatar(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, big: bool, refresh: bool) -> Result<Option<PathBuf>, TgError> {
+    if refresh { get_chat_info(client, ctx, chat_id).await?; }
     let Some(photo_id) = ctx.photos.lock().unwrap().get(&chat_id).copied() else {
         return Ok(None);
     };
     let dir = ctx.avatar_dir();
     private_dir(&dir)?;
-    let path = dir.join(format!("{chat_id}_{photo_id}.jpg"));
+    let path = dir.join(profile_photo_filename(chat_id, photo_id, big));
+    if refresh {
+        let _guard = ctx.download_lock(&path).await;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("Could not refresh profile photo".into()),
+        }
+    }
     if complete_file(&path) {
         return Ok(Some(path));
     }
     let peer = input_peer(ctx, chat_id)?;
     let location = ChatPhoto {
         raw: tl::enums::InputFileLocation::InputPeerPhotoFileLocation(tl::types::InputPeerPhotoFileLocation {
-            big: false,
+            big,
             peer,
             photo_id,
         }),
     };
     download_complete(client, ctx, &location, &path, false).await?;
     Ok(Some(path))
+}
+
+fn profile_photo_filename(chat_id: i64, photo_id: i64, big: bool) -> String {
+    format!("{chat_id}_{photo_id}{}.jpg", if big { "_large" } else { "" })
 }
 
 /// Decode a webp (stickers) into a png next to it; GdkPixbuf has no webp loader here.
@@ -2178,7 +2271,12 @@ fn sticker_from_doc(d: &tl::types::Document) -> Sticker {
 async fn get_messages(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, ids: &[i32]) -> Result<Vec<Msg>, TgError> {
     let peer = ctx.peer(chat_id)?;
     let fetched = client.get_messages_by_id(peer, ids).await.map_err(|e| e.to_string())?;
-    Ok(fetched.into_iter().flatten().map(|m| convert(ctx, &m, chat_id)).collect())
+    let mut out = Vec::new();
+    for message in fetched.into_iter().flatten() {
+        remember_from_message(ctx, &message, real_chat(chat_id).0).await;
+        out.push(convert(ctx, &message, chat_id));
+    }
+    Ok(out)
 }
 
 async fn delete_messages(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, ids: &[i32]) -> Result<(), TgError> {
@@ -2617,6 +2715,55 @@ fn user_facts(u: &tl::types::User) -> (String, String, String, Presence, bool, b
     )
 }
 
+fn refresh_chat_photo(ctx: &Ctx, chat_id: i64, chats: &[tl::enums::Chat]) {
+    let photo = chats.iter().find_map(|chat| match chat {
+        tl::enums::Chat::Chat(chat) if PeerId::chat(chat.id).is_some_and(|id| id.bot_api_dialog_id_unchecked() == chat_id) => Some(&chat.photo),
+        tl::enums::Chat::Channel(chat) if PeerId::channel(chat.id).is_some_and(|id| id.bot_api_dialog_id_unchecked() == chat_id) => Some(&chat.photo),
+        _ => None,
+    });
+    if let Some(photo) = photo {
+        let mut photos = ctx.photos.lock().unwrap();
+        match photo {
+            tl::enums::ChatPhoto::Photo(photo) => { photos.insert(chat_id, photo.photo_id); }
+            tl::enums::ChatPhoto::Empty => { photos.remove(&chat_id); }
+        }
+    }
+}
+
+async fn get_user_profile(client: &Client, ctx: &Arc<Ctx>, user_id: i64, source: Option<(i64, i32)>) -> Result<ChatInfo, TgError> {
+    if user_id <= 0 { return Err("This sender has no user profile".into()); }
+    if ctx.peer(user_id).is_err() && let Some((chat_id, msg_id)) = source {
+        let peer = ctx.peer(chat_id)?;
+        let fetched = client.get_messages_by_id(peer, &[msg_id]).await.map_err(|e| e.to_string())?;
+        let message = fetched.into_iter().flatten().next().ok_or("This message is no longer available")?;
+        if message.sender_id().map(|id| id.bot_api_dialog_id_unchecked()) != Some(user_id) {
+            return Err("The message sender has changed; reopen their profile".into());
+        }
+        remember_from_message(ctx, &message, real_chat(chat_id).0).await;
+        if ctx.peer(user_id).is_err() {
+            // Large groups may send only a minimal user, without an access
+            // hash. Telegram can resolve that user through the source message.
+            let users = client.invoke(&tl::functions::users::GetUsers {
+                id: vec![tl::types::InputUserFromMessage { peer: peer.into(), msg_id, user_id }.into()],
+            }).await.map_err(|e| format!("Could not load sender: {e}"))?;
+            for raw in users {
+                let user = grammers_client::peer::User::from_raw(client, raw);
+                if user.id().bot_api_dialog_id_unchecked() != user_id { continue; }
+                if let Ok(Some(reference)) = user.to_ref().await {
+                    let peer = Peer::User(user);
+                    let facts = describe_peer(&peer);
+                    ctx.remember(user_id, reference, peer.name());
+                    if let Some(photo) = facts.photo_id { ctx.photos.lock().unwrap().insert(user_id, photo); }
+                    ctx.meta.lock().unwrap().entry(user_id).or_insert(DialogMeta {
+                        kind: facts.kind, contact: facts.contact, muted: false, unread: false, archived: false,
+                    });
+                }
+            }
+        }
+    }
+    get_chat_info(client, ctx, user_id).await
+}
+
 async fn get_chat_info(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<ChatInfo, TgError> {
     use grammers_client::session::types::PeerKind;
     let peer = ctx.peer(chat_id)?;
@@ -2635,6 +2782,14 @@ async fn get_chat_info(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<
                 tl::enums::User::User(u) if u.id == chat_id => Some(u),
                 _ => None,
             });
+            if let Some(user) = &user {
+                let mut photos = ctx.photos.lock().unwrap();
+                if let Some(tl::enums::UserProfilePhoto::Photo(photo)) = &user.photo {
+                    photos.insert(chat_id, photo.photo_id);
+                } else {
+                    photos.remove(&chat_id);
+                }
+            }
             let (name, username, phone, presence, has_photo, contact) =
                 user.as_ref().map(user_facts).unwrap_or((title.clone(), String::new(), String::new(), Presence::Unknown, false, false));
             Ok(ChatInfo {
@@ -2659,6 +2814,7 @@ async fn get_chat_info(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<
                 .await
                 .map_err(|e| e.to_string())?;
             let tl::enums::messages::ChatFull::Full(full) = r;
+            refresh_chat_photo(ctx, chat_id, &full.chats);
             let (about, members, muted) = match full.full_chat {
                 tl::enums::ChatFull::Full(f) => (
                     f.about,
@@ -2674,6 +2830,7 @@ async fn get_chat_info(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<
                 id: chat_id,
                 title,
                 kind: ChatKind::Group,
+                has_photo: ctx.photos.lock().unwrap().contains_key(&chat_id),
                 about,
                 members,
                 muted,
@@ -2686,6 +2843,7 @@ async fn get_chat_info(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<
                 .await
                 .map_err(|e| e.to_string())?;
             let tl::enums::messages::ChatFull::Full(full) = r;
+            refresh_chat_photo(ctx, chat_id, &full.chats);
             let (about, members, muted) = match full.full_chat {
                 tl::enums::ChatFull::ChannelFull(f) => (f.about, f.participants_count, is_muted(&f.notify_settings, now)),
                 tl::enums::ChatFull::Full(f) => (f.about, None, is_muted(&f.notify_settings, now)),
@@ -2702,6 +2860,7 @@ async fn get_chat_info(client: &Client, ctx: &Arc<Ctx>, chat_id: i64) -> Result<
                 id: chat_id,
                 title,
                 kind: meta.map(|m| m.kind).unwrap_or(ChatKind::Channel),
+                has_photo: ctx.photos.lock().unwrap().contains_key(&chat_id),
                 username,
                 about,
                 members,
@@ -3916,4 +4075,82 @@ fn event_from_raw(ctx: &Ctx, u: &tl::enums::Update) -> Option<Event> {
         U::PinnedMessages(x) => Event::PinnedChanged { chat_id: peer_chat_id(&x.peer) },
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod media_recovery_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::future::ready;
+
+    #[tokio::test]
+    async fn cold_history_reference_is_fetched_before_download() {
+        let refreshes = Cell::new(0);
+        let result = with_fresh_media(None, || {
+            refreshes.set(refreshes.get() + 1);
+            ready(Ok(Some(42)))
+        }, |reference| {
+            assert_eq!(reference, 42);
+            ready(Ok(Some(PathBuf::from("downloaded.ogg"))))
+        }).await.unwrap();
+        assert_eq!(result, Some(PathBuf::from("downloaded.ogg")));
+        assert_eq!(refreshes.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_reference_is_replaced_once() {
+        let downloads = Cell::new(0);
+        let result = with_fresh_media(Some(1), || ready(Ok(Some(2))), |reference| {
+            downloads.set(downloads.get() + 1);
+            ready(if reference == 1 { Err("download failed: FILE_REFERENCE_EXPIRED".into()) }
+                else { Ok(Some(PathBuf::from("photo.jpg"))) })
+        }).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(downloads.get(), 2);
+        let attempts = Cell::new(0);
+        let failure = with_fresh_media(Some(1), || ready(Ok(Some(2))), |_| {
+            attempts.set(attempts.get() + 1);
+            ready(Err("FILE_REFERENCE_EMPTY".into()))
+        }).await;
+        assert!(failure.is_err());
+        assert_eq!(attempts.get(), 2, "expired references cannot loop forever");
+    }
+
+    #[tokio::test]
+    async fn temporary_lookup_failure_does_not_become_permanent_unavailability() {
+        let error = with_fresh_media::<i32, _, _, _, _>(None,
+            || ready(Err("network unavailable".into())),
+            |_| ready(Ok(None))).await.unwrap_err();
+        assert_eq!(error, "network unavailable");
+        let unavailable = with_fresh_media::<i32, _, _, _, _>(None,
+            || ready(Ok(None)), |_| -> std::future::Ready<Result<Option<PathBuf>, TgError>> { panic!("deleted media must not download") }).await.unwrap();
+        assert_eq!(unavailable, None);
+    }
+
+    #[tokio::test]
+    async fn unrelated_download_failure_does_not_refetch_metadata() {
+        let result = with_fresh_media(Some(1), || -> std::future::Ready<Result<Option<i32>, TgError>> { panic!("do not refresh a network or disk error") },
+            |_| ready(Err("disk full".into()))).await;
+        assert_eq!(result.unwrap_err(), "disk full");
+    }
+
+    #[test]
+    fn large_profile_photo_cannot_reuse_thumbnail_path() {
+        assert_eq!(profile_photo_filename(12, 34, false), "12_34.jpg");
+        assert_eq!(profile_photo_filename(12, 34, true), "12_34_large.jpg");
+    }
+
+    #[tokio::test]
+    async fn media_cache_discovery_is_scoped_to_exact_message_and_complete_files() {
+        let dir = std::env::temp_dir().join(format!("omg-media-discovery-{}-{}", std::process::id(), random_id()));
+        std::fs::create_dir(&dir).unwrap();
+        for file in ["12_34.jpg", "12_345.jpg", "112_34.jpg", "12_34.jpg.part", "12_34.jpg.bak"] {
+            std::fs::write(dir.join(file), b"fixture").unwrap();
+        }
+        std::fs::write(dir.join("12_34.png"), b"").unwrap();
+        std::os::unix::fs::symlink(dir.join("12_34.jpg"), dir.join("12_34.gif")).unwrap();
+        let files = cached_media_files(dir.clone(), 12, 34).await.unwrap();
+        assert_eq!(files, vec![dir.join("12_34.jpg")]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

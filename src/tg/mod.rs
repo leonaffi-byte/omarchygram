@@ -771,8 +771,8 @@ enum Command {
     GetHistory { chat_id: i64, before_id: Option<i32>, respond: Reply<Vec<Msg>> },
     GetCachedHistory { chat_id: i64, respond: Reply<Vec<Msg>> },
     GetMessages { chat_id: i64, ids: Vec<i32>, respond: Reply<Vec<Msg>> },
-    DownloadMedia { chat_id: i64, msg_id: i32, respond: Reply<Option<PathBuf>> },
-    DownloadAvatar { chat_id: i64, respond: Reply<Option<PathBuf>> },
+    DownloadMedia { chat_id: i64, msg_id: i32, redownload: bool, respond: Reply<Option<PathBuf>> },
+    DownloadAvatar { chat_id: i64, big: bool, refresh: bool, respond: Reply<Option<PathBuf>> },
     SendText { chat_id: i64, text: String, reply_to: Option<i32>, respond: Reply<Msg> },
     SendFile { chat_id: i64, path: PathBuf, caption: String, respond: Reply<Msg> },
     SendVoice { chat_id: i64, path: PathBuf, duration: u32, respond: Reply<Msg> },
@@ -807,6 +807,7 @@ enum Command {
     ClearHistory { chat_id: i64, respond: Reply<()> },
     SaveDraft { chat_id: i64, text: String, reply_to: Option<i32>, respond: Reply<()> },
     GetChatInfo { chat_id: i64, respond: Reply<ChatInfo> },
+    GetUserProfile { user_id: i64, source: Option<(i64, i32)>, respond: Reply<ChatInfo> },
     GetMembers { chat_id: i64, offset: i32, limit: i32, respond: Reply<Vec<Member>> },
     GetSharedMedia { chat_id: i64, kind: SharedKind, before_id: Option<i32>, respond: Reply<Vec<Msg>> },
     GetContacts(Reply<Vec<Contact>>),
@@ -897,6 +898,7 @@ impl Command {
             Command::ClearHistory { .. } => "ClearHistory",
             Command::SaveDraft { .. } => "SaveDraft",
             Command::GetChatInfo { .. } => "GetChatInfo",
+            Command::GetUserProfile { .. } => "GetUserProfile",
             Command::GetMembers { .. } => "GetMembers",
             Command::GetSharedMedia { .. } => "GetSharedMedia",
             Command::GetContacts(_) => "GetContacts",
@@ -987,7 +989,7 @@ fn reject(cmd: Command, e: &str) {
         Command::GetPinnedMessage { respond, .. } => drop(respond.send(Err(e))),
         Command::GetAvailableReactions(tx) => drop(tx.send(Err(e))),
         Command::SearchChats { respond, .. } => drop(respond.send(Err(e))),
-        Command::GetChatInfo { respond, .. } => drop(respond.send(Err(e))),
+        Command::GetChatInfo { respond, .. } | Command::GetUserProfile { respond, .. } => drop(respond.send(Err(e))),
         Command::GetMembers { respond, .. } => drop(respond.send(Err(e))),
         Command::GetContacts(tx) => drop(tx.send(Err(e))),
         Command::OpenUser { respond, .. } | Command::CreateGroup { respond, .. } => drop(respond.send(Err(e))),
@@ -1173,13 +1175,27 @@ impl Tg {
     /// (stickers are converted webp -> png). Cached across calls.
     /// None when the message has no media or it cannot be rendered.
     pub async fn download_media(&self, chat_id: i64, msg_id: i32) -> Result<Option<PathBuf>, TgError> {
-        roundtrip!(self, |tx| Command::DownloadMedia { chat_id, msg_id, respond: tx })
+        roundtrip!(self, |tx| Command::DownloadMedia { chat_id, msg_id, redownload: false, respond: tx })
+    }
+
+    /// Explicit recovery from a corrupt cached file or failed playback.
+    pub async fn retry_media(&self, chat_id: i64, msg_id: i32) -> Result<Option<PathBuf>, TgError> {
+        roundtrip!(self, |tx| Command::DownloadMedia { chat_id, msg_id, redownload: true, respond: tx })
     }
 
     /// Small profile photo of a chat or user (Bot-API id), cached. None when
     /// there is no photo — render initials.
     pub async fn download_avatar(&self, chat_id: i64) -> Result<Option<PathBuf>, TgError> {
-        roundtrip!(self, |tx| Command::DownloadAvatar { chat_id, respond: tx })
+        roundtrip!(self, |tx| Command::DownloadAvatar { chat_id, big: false, refresh: false, respond: tx })
+    }
+
+    /// Full-size profile photo, stored separately from list thumbnails.
+    pub async fn download_profile_photo(&self, chat_id: i64) -> Result<Option<PathBuf>, TgError> {
+        roundtrip!(self, |tx| Command::DownloadAvatar { chat_id, big: true, refresh: false, respond: tx })
+    }
+
+    pub async fn retry_profile_photo(&self, chat_id: i64) -> Result<Option<PathBuf>, TgError> {
+        roundtrip!(self, |respond| Command::DownloadAvatar { chat_id, big: true, refresh: true, respond })
     }
 
     // ----- sending -----
@@ -1322,6 +1338,10 @@ impl Tg {
     }
 
     // ----- info -----
+
+    pub async fn get_user_profile(&self, user_id: i64, source: Option<(i64, i32)>) -> Result<ChatInfo, TgError> {
+        roundtrip!(self, |respond| Command::GetUserProfile { user_id, source, respond })
+    }
 
     pub async fn get_chat_info(&self, chat_id: i64) -> Result<ChatInfo, TgError> {
         roundtrip!(self, |tx| Command::GetChatInfo { chat_id, respond: tx })

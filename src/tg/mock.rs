@@ -1297,6 +1297,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             chat_id,
             msg_id,
             respond,
+            ..
         } => {
             // Spawned: downloads must never block other commands.
             let (media, doc_name, sent_path, point) = {
@@ -1334,8 +1335,8 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                 let _ = respond.send(Ok(path));
             });
         }
-        Command::DownloadAvatar { chat_id, respond } => {
-            let has = st
+        Command::DownloadAvatar { chat_id, respond, .. } => {
+            let has = mock_member_profile(chat_id).is_some_and(|info| info.has_photo) || st
                 .lock()
                 .unwrap()
                 .chats
@@ -1963,7 +1964,8 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                 Err(format!("unknown chat {chat_id}"))
             });
         }
-        Command::GetChatInfo { chat_id, respond } => {
+        Command::GetChatInfo { chat_id, respond }
+        | Command::GetUserProfile { user_id: chat_id, respond, .. } => {
             let st = st.lock().unwrap();
             let r = match st.chats.get(&chat_id) {
                 Some(c) => Ok(ChatInfo {
@@ -1993,7 +1995,7 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                         is_contact: true,
                         ..ChatInfo::default()
                     }),
-                    None => Err(format!("unknown chat {chat_id}")),
+                    None => mock_member_profile(chat_id).ok_or_else(|| format!("unknown chat {chat_id}")),
                 },
             };
             let _ = respond.send(r);
@@ -2085,6 +2087,15 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
                     nc.has_photo = c.has_photo;
                     nc.is_contact = true;
                     st.chats.insert(user_id, nc);
+                    st.history.entry(user_id).or_default();
+                    Ok(st.summary(&st.chats[&user_id]))
+                } else if let Some(info) = mock_member_profile(user_id) {
+                    let mut member = chat(user_id, &info.title, info.kind);
+                    member.username = info.username;
+                    member.about = info.about;
+                    member.presence = info.presence;
+                    member.has_photo = info.has_photo;
+                    st.chats.insert(user_id, member);
                     st.history.entry(user_id).or_default();
                     Ok(st.summary(&st.chats[&user_id]))
                 } else if user_id == 7007 {
@@ -3267,4 +3278,13 @@ fn schedule_reply(
             }
         }
     });
+}
+
+fn mock_member_profile(id: i64) -> Option<ChatInfo> {
+    let name = match id { 4001 => "Robin", 4002 => "Ada", 4003 => "Kai", _ => return None };
+    Some(ChatInfo {
+        id, title: name.into(), kind: ChatKind::User, username: name.to_lowercase(),
+        about: "Linux, small computers and open source.".into(), presence: Presence::Recently,
+        has_photo: id == 4001, ..ChatInfo::default()
+    })
 }

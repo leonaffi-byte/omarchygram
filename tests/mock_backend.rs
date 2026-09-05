@@ -571,3 +571,22 @@ async fn recent_history_is_available_without_another_server_load() {
     assert!(tg.get_cached_history(2).await.unwrap().is_empty());
     tg.shutdown().await;
 }
+
+#[tokio::test]
+async fn group_sender_profile_does_not_create_a_dialog_until_message_action() {
+    let tg = started_mock().await;
+    let before = tg.get_dialogs().await.unwrap();
+    let sender = tg.get_history(4, None).await.unwrap().into_iter()
+        .find(|m| m.sender_id == Some(4001)).unwrap();
+    let info = tg.get_user_profile(4001, Some((4, sender.id))).await.unwrap();
+    assert_eq!(info.title, "Robin");
+    assert!(info.has_photo);
+    assert!(!info.is_contact);
+    assert!(tg.download_profile_photo(info.id).await.unwrap().is_some());
+    assert_eq!(tg.get_dialogs().await.unwrap().len(), before.len());
+    let summary = tg.open_user(info.id).await.unwrap();
+    assert_eq!(summary.id, info.id);
+    assert_eq!(summary.kind, ChatKind::User);
+    assert_eq!(tg.get_dialogs().await.unwrap().len(), before.len() + 1);
+    tg.shutdown().await;
+}

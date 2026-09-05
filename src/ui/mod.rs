@@ -30,6 +30,7 @@ pub mod stickers;
 pub mod switcher;
 pub mod topics;
 pub mod viewer;
+pub mod profile;
 pub mod virtual_chat;
 /// Wave 6D rasterizer (orchestrator-owned; see specs/spec-wave6.md §5.1).
 pub mod lottie_backend;

@@ -28,6 +28,7 @@ pub enum InfoLayout {
 pub enum InfoAction {
     Close,
     RetryInfo,
+    OpenPhoto,
     SetNotifications(bool),
     OpenMember(i64),
     MoreMembers,
@@ -44,6 +45,7 @@ type Callback = Rc<dyn Fn(InfoAction)>;
 pub struct InfoPanel {
     pub widget: gtk::Box,
     avatar: Avatar,
+    photo: gtk::Button,
     title: gtk::Label,
     status: gtk::Label,
     username_row: gtk::Box,
@@ -119,7 +121,12 @@ impl InfoPanel {
         let identity = gtk::Box::new(gtk::Orientation::Vertical, 4);
         identity.set_halign(gtk::Align::Center);
         let avatar = Avatar::new(96);
-        identity.append(&avatar.widget);
+        let photo = gtk::Button::new();
+        photo.add_css_class("omg-profile-photo");
+        photo.set_child(Some(&avatar.widget));
+        photo.set_tooltip_text(Some("Open profile photo"));
+        photo.update_property(&[gtk::accessible::Property::Label("Open profile photo")]);
+        identity.append(&photo);
         let title = gtk::Label::new(None);
         title.add_css_class("omg-title");
         title.set_wrap(true);
@@ -226,6 +233,10 @@ impl InfoPanel {
         contents.append(&shared_section);
 
         let action: Rc<RefCell<Option<Callback>>> = Rc::new(RefCell::new(None));
+        {
+            let action = action.clone();
+            photo.connect_clicked(move |_| emit(&action, InfoAction::OpenPhoto));
+        }
         let notification_signal_blocked = Rc::new(Cell::new(false));
         let current_chat = Rc::new(Cell::new(None));
         let bind_generation = Rc::new(Cell::new(0));
@@ -294,6 +305,7 @@ impl InfoPanel {
         Self {
             widget,
             avatar,
+            photo,
             title,
             status,
             username_row,
@@ -348,10 +360,12 @@ impl InfoPanel {
         self.shared_generation
             .set(self.shared_generation.get().wrapping_add(1));
         self.current_chat.set(Some(summary.id));
+        self.photo.set_sensitive(summary.has_photo);
         self.title.set_label(&summary.title);
         self.status.set_label("Loading…");
         let show_avatars = self.show_avatars.get();
         self.avatar.widget.set_visible(show_avatars);
+        self.photo.set_visible(show_avatars);
         self.avatar.bind(
             &self.tg,
             summary.id,
@@ -411,10 +425,12 @@ impl InfoPanel {
         if !self.matches(chat_id, generation) {
             return false;
         }
+        self.photo.set_sensitive(info.has_photo);
         self.title.set_label(&info.title);
         self.status.set_label(&chat_status(info));
         let show_avatars = self.show_avatars.get();
         self.avatar.widget.set_visible(show_avatars);
+        self.photo.set_visible(show_avatars);
         self.avatar.bind(
             &self.tg,
             info.id,
@@ -687,6 +703,7 @@ impl InfoPanel {
             return false;
         }
         self.avatar.widget.set_visible(show);
+        self.photo.set_visible(show);
         true
     }
 
@@ -730,6 +747,8 @@ impl InfoPanel {
     pub fn shared_state_text(&self) -> String {
         self.shared_state.label().to_string()
     }
+
+    pub fn probe_photo(&self) { self.photo.emit_clicked(); }
 
     pub fn info_retry_visible(&self) -> bool {
         self.info_retry.is_visible()
@@ -986,7 +1005,7 @@ fn shared_kind_key(kind: SharedKind) -> &'static str {
     }
 }
 
-fn chat_status(info: &ChatInfo) -> String {
+pub(super) fn chat_status(info: &ChatInfo) -> String {
     match info.kind {
         ChatKind::Group => format!("{} members", info.members.unwrap_or(0)),
         ChatKind::Channel => format!("{} subscribers", info.members.unwrap_or(0)),

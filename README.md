@@ -116,6 +116,19 @@ messages each, at most 12 MiB of message payload. Cache files are private and
 persist across restarts. A chat without cached history still needs its first
 Telegram response. Failed refreshes keep the cached content and offer Retry.
 
+## Profiles and media
+
+Click a sender's name in a group to view their profile without leaving the
+conversation. **Message** opens a private chat; **Call** starts a voice call
+when calling support is enabled. Click a profile photo in these details or in
+Chat info to view the larger photo. Escape returns to the details.
+
+Photos and voice messages can recover their download details even when the
+chat first opens from its local cache. Download and playback errors offer
+**Retry**, which can replace a damaged cached file. Desktop message
+notifications include the private chat's user photo or the group's photo;
+notifications still arrive if a photo is unavailable or slow to download.
+
 ## Layout
 
 Telegram Desktop's layout on the Omarchy skin: a resizable chat list (drag

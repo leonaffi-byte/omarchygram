@@ -490,7 +490,7 @@ impl AudioPlayer {
         self.render_error_action(retryable);
         let weak = Rc::downgrade(self);
         glib::idle_add_local_once(move || {
-            if let Some(this) = weak.upgrade() {
+            if let Some(this) = weak.upgrade().filter(|this| this.failed.get()) {
                 this.teardown();
                 this.render_error_action(retryable);
             }
@@ -513,7 +513,7 @@ impl AudioPlayer {
             sink.set_property("sync", true);
             return Some(sink);
         }
-        for factory in ["autoaudiosink", "pipewiresink", "fakesink"] {
+        for factory in ["autoaudiosink", "pipewiresink", "pulsesink", "alsasink"] {
             if gst::ElementFactory::find(factory).is_some()
                 && let Ok(sink) = gst::ElementFactory::make(factory).build() {
                     return Some(sink);
@@ -535,17 +535,19 @@ impl AudioPlayer {
 
         let pipeline = gst::Pipeline::with_name("omg-audio");
         let Ok(playbin) = gst::ElementFactory::make("playbin3").build() else {
-            self.show_error(DECODE_ERROR, false);
+            self.show_error(DECODE_ERROR, true);
             return;
         };
         if pipeline.add(&playbin).is_err() {
-            self.show_error(DECODE_ERROR, false);
+            self.show_error(DECODE_ERROR, true);
             return;
         }
         playbin.set_property("uri", gtk::gio::File::for_path(path).uri().to_string());
-        if let Some(sink) = self.audio_sink() {
-            playbin.set_property("audio-sink", &sink);
-        }
+        let Some(sink) = self.audio_sink() else {
+            self.show_error("Audio output is unavailable. Check your sound device and retry.", true);
+            return;
+        };
+        playbin.set_property("audio-sink", &sink);
         if let Ok(sink) = gst::ElementFactory::make("fakesink").build() {
             playbin.set_property("video-sink", &sink);
         }
@@ -558,7 +560,7 @@ impl AudioPlayer {
                 };
                 match message.view() {
                     gst::MessageView::Error(error) => {
-                        this.show_error(&error_text(&error.error()), false)
+                        this.show_error(&error_text(&error.error()), true)
                     }
                     gst::MessageView::Eos(_) => this.rewind(),
                     gst::MessageView::StateChanged(changed) => {
@@ -578,7 +580,7 @@ impl AudioPlayer {
 
         if pipeline.set_state(gst::State::Playing).is_err() {
             let _ = pipeline.set_state(gst::State::Null);
-            self.show_error(DECODE_ERROR, false);
+            self.show_error(DECODE_ERROR, true);
             return;
         }
         *self.pipeline.borrow_mut() = Some(pipeline);
@@ -1719,6 +1721,33 @@ pub fn set_error(msg_id: i32, text: &str) {
         Some(PlayerInner::Audio(audio)) => audio.show_error(text, false),
         Some(PlayerInner::Video(video)) => video.show_error(text, false),
         None => {}
+    }
+}
+
+pub fn download_started(msg_id: i32) {
+    if let Some(PlayerInner::Audio(audio)) = get_handle(msg_id).map(|handle| handle.inner) {
+        audio.teardown();
+        audio.failed.set(false);
+        audio.error.set_visible(false);
+        audio.play.set_label("…");
+        audio.play.set_tooltip_text(Some("Downloading…"));
+        audio.play.set_sensitive(false);
+    }
+}
+
+pub fn download_ready(msg_id: i32) {
+    if let Some(PlayerInner::Audio(audio)) = get_handle(msg_id).map(|handle| handle.inner)
+        && audio.pipeline.borrow().is_none() && !audio.failed.get() {
+        audio.set_playing(false);
+        audio.play.set_sensitive(true);
+    }
+}
+
+pub fn play_control_enabled(msg_id: i32) -> bool {
+    match get_handle(msg_id).map(|handle| handle.inner) {
+        Some(PlayerInner::Audio(audio)) => audio.play.is_sensitive(),
+        Some(PlayerInner::Video(video)) => video.play_overlay.is_sensitive(),
+        None => false,
     }
 }
 

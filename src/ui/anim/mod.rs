@@ -1052,6 +1052,8 @@ impl Effects {
             .iter()
             .map(|label| label.label().to_string())
             .collect();
+        // Animate visible text, never the link/span markup backing a label.
+        let plain: Vec<String> = labels.iter().map(|label| label.text().to_string()).collect();
         let labels = Rc::new(labels);
         let originals = Rc::new(originals);
         let frame = Rc::new(Cell::new(0u32));
@@ -1068,7 +1070,7 @@ impl Effects {
                 return glib::ControlFlow::Break;
             }
             for (label_index, label) in labels_for_timeout.iter().enumerate() {
-                let source = &originals_for_timeout[label_index];
+                let source = &plain[label_index];
                 let noise = source
                     .chars()
                     .enumerate()
@@ -1083,7 +1085,7 @@ impl Effects {
                         }
                     })
                     .collect::<String>();
-                label.set_label(&noise);
+                set_animation_text(label, &noise);
             }
             frame_for_timeout.set(current + 1);
             glib::ControlFlow::Continue
@@ -1512,7 +1514,7 @@ impl Effects {
             index.set(next);
             let mut visible: String = characters[..next].iter().collect();
             visible.push('▌');
-            label.set_label(&visible);
+            set_animation_text(&label, &visible);
             if next == characters.len() {
                 let final_text: String = characters.iter().collect();
                 glib::timeout_add_local_once(Duration::from_millis(350), move || {
@@ -1569,7 +1571,7 @@ impl Effects {
                     }
                 })
                 .collect::<String>();
-            label.set_label(&decoded);
+            set_animation_text(&label, &decoded);
             frame.set(current + 1);
             if settled >= characters.len() {
                 label.set_label(&characters.iter().collect::<String>());
@@ -1865,5 +1867,15 @@ pub(super) fn tick_start(started: &Cell<Option<i64>>, now: i64) -> i64 {
     } else {
         started.set(Some(now));
         now
+    }
+}
+
+/// Animation glyphs are text even when the underlying message uses markup.
+/// Preserve the mode so restoring the original label also restores links.
+fn set_animation_text(label: &gtk::Label, text: &str) {
+    if label.uses_markup() {
+        label.set_markup(&glib::markup_escape_text(text));
+    } else {
+        label.set_label(text);
     }
 }

@@ -13,6 +13,7 @@ use super::icons;
 
 #[derive(Clone, Debug)]
 pub enum ViewerAction {
+    Retry { msg_id: i32, generation: u64 },
     Load { msg_id: i32, generation: u64 },
     Save { msg_id: i32, generation: u64 },
     Open { msg_id: i32, generation: u64 },
@@ -24,10 +25,12 @@ type Callback = Rc<dyn Fn(ViewerAction)>;
 #[derive(Default)]
 struct ViewerState {
     chat_id: i64,
+    profile: Option<String>,
     photos: Vec<Msg>,
     index: usize,
     source_id: i32,
     generation: u64,
+    decode_generation: u64,
     paths: std::collections::HashMap<i32, PathBuf>,
 }
 
@@ -139,6 +142,22 @@ impl Viewer {
         let state = Rc::new(RefCell::new(ViewerState::default()));
         let action: Rc<RefCell<Option<Callback>>> = Rc::new(RefCell::new(None));
         let visible = Rc::new(Cell::new(false));
+        {
+            let state = state.clone();
+            let action = action.clone();
+            loading.connect_activate_link(move |_, _| {
+                let (msg_id, generation) = {
+                    let mut state = state.borrow_mut();
+                    let id = state.photos.get(state.index).map(|m| m.id).unwrap_or(0);
+                    state.paths.remove(&id);
+                    (id, state.generation)
+                };
+                let callback = action.borrow().clone();
+                if let Some(callback) = callback { callback(ViewerAction::Retry { msg_id, generation }); }
+                glib::Propagation::Stop
+            });
+        }
+
 
         {
             let state = state.clone();
@@ -165,22 +184,23 @@ impl Viewer {
             let action = action.clone();
             button.connect_clicked(move |_| {
                 let state = state.borrow();
-                let Some(message) = state.photos.get(state.index) else {
-                    return;
-                };
+                let msg_id = if state.profile.is_some() { 0 }
+                    else if let Some(message) = state.photos.get(state.index) { message.id }
+                    else { return };
                 let event = match kind {
                     0 => ViewerAction::Save {
-                        msg_id: message.id,
+                        msg_id,
                         generation: state.generation,
                     },
                     1 => ViewerAction::Open {
-                        msg_id: message.id,
+                        msg_id,
                         generation: state.generation,
                     },
                     _ => ViewerAction::Close {
                         source_id: state.source_id,
                     },
                 };
+                drop(state);
                 if let Some(callback) = action.borrow().as_ref().cloned() {
                     callback(event);
                 }
@@ -203,8 +223,13 @@ impl Viewer {
             let view = widgets(
                 &picture, &title, &caption, &loading, [&previous, &next, &save, &open],
             );
+            let retry = loading.downgrade();
             keys.connect_key_pressed(move |_, key, _, modifiers| {
-                let buttons = buttons.iter().filter_map(glib::WeakRef::upgrade).collect::<Vec<_>>();
+                let mut buttons = buttons.iter().filter_map(glib::WeakRef::upgrade)
+                    .map(|button| button.upcast::<gtk::Widget>()).collect::<Vec<_>>();
+                if let Some(retry) = retry.upgrade().filter(|label| label.is_visible() && label.label().contains("href=")) {
+                    buttons.push(retry.upcast());
+                }
                 if key == gdk::Key::Escape {
                     let source_id = state.borrow().source_id;
                     if let Some(callback) = action.borrow().as_ref().cloned() {
@@ -238,7 +263,7 @@ impl Viewer {
                     } else {
                         (current + step) % buttons.len()
                     };
-                    if buttons[candidate].is_sensitive() {
+                    if buttons[candidate].is_sensitive() && buttons[candidate].is_visible() {
                         buttons[candidate].grab_focus();
                         break;
                     }
@@ -287,10 +312,12 @@ impl Viewer {
         }
         *self.state.borrow_mut() = ViewerState {
             chat_id,
+            profile: None,
             photos,
             index,
             source_id: current_id,
             generation,
+            decode_generation: 0,
             paths,
         };
         self.visible.set(true);
@@ -300,13 +327,34 @@ impl Viewer {
         true
     }
 
+    pub fn present_profile(&self, peer: i64, title: &str, generation: u64) {
+        *self.state.borrow_mut() = ViewerState {
+            chat_id: peer, profile: Some(title.to_string()), generation, ..ViewerState::default()
+        };
+        self.visible.set(true);
+        self.widget.set_visible(true);
+        self.refresh();
+        self.close.grab_focus();
+    }
+
+    pub fn profile_peer(&self) -> Option<i64> {
+        let state = self.state.borrow();
+        (self.is_open() && state.profile.is_some()).then_some(state.chat_id)
+    }
+
+    pub fn path(&self, id: i32) -> Option<PathBuf> { self.state.borrow().paths.get(&id).cloned() }
+
     pub fn close(&self) -> Option<i32> {
         if !self.visible.replace(false) {
             return None;
         }
         move_focus_outside(self.widget.upcast_ref());
         self.widget.set_visible(false);
-        Some(self.state.borrow().source_id)
+        self.picture.set_paintable(None::<&gdk::Paintable>);
+        let mut state = self.state.borrow_mut();
+        state.paths.clear();
+        state.generation = state.generation.wrapping_add(1);
+        Some(state.source_id)
     }
 
     pub fn is_open(&self) -> bool {
@@ -324,7 +372,7 @@ impl Viewer {
     pub fn current_id(&self) -> Option<i32> {
         let state = self.state.borrow();
         self.is_open()
-            .then(|| state.photos.get(state.index).map(|message| message.id))
+            .then(|| if state.profile.is_some() { Some(0) } else { state.photos.get(state.index).map(|message| message.id) })
             .flatten()
     }
 
@@ -346,7 +394,7 @@ impl Viewer {
     pub fn show_error(&self, msg_id: i32, generation: u64, message: &str) {
         if self.is_open() && self.generation() == generation && self.current_id() == Some(msg_id) {
             self.loading.add_css_class("omg-error");
-            self.loading.set_label(message);
+            self.loading.set_markup(&format!("{}  <a href=\"retry\">Retry</a>", glib::markup_escape_text(message)));
             self.loading.set_visible(true);
         }
     }
@@ -355,7 +403,7 @@ impl Viewer {
     /// If the current photo vanished, advance at the same position, fall back
     /// to the previous photo, or close when the snapshot became empty (A25).
     pub fn remove_deleted(&self, chat_id: i64, ids: &[i32]) -> bool {
-        if self.chat_id() != Some(chat_id) {
+        if self.profile_peer().is_some() || self.chat_id() != Some(chat_id) {
             return false;
         }
         let close = {
@@ -383,6 +431,12 @@ impl Viewer {
         }
         close
     }
+
+    pub fn image_ready(&self) -> bool { self.picture.paintable().is_some() && !self.loading.is_visible() }
+    pub fn retry_visible(&self) -> bool { self.loading.is_visible() && self.loading.label().contains("href=") }
+    pub fn probe_retry(&self) { self.loading.emit_by_name::<bool>("activate-link", &[&"retry"]); }
+    pub fn probe_close(&self) { self.close.emit_clicked(); }
+    pub fn probe_open(&self) { self.open.emit_clicked(); }
 
     pub fn probe_key(&self, key: gdk::Key) -> bool {
         self.key_controller
@@ -474,49 +528,87 @@ fn refresh_widgets(
     let Some(next) = widgets.next.upgrade() else { return };
     let Some(save) = widgets.save.upgrade() else { return };
     let Some(open) = widgets.open.upgrade() else { return };
-    let (message, index, count, path, generation) = {
-        let state = state.borrow();
-        let Some(message) = state.photos.get(state.index).cloned() else {
-            return;
-        };
+    let (message, profile, index, count, path, generation, decode_generation) = {
+        let mut state = state.borrow_mut();
+        state.decode_generation = state.decode_generation.wrapping_add(1);
+        let message = state.photos.get(state.index).cloned();
+        if message.is_none() && state.profile.is_none() { return; }
+        let id = message.as_ref().map(|m| m.id).unwrap_or(0);
         (
-            message.clone(),
+            message,
+            state.profile.clone(),
             state.index,
             state.photos.len(),
-            state.paths.get(&message.id).cloned(),
+            state.paths.get(&id).cloned(),
             state.generation,
+            state.decode_generation,
         )
     };
-    title.set_label(&format!("Photo {} of {}", index + 1, count));
-    caption.set_label(&format!(
-        "{}  ·  {}{}",
-        if message.sender.is_empty() {
-            "Unknown"
-        } else {
-            &message.sender
-        },
-        message.ts.format("%Y-%m-%d %H:%M"),
-        if message.text.is_empty() {
-            String::new()
-        } else {
-            format!("\n{}", message.text)
-        }
-    ));
+    let msg_id = message.as_ref().map(|m| m.id).unwrap_or(0);
+    if let Some(profile) = &profile {
+        title.set_label("Profile photo");
+        caption.set_label(profile);
+    } else if let Some(message) = &message {
+        title.set_label(&format!("Photo {} of {}", index + 1, count));
+        caption.set_label(&format!(
+            "{}  ·  {}{}",
+            if message.sender.is_empty() {
+                "Unknown"
+            } else {
+                &message.sender
+            },
+            message.ts.format("%Y-%m-%d %H:%M"),
+            if message.text.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", message.text)
+            }
+        ));
+    }
+    previous.set_visible(profile.is_none());
+    next.set_visible(profile.is_none());
     previous.set_sensitive(index > 0);
     next.set_sensitive(index + 1 < count);
     save.set_sensitive(path.is_some());
     open.set_sensitive(path.is_some());
     loading.remove_css_class("omg-error");
     if let Some(path) = path {
-        picture.set_filename(Some(&path));
-        loading.set_visible(false);
+        picture.set_paintable(None::<&gdk::Paintable>);
+        loading.set_label("Loading…");
+        loading.set_visible(true);
+        save.set_sensitive(false);
+        open.set_sensitive(false);
+        let state = Rc::downgrade(state);
+        let widgets = widgets.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let decoded = gtk::gio::spawn_blocking(move || gdk::Texture::from_filename(path)).await;
+            let Some(state) = state.upgrade() else { return };
+            let state = state.borrow();
+            let current = state.photos.get(state.index).map(|m| m.id).unwrap_or(0);
+            if state.generation != generation || state.decode_generation != decode_generation || current != msg_id { return; }
+            let (Some(picture), Some(loading), Some(save), Some(open)) = (
+                widgets.picture.upgrade(), widgets.loading.upgrade(), widgets.save.upgrade(), widgets.open.upgrade()
+            ) else { return };
+            match decoded {
+                Ok(Ok(texture)) => {
+                    picture.set_paintable(Some(&texture));
+                    loading.set_visible(false);
+                    save.set_sensitive(true);
+                    open.set_sensitive(true);
+                }
+                _ => {
+                    loading.add_css_class("omg-error");
+                    loading.set_markup("Could not open image. <a href=\"retry\">Retry</a>");
+                }
+            }
+        });
     } else {
         picture.set_paintable(None::<&gdk::Paintable>);
         loading.set_label("Loading…");
         loading.set_visible(true);
         if let Some(callback) = action.borrow().as_ref().cloned() {
             callback(ViewerAction::Load {
-                msg_id: message.id,
+                msg_id,
                 generation,
             });
         }

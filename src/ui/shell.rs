@@ -42,6 +42,7 @@ use super::locationdialog::{LocationDialog, LocationDialogAction};
 use super::newgroup::{NewGroupAction, NewGroupDialog};
 use super::scheduled::SendLaterPopover;
 use super::player;
+use super::profile::{ProfileAction, ProfileDialog};
 use super::recorder::{
     CancelCommand, RecordTarget, RecorderMachine, StartResolution, StopResolution,
 };
@@ -212,6 +213,7 @@ impl ShellInner {
         }
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_contacts();
         self.close_new_group();
         self.close_stickers();
@@ -241,6 +243,7 @@ impl ShellInner {
         }
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_stories_viewer();
         self.close_contacts();
         self.close_new_group();
@@ -270,6 +273,7 @@ impl ShellInner {
         };
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_stories_viewer();
         self.close_contacts();
         self.close_new_group();
@@ -710,11 +714,13 @@ struct ShellInner {
     /// Only the newest get_topics completion may replace the visible list.
     forum_topics_generation: Cell<u64>,
     info: InfoPanel,
+    profile: ProfileDialog,
     contacts: ContactsDialog,
     new_group: NewGroupDialog,
     stickers: StickerPicker,
     forward: ForwardDialog,
     viewer: Viewer,
+    playback_generation: Cell<u64>,
     poll_dialog: Rc<PollDialog>,
     location_dialog: Rc<LocationDialog>,
     /// Per-open tokens. Late completions must not close, unlock, or put an
@@ -836,6 +842,9 @@ struct ShellInner {
     voice_retry: RefCell<Option<PendingVoice>>,
     caption_dialog: RefCell<Option<gtk::Window>>,
     probe_notifications: Cell<u64>,
+    probe_notification_avatar: RefCell<Option<(i64, PathBuf)>>,
+    notification_sequence: Cell<u64>,
+    pending_notifications: RefCell<HashMap<i64, u64>>,
     probe_restored_ui_state: Option<RestoredUiState>,
     smoke_hook_done: Cell<bool>,
     probe_started: Cell<bool>,
@@ -866,6 +875,7 @@ impl Shell {
         content_area.add_named(&topics.widget, Some("topics"));
         content_area.set_visible_child_name("messages");
         let info = InfoPanel::new(tg.clone());
+        let profile = ProfileDialog::new();
         let contacts = ContactsDialog::new(tg.clone());
         let new_group = NewGroupDialog::new();
         let stickers = StickerPicker::new();
@@ -943,6 +953,7 @@ impl Shell {
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&stack));
         overlay.add_overlay(&info.widget);
+        overlay.add_overlay(&profile.widget);
         overlay.add_overlay(&viewer.widget);
         overlay.add_overlay(&video_fullscreen.widget);
         overlay.add_overlay(&stories_viewer.widget);
@@ -986,11 +997,13 @@ impl Shell {
             forum_topics: RefCell::new(Vec::new()),
             forum_topics_generation: Cell::new(0),
             info,
+            profile,
             contacts,
             new_group,
             stickers,
             forward,
             viewer,
+            playback_generation: Cell::new(0),
             poll_dialog,
             location_dialog,
             poll_dialog_generation: Cell::new(0),
@@ -1089,6 +1102,9 @@ impl Shell {
             voice_retry: RefCell::new(None),
             caption_dialog: RefCell::new(None),
             probe_notifications: Cell::new(0),
+            probe_notification_avatar: RefCell::new(None),
+            notification_sequence: Cell::new(0),
+            pending_notifications: RefCell::new(HashMap::new()),
             probe_restored_ui_state,
             smoke_hook_done: Cell::new(false),
             probe_started: Cell::new(false),
@@ -1270,6 +1286,12 @@ impl ShellInner {
                 if let Some(this) = weak.upgrade() {
                     this.handle_viewer_action(action);
                 }
+            }));
+        }
+        {
+            let weak = Rc::downgrade(this);
+            this.profile.set_action(Rc::new(move |action| {
+                if let Some(this) = weak.upgrade() { this.handle_profile_action(action); }
             }));
         }
         {
@@ -1469,6 +1491,8 @@ impl ShellInner {
                         this.close_stories_viewer();
                     } else if this.viewer.is_open() {
                         this.close_viewer();
+                    } else if this.profile.is_open() {
+                        this.close_profile();
                     } else if this.forward.is_open() {
                         this.close_forward();
                     } else if this.contacts.is_open() {
@@ -1631,6 +1655,7 @@ impl ShellInner {
         self.cancel_recording();
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_contacts();
         self.close_new_group();
         self.close_poll_dialog();
@@ -1640,6 +1665,8 @@ impl ShellInner {
         if self.messages.search_is_open() {
             self.close_in_chat_search();
         }
+        self.pending_notifications.borrow_mut().clear();
+        self.probe_notification_avatar.borrow_mut().take();
         self.settings_view.begin_logout();
         self.switcher.close();
         self.main_menu.dismiss();
@@ -1758,6 +1785,7 @@ impl ShellInner {
         if disabled_open {
             self.close_forward();
             self.close_viewer();
+            self.close_profile();
             if self.messages.search_is_open() {
                 self.close_in_chat_search();
             }
@@ -1894,6 +1922,7 @@ impl ShellInner {
         } else {
             self.close_forward();
             self.close_viewer();
+            self.close_profile();
             self.close_contacts();
             self.close_new_group();
             self.close_poll_dialog();
@@ -1911,6 +1940,7 @@ impl ShellInner {
     fn open_switcher(&self) {
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_contacts();
         self.close_new_group();
         self.close_poll_dialog();
@@ -1991,6 +2021,7 @@ impl ShellInner {
         let sidebar = if state.sidebar_collapsed || window_width < 800 { 64 } else { clamp_sidebar_width(state.sidebar_width, window_width) };
         drop(state);
         let overlay_blocked = self.viewer.is_open()
+            || self.profile.is_open()
             || player::fullscreen_open()
             || self.forward.is_open()
             || self.contacts.is_open()
@@ -2152,6 +2183,7 @@ impl ShellInner {
     fn open_contacts(self: &Rc<Self>) {
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_new_group();
         self.close_stickers();
         self.close_caption_dialog();
@@ -2234,6 +2266,7 @@ impl ShellInner {
     fn open_new_group(self: &Rc<Self>) {
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_contacts();
         self.close_stickers();
         self.close_caption_dialog();
@@ -2967,6 +3000,7 @@ impl ShellInner {
                         self.cancel_recording();
                         self.close_forward();
                         self.close_viewer();
+                        self.close_profile();
                         self.close_in_chat_search();
                         self.open_chat.set(None);
                         let epoch = self.bump_epoch();
@@ -3214,6 +3248,12 @@ impl ShellInner {
             InfoAction::Close => {
                 self.close_info_panel();
             }
+            InfoAction::OpenPhoto => {
+                if let Some(id) = self.info.chat_id() {
+                    let name = self.chatlist.summary(dialog_id(id)).map(|s| s.title).unwrap_or_else(|| "Profile photo".into());
+                    self.open_profile_photo(dialog_id(id), &name);
+                }
+            }
             InfoAction::RetryInfo => {
                 if let (Some(chat_id), generation) =
                     (self.info.chat_id(), self.info.bind_generation())
@@ -3233,7 +3273,7 @@ impl ShellInner {
                     );
                 }
             }
-            InfoAction::OpenMember(user_id) => self.open_mention(user_id),
+            InfoAction::OpenMember(user_id) => self.open_profile(user_id, "Profile", None),
             InfoAction::MoreMembers | InfoAction::RetryMembers => {
                 self.load_info_members(self.info.members_count());
             }
@@ -3261,6 +3301,7 @@ impl ShellInner {
             SharedKind::Photos if message.media == Some(MediaKind::Photo) => {
                 self.close_forward();
                 self.close_viewer();
+                self.close_profile();
                 let generation = self.viewer_generation.get().wrapping_add(1);
                 self.viewer_generation.set(generation);
                 if self.viewer.present(
@@ -3321,6 +3362,7 @@ impl ShellInner {
         }
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_contacts();
         self.close_new_group();
         let generation = self.stickers.begin();
@@ -5064,6 +5106,7 @@ impl ShellInner {
                 let viewer_closed = self.viewer.remove_deleted(chat_id, &msg_ids);
                 if viewer_closed {
                     self.close_viewer();
+                    self.close_profile();
                 }
                 let is_open = self.open_chat_is(chat_id);
                 let anti_delete = self.settings.get().anti_delete;
@@ -5221,7 +5264,7 @@ impl ShellInner {
         }
     }
 
-    fn notify(&self, message: &Msg) {
+    fn notify(self: &Rc<Self>, message: &Msg) {
         let muted = effective_mute(
             self.pending_mutes.borrow().get(&message.chat_id).copied(),
             self.chatlist
@@ -5254,21 +5297,60 @@ impl ShellInner {
         let body = glib::markup_escape_text(&body);
         let notification = gio::Notification::new(title.as_str());
         notification.set_body(Some(body.as_str()));
-        application.send_notification(Some(&format!("chat-{}", message.chat_id)), &notification);
-        self.probe_notifications
-            .set(self.probe_notifications.get().wrapping_add(1));
+        let chat_id = message.chat_id;
+        let avatar_peer = dialog_id(chat_id);
+        let sequence = self.notification_sequence.get().wrapping_add(1);
+        self.notification_sequence.set(sequence);
+        {
+            let mut pending = self.pending_notifications.borrow_mut();
+            // Only pending avatar lookups live here, never a message archive.
+            if pending.len() >= 256
+                && let Some(oldest) = pending.iter().min_by_key(|(_, seq)| **seq).map(|(id, _)| *id) {
+                pending.remove(&oldest);
+            }
+            pending.insert(chat_id, sequence);
+        }
+        let tg = self.tg.clone();
+        let session = self.session_epoch.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            // Cached photos complete quickly. A slow network must not hold
+            // the notification indefinitely or cause a second popup later.
+            let photo = glib::future_with_timeout(Duration::from_millis(800), tg.download_avatar(avatar_peer))
+                .await.ok().and_then(Result::ok).flatten();
+            let Some(this) = weak.upgrade() else { return };
+            if this.pending_notifications.borrow().get(&chat_id) != Some(&sequence) { return; }
+            this.pending_notifications.borrow_mut().remove(&chat_id);
+            if !this.is_session_current(session)
+                || (this.window_is_active() && this.open_chat.get().is_some_and(|id| dialog_id(id) == avatar_peer))
+                || effective_mute(this.pending_mutes.borrow().get(&chat_id).copied(),
+                    this.chatlist.summary(avatar_peer).map(|chat| chat.muted)) { return; }
+            if let Some(path) = photo {
+                notification.set_icon(&gio::FileIcon::new(&gio::File::for_path(&path)));
+                if this.probe { *this.probe_notification_avatar.borrow_mut() = Some((avatar_peer, path)); }
+            } else {
+                notification.set_icon(&gio::ThemedIcon::new("omarchygram"));
+                if this.probe { this.probe_notification_avatar.borrow_mut().take(); }
+            }
+            if !this.probe {
+                application.send_notification(Some(&format!("chat-{chat_id}")), &notification);
+            }
+            this.probe_notifications.set(this.probe_notifications.get().wrapping_add(1));
+        });
     }
 
     fn open_chat(self: Rc<Self>, chat_id: i64) {
         if !self.session_ready.get() {
             return;
         }
+        self.pending_notifications.borrow_mut().retain(|id, _| dialog_id(*id) != dialog_id(chat_id));
         // A chat activation owns the main view even when it re-opens the
         // already-selected chat; dismiss settings capture and modal windows.
         self.close_settings();
         self.switcher.close();
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_contacts();
         self.close_new_group();
         self.close_stickers();
@@ -5576,6 +5658,7 @@ impl ShellInner {
         self.cancel_recording();
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_stickers();
         if self.messages.search_is_open() {
             self.close_in_chat_search();
@@ -5831,6 +5914,12 @@ impl ShellInner {
             }
             MessageAction::OpenLink(url) => self.open_link(&url),
             MessageAction::OpenMention(user_id) => self.open_mention(user_id),
+            MessageAction::OpenSender(msg_id) => {
+                if let Some(message) = self.messages.message(msg_id)
+                    && let Some(user_id) = message.sender_id.filter(|id| *id > 0) {
+                    self.open_profile(user_id, &message.sender, Some((message.chat_id, msg_id)));
+                }
+            }
             MessageAction::Vote { msg_id, options } => {
                 if let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) {
                     self.vote(chat_id, msg_id, options);
@@ -6026,6 +6115,7 @@ impl ShellInner {
         }
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.switcher.close();
         self.close_settings();
         self.messages.open_search();
@@ -6178,6 +6268,7 @@ impl ShellInner {
         let session_epoch = self.session_epoch.get();
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         let this = self.clone();
         glib::MainContext::default().spawn_local(async move {
             // A17 order matters: anchor around the search hit's timestamp
@@ -6403,6 +6494,75 @@ impl ShellInner {
         }
     }
 
+    fn open_profile(self: &Rc<Self>, user_id: i64, name: &str, source: Option<(i64, i32)>) {
+        if !self.session_ready.get() || user_id <= 0 { return; }
+        self.close_viewer();
+        self.close_forward();
+        self.close_contacts();
+        self.close_new_group();
+        self.switcher.close();
+        self.close_settings();
+        let settings = self.settings.get();
+        let generation = self.profile.begin(&self.tg, user_id, name, source, settings.ui.show_avatars);
+        self.apply_info_layout(self.current_window_width());
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(self);
+        let session = self.session_epoch.get();
+        glib::MainContext::default().spawn_local(async move {
+            let result = glib::future_with_timeout(Duration::from_secs(20), tg.get_user_profile(user_id, source)).await
+                .unwrap_or_else(|_| Err("Loading profile timed out; try again".into()));
+            let Some(this) = weak.upgrade().filter(|s| s.is_session_current(session)) else { return };
+            match result {
+                Ok(info) => this.profile.finish(&tg, user_id, generation, info,
+                    this.settings.get().ui.show_avatars, cfg!(feature = "calls")),
+                Err(error) => this.profile.fail(user_id, generation, &error),
+            }
+        });
+    }
+
+    fn close_profile(&self) {
+        if !self.profile.is_open() { return; }
+        let source = self.profile.source();
+        self.profile.close();
+        if let Some((_, msg_id)) = source { self.messages.focus_message_or_composer(msg_id); }
+        else { self.messages.focus_composer(); }
+        self.apply_info_layout(self.current_window_width());
+    }
+
+    fn handle_profile_action(self: Rc<Self>, action: ProfileAction) {
+        let Some(id) = self.profile.user_id() else { return };
+        match action {
+            ProfileAction::Close => self.close_profile(),
+            ProfileAction::Retry => self.open_profile(id, "Profile", self.profile.source()),
+            ProfileAction::Message => {
+                let generation = self.profile.generation();
+                let session = self.session_epoch.get();
+                glib::MainContext::default().spawn_local(async move {
+                    let result = self.tg.open_user(id).await;
+                    if !self.is_session_current(session) || !self.profile.matches(id, generation) { return; }
+                    match result {
+                        Ok(summary) => { self.chatlist.set_summary(summary); self.open_chat(id); }
+                        Err(error) => self.profile.fail(id, generation, &error),
+                    }
+                });
+            }
+            ProfileAction::Call => { self.close_profile(); self.start_call(id); }
+            ProfileAction::Photo => {
+                if let Some(info) = self.profile.info().filter(|info| info.has_photo) {
+                    self.open_profile_photo(id, &info.title);
+                }
+            }
+        }
+    }
+
+    fn open_profile_photo(self: &Rc<Self>, id: i64, title: &str) {
+        self.close_viewer();
+        let generation = self.viewer_generation.get().wrapping_add(1);
+        self.viewer_generation.set(generation);
+        self.viewer.present_profile(id, title, generation);
+        self.apply_info_layout(self.current_window_width());
+    }
+
     fn open_mention(self: Rc<Self>, user_id: i64) {
         let session_epoch = self.session_epoch.get();
         glib::MainContext::default().spawn_local(async move {
@@ -6530,6 +6690,7 @@ impl ShellInner {
             return;
         }
         self.close_viewer();
+        self.close_profile();
         self.switcher.close();
         self.close_settings();
         self.close_forward();
@@ -6653,6 +6814,7 @@ impl ShellInner {
         self.switcher.close();
         self.close_settings();
         self.close_viewer();
+        self.close_profile();
         let generation = self.viewer_generation.get().wrapping_add(1);
         self.viewer_generation.set(generation);
         if self
@@ -6677,11 +6839,16 @@ impl ShellInner {
             self.messages.focus_composer();
         }
         self.viewer.close();
+        if self.profile.is_open() { self.profile.focus(); }
         self.apply_info_layout(self.current_window_width());
     }
 
     fn handle_viewer_action(self: Rc<Self>, action: ViewerAction) {
         match action {
+            ViewerAction::Retry { msg_id, generation } => {
+                if self.viewer_generation.get() != generation || !self.viewer.is_open() { return; }
+                self.clone().reload_viewer_media(msg_id, generation);
+            }
             ViewerAction::Load { msg_id, generation } => self.load_viewer_media(msg_id, generation),
             ViewerAction::Open { msg_id, generation } => {
                 if self.viewer_generation.get() == generation
@@ -6698,8 +6865,16 @@ impl ShellInner {
         if self.viewer_generation.get() != generation || !self.viewer.is_open() {
             return;
         }
+        if self.viewer.profile_peer().is_some() {
+            self.load_profile_photo(generation, false);
+            return;
+        }
         if let Some(path) = self.viewer_media_path(msg_id) {
             self.viewer.set_path(msg_id, generation, path);
+            return;
+        }
+        if matches!(self.messages.media_state(msg_id), Some(MediaState::Failed)) {
+            self.reload_viewer_media(msg_id, generation);
             return;
         }
         let weak = Rc::downgrade(&self);
@@ -6723,10 +6898,46 @@ impl ShellInner {
         }
     }
 
+    fn load_profile_photo(self: Rc<Self>, generation: u64, refresh: bool) {
+        let Some(peer) = self.viewer.profile_peer() else { return };
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(&self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = if refresh { tg.retry_profile_photo(peer).await } else { tg.download_profile_photo(peer).await };
+            let Some(this) = weak.upgrade().filter(|this| this.viewer_generation.get() == generation
+                && this.viewer.profile_peer() == Some(peer)) else { return };
+            match result {
+                Ok(Some(path)) => { this.viewer.set_path(0, generation, path); }
+                Ok(None) => this.viewer.show_error(0, generation, "No profile photo available"),
+                Err(_) => this.viewer.show_error(0, generation, "Could not load profile photo"),
+            }
+        });
+    }
+
+    fn reload_viewer_media(self: Rc<Self>, msg_id: i32, generation: u64) {
+        if self.viewer.profile_peer().is_some() {
+            self.load_profile_photo(generation, true);
+            return;
+        }
+        let Some(chat_id) = self.viewer.chat_id() else { return };
+        let tg = self.tg.clone();
+        let weak = Rc::downgrade(&self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = tg.retry_media(chat_id, msg_id).await;
+            let Some(this) = weak.upgrade().filter(|this| this.viewer_generation.get() == generation
+                && this.viewer.chat_id() == Some(chat_id)) else { return };
+            match result {
+                Ok(Some(path)) => { this.viewer.set_path(msg_id, generation, path); }
+                _ => this.viewer.show_error(msg_id, generation, "Could not load image"),
+            }
+        });
+    }
+
     fn viewer_media_path(&self, msg_id: i32) -> Option<PathBuf> {
-        self.messages
-            .media_path(msg_id)
+        if self.viewer.profile_peer().is_some() { return self.viewer.path(msg_id); }
+        self.messages.media_path(msg_id)
             .or_else(|| self.info.shared_path(msg_id))
+            .or_else(|| self.viewer.path(msg_id))
     }
 
     fn load_shared_viewer_media(self: Rc<Self>, msg_id: i32, generation: u64) {
@@ -6759,6 +6970,9 @@ impl ShellInner {
             })
             .await
             else {
+                if let Some(this) = weak.upgrade() {
+                    this.viewer.show_error(msg_id, generation, "Could not open image");
+                }
                 return;
             };
             let Some(this) = weak.upgrade().filter(|this| {
@@ -6768,16 +6982,8 @@ impl ShellInner {
             }) else {
                 return;
             };
-            if this.info.set_thumbnail(
-                chat_id,
-                bind_generation,
-                shared_generation,
-                msg_id,
-                path.clone(),
-                &texture,
-            ) {
-                this.viewer.set_path(msg_id, generation, path);
-            }
+            this.info.set_thumbnail(chat_id, bind_generation, shared_generation, msg_id, path.clone(), &texture);
+            this.viewer.set_path(msg_id, generation, path);
         });
     }
 
@@ -6894,6 +7100,7 @@ impl ShellInner {
         }
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         let epoch = self.bump_epoch();
         // History-only reset: same chat, so the composer draft, reply/edit
         // mode, and busy sensitivity are preserved (C5/C13).
@@ -6941,6 +7148,7 @@ impl ShellInner {
         }
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         let epoch = self.bump_epoch();
         // History-only reset: same chat, so the composer draft, reply/edit
         // mode, and busy sensitivity are preserved (C5/C13).
@@ -7639,6 +7847,7 @@ impl ShellInner {
         };
         self.close_forward();
         self.close_viewer();
+        self.close_profile();
         self.close_contacts();
         self.close_new_group();
         self.close_stickers();
@@ -8510,6 +8719,9 @@ impl ShellInner {
     /// In-app playback for voice/audio/video/video-note/gif (§2). Nothing here
     /// ever launches an external player — `launch_media` is for documents.
     fn play_inline(self: Rc<Self>, msg_id: i32, intent: player::OpenIntent) {
+        if intent == player::OpenIntent::Manual {
+            self.playback_generation.set(self.playback_generation.get().wrapping_add(1));
+        }
         match self.messages.media_state(msg_id) {
             Some(MediaState::Done(path)) => match self.messages.player_state(msg_id) {
                 // A live pipeline: the button is a play/pause toggle.
@@ -8517,6 +8729,11 @@ impl ShellInner {
                     if intent == player::OpenIntent::Manual {
                         self.messages.toggle_media(msg_id);
                     }
+                }
+                player::PlayerState::Error => {
+                    self.messages.retry_failed_playback(msg_id);
+                    self.clone().play_when_ready(msg_id, intent);
+                    self.start_media_download(msg_id, false);
                 }
                 _ => self.messages.play_media(msg_id, path, intent),
             },
@@ -8533,15 +8750,19 @@ impl ShellInner {
 
     fn play_when_ready(self: Rc<Self>, msg_id: i32, intent: player::OpenIntent) {
         let epoch = self.epoch.get();
+        let playback_generation = self.playback_generation.get();
         let weak = Rc::downgrade(&self);
         self.messages.on_media_ready(msg_id, move |path| {
-            if let Some(this) = weak.upgrade().filter(|this| this.epoch.get() == epoch) {
+            if let Some(this) = weak.upgrade().filter(|this| this.epoch.get() == epoch
+                && (intent != player::OpenIntent::Manual || this.playback_generation.get() == playback_generation)) {
+                // A newer Play/Pause action supersedes any older queued start,
+                // even if its row/player was reclaimed while downloading.
                 // A late completion (a second download, a stale callback) must
                 // not re-open a player that is already open: re-opening calls
                 // activate(), which would pause whatever the user started since
                 // (seen in the gate: the voice re-opened and paused the music).
                 if this.messages.player_exists(msg_id)
-                    && this.messages.player_state(msg_id) != player::PlayerState::None
+                    && !matches!(this.messages.player_state(msg_id), player::PlayerState::None | player::PlayerState::Error)
                 {
                     if intent == player::OpenIntent::Manual {
                         // A real click queued behind autoplay owns the now-open
@@ -8581,11 +8802,14 @@ impl ShellInner {
             return;
         };
         let epoch = self.epoch.get();
+        let retry = matches!(self.messages.media_state(msg_id), Some(MediaState::Failed));
         let Some((kind, media_generation)) = self.messages.begin_media(msg_id) else {
             return;
         };
         glib::MainContext::default().spawn_local(async move {
-            match self.tg.download_media(chat_id, msg_id).await {
+            let result = if retry { self.tg.retry_media(chat_id, msg_id).await }
+                else { self.tg.download_media(chat_id, msg_id).await };
+            match result {
                 // Wave 6D: a .tgs sticker is Lottie, not an image — it must
                 // never reach the texture decoder below.
                 Ok(Some(path)) if kind == MediaKind::Sticker && is_lottie(&path) => {
@@ -8622,13 +8846,13 @@ impl ShellInner {
                         }
                         Ok(Err(error)) => {
                             shell_log!("decode media ({chat_id}, {msg_id}): {error}");
-                            if self.messages.fail_media(msg_id, media_generation, false) {
+                            if self.messages.fail_media(msg_id, media_generation, true) {
                                 self.messages.show_error(error.message());
                             }
                         }
                         Err(_) => {
                             shell_log!("decode media ({chat_id}, {msg_id}): decoder failed");
-                            if self.messages.fail_media(msg_id, media_generation, false) {
+                            if self.messages.fail_media(msg_id, media_generation, true) {
                                 self.messages.show_error("image unavailable");
                             }
                         }
@@ -8647,6 +8871,9 @@ impl ShellInner {
                 }
                 Ok(None) => {
                     if self.is_current(chat_id, epoch) && self.messages.contains(msg_id) {
+                        if self.viewer.chat_id() == Some(chat_id) {
+                            self.viewer.show_error(msg_id, self.viewer_generation.get(), "Image unavailable");
+                        }
                         let transcription_requested = kind == MediaKind::Voice
                             && matches!(
                                 self.aux.borrow().transcripts.get(&(chat_id, msg_id)),
@@ -8670,6 +8897,9 @@ impl ShellInner {
                     }
                 }
                 Err(error) => {
+                    if self.is_current(chat_id, epoch) && self.viewer.chat_id() == Some(chat_id) {
+                        self.viewer.show_error(msg_id, self.viewer_generation.get(), "Could not load image");
+                    }
                     shell_log!("download_media({chat_id}, {msg_id}): {error}");
                     if self.is_current(chat_id, epoch) && self.messages.contains(msg_id)
                         && self.messages.fail_media(msg_id, media_generation, true) {
@@ -9125,6 +9355,14 @@ impl ShellInner {
                 probe_fail("restored UI state");
                 return;
             }
+        }
+
+        if std::env::var_os("OMG_PROBE_MEDIA_PROFILE_ONLY").is_some() {
+            if self.run_media_profile_probe().await {
+                probe_step("media and profiles PASS");
+                if let Some(app) = self.window().and_then(|w| w.application()) { app.quit(); }
+            }
+            return;
         }
 
         if environment_listed("OMG_MOCK_SLOW", "GetDialogs")
@@ -9587,6 +9825,7 @@ impl ShellInner {
             }
             if self.viewer.is_open() {
                 self.close_viewer();
+                self.close_profile();
             }
         }
         if self.messages.has_sender_name() {
@@ -12494,6 +12733,8 @@ impl ShellInner {
             return;
         }
 
+        if !self.run_media_profile_probe().await { return; }
+
         probe_step("logout stops active player");
         self.clone().open_chat(media_lab);
         if !poll_until(5_000, || {
@@ -12592,6 +12833,170 @@ impl ShellInner {
             return;
         };
         application.quit();
+    }
+
+    async fn run_media_profile_probe(self: &Rc<Self>) -> bool {
+        probe_step("group sender opens profile without changing chat");
+        self.clone().open_chat(4);
+        if !poll_until(4000, || self.messages.contains(401) && !self.messages.is_loading()).await {
+            probe_fail("sender profile source chat"); return false;
+        }
+        let count = self.chatlist.ordered().len();
+        if !self.messages.probe_open_sender(401)
+            || !poll_until(4000, || self.profile.info().is_some_and(|info| info.id == 4001)).await
+            || self.open_chat.get() != Some(4) || self.chatlist.ordered().len() != count {
+            probe_fail("sender profile changed conversation or failed to load"); return false;
+        }
+        if self.settings.get().ui.show_avatars
+            && !poll_until(4000, || self.profile.photo_loaded()).await {
+            probe_fail("sender avatar did not load"); return false;
+        }
+        self.probe_capture("sender-profile").await;
+        probe_step("full profile photo loads and closes back to sender details");
+        self.profile.probe_photo();
+        if !poll_until(4000, || self.viewer.profile_peer() == Some(4001) && self.viewer.image_ready()).await {
+            probe_fail("enlarged sender photo"); return false;
+        }
+        self.probe_capture("profile-photo").await;
+        let launches = self.probe_media_launches.get();
+        self.viewer.probe_open();
+        if self.probe_media_launches.get() != launches + 1 {
+            probe_fail("profile photo external action"); return false;
+        }
+        self.viewer.probe_close();
+        if self.viewer.is_open() || !self.profile.is_open() || self.open_chat.get() != Some(4) {
+            probe_fail("profile photo return navigation"); return false;
+        }
+        probe_step("profile message action opens private conversation");
+        self.profile.probe_message();
+        if !poll_until(4000, || self.open_chat.get() == Some(4001) && !self.messages.is_loading()).await
+            || self.profile.is_open() {
+            probe_fail("sender profile message action"); return false;
+        }
+        probe_step("profile generation rejects a superseded user");
+        self.open_profile(4001, "Robin", None);
+        self.open_profile(4002, "Ada", None);
+        if !poll_until(4000, || self.profile.info().is_some_and(|info| info.id == 4002)).await {
+            probe_fail("late sender details"); return false;
+        }
+        self.close_profile();
+        self.clone().open_chat(4);
+        if !self.ui_state.borrow().info_panel_open { self.toggle_info_panel(); }
+        if !poll_until(4000, || self.info.is_bound(4) && !self.messages.is_loading()).await {
+            probe_fail("group info binding"); return false;
+        }
+        probe_step("group info photo expands");
+        self.info.probe_photo();
+        if !poll_until(4000, || self.viewer.profile_peer() == Some(4) && self.viewer.image_ready()).await {
+            probe_fail("group photo enlargement"); return false;
+        }
+        self.viewer.probe_key(gdk::Key::Escape);
+
+        probe_step("photo viewer recovers from an unreadable cache file");
+        self.clone().open_chat(1);
+        if !poll_until(4000, || self.messages.contains(100) && self.messages.media_path(100).is_some()).await {
+            probe_fail("photo recovery fixture"); return false;
+        }
+        self.open_viewer(100);
+        if !poll_until(4000, || self.viewer.image_ready()).await { probe_fail("photo viewer decode"); return false; }
+        let broken = std::env::temp_dir().join(format!("omg-probe-corrupt-media-{}.bin", std::process::id()));
+        if std::fs::write(&broken, b"invalid media fixture").is_err() { probe_fail("write corrupt fixture"); return false; }
+        self.viewer.set_path(100, self.viewer_generation.get(), broken.clone());
+        if !poll_until(3000, || self.viewer.retry_visible()).await { probe_fail("photo failure has no retry"); return false; }
+        self.viewer.probe_retry();
+        if !poll_until(4000, || self.viewer.image_ready()).await { probe_fail("photo retry decode"); return false; }
+        self.close_viewer();
+        probe_step("voice playback error permits retry and resumes audio");
+        self.clone().open_chat(3);
+        if !poll_until(4000, || self.messages.contains(301) && !self.messages.is_loading()).await {
+            probe_fail("voice recovery fixture"); return false;
+        }
+        let _ = self.scroll_into_view(301).await;
+        self.messages.play_media(301, broken.clone(), player::OpenIntent::Manual);
+        if !poll_until(3000, || self.messages.player_state(301) == player::PlayerState::Error && player::retry_available(301)).await {
+            probe_fail("voice decode failure cannot retry"); return false;
+        }
+        // Drain the bus error's deferred teardown before the user's next click.
+        glib::timeout_future(Duration::from_millis(100)).await;
+        self.clone().media_action(301, player::OpenIntent::Manual);
+        if !poll_until(5000, || self.messages.player_state(301) == player::PlayerState::Playing).await {
+            probe_fail("voice retry did not resume playback"); return false;
+        }
+        if !poll_until(2000, || player::position_of(301) > 0.1).await {
+            probe_fail("voice clock did not advance"); return false;
+        }
+        self.messages.reset_players();
+        let _ = std::fs::remove_file(broken);
+
+        probe_step("late voice download cannot interrupt newer music");
+        self.clone().open_chat(8);
+        if !poll_until(4000, || self.messages.contains(800) && self.messages.contains(801) && !self.messages.is_loading()).await {
+            probe_fail("playback ordering fixture"); return false;
+        }
+        let Ok(Some(voice_path)) = self.tg.download_media(8, 800).await else {
+            probe_fail("playback ordering voice file"); return false;
+        };
+        self.messages.reset_media(800);
+        let Some((_, generation)) = self.messages.begin_media(800) else {
+            probe_fail("queue old voice request"); return false;
+        };
+        self.clone().play_when_ready(800, player::OpenIntent::Manual);
+        let _ = self.scroll_into_view(801).await;
+        self.clone().media_action(801, player::OpenIntent::Manual);
+        if !poll_until(4000, || self.messages.player_state(801) == player::PlayerState::Playing).await {
+            probe_fail("newer music request did not play"); return false;
+        }
+        self.messages.finish_media_path(800, generation, voice_path);
+        glib::timeout_future(Duration::from_millis(200)).await;
+        if self.messages.player_state(801) != player::PlayerState::Playing
+            || self.messages.player_state(800) == player::PlayerState::Playing
+            || !player::play_control_enabled(800) {
+            probe_fail("late voice stole playback or became unplayable"); return false;
+        }
+        self.messages.reset_players();
+
+        probe_step("notification photos use the private user and group identity");
+        for (chat_id, sender_id) in [(1, 1), (4, 4001)] {
+            let before = self.probe_notifications.get();
+            self.notify(&Msg { chat_id, sender_id: Some(sender_id), sender: "Fixture sender".into(),
+                chat_title: "Fixture chat".into(), text: "Notification photo check".into(), ..Msg::default() });
+            if !poll_until(3000, || self.probe_notifications.get() == before + 1).await {
+                probe_fail("avatar notification not emitted"); return false;
+            }
+            let expected = self.tg.download_avatar(chat_id).await.ok().flatten();
+            if self.probe_notification_avatar.borrow().as_ref().is_none_or(|(id, path)| *id != chat_id || Some(path) != expected.as_ref()) {
+                probe_fail("notification used the wrong avatar"); return false;
+            }
+        }
+        probe_step("opening a chat cancels its pending avatar notification");
+        let before = self.probe_notifications.get();
+        self.notify(&Msg { chat_id: 4, sender_id: Some(4001), text: "Already read".into(), ..Msg::default() });
+        self.clone().open_chat(4);
+        glib::timeout_future(Duration::from_millis(1000)).await;
+        if self.probe_notifications.get() != before { probe_fail("late notification after chat activation"); return false; }
+        self.close_info_panel();
+        true
+    }
+
+    async fn probe_capture(&self, name: &str) {
+        let Some(directory) = std::env::var_os("OMG_PROBE_ARTIFACTS") else { return };
+        let directory = PathBuf::from(directory);
+        if std::fs::create_dir_all(&directory).is_err() { probe_fail("create probe artifact directory"); return; }
+        for _ in 0..5 {
+            wait_for_frame(self.widget.upcast_ref()).await;
+            let Some(window) = self.window() else { return };
+            let Some(renderer) = window.renderer() else { return };
+            let paintable = gtk::WidgetPaintable::new(Some(&self.widget));
+            let snapshot = gtk::Snapshot::new();
+            let (width, height) = (self.widget.width() as f64, self.widget.height() as f64);
+            paintable.snapshot(&snapshot, width, height);
+            if let Some(node) = snapshot.to_node() {
+                let texture = renderer.render_texture(&node, Some(&gtk::graphene::Rect::new(0.0, 0.0, width as f32, height as f32)));
+                if texture.save_to_png(directory.join(format!("{name}.png"))).is_ok() { return; }
+            }
+            glib::timeout_future(Duration::from_millis(100)).await;
+        }
+        probe_fail("capture media profile screenshot");
     }
 
     async fn run_wave5d_probe(
