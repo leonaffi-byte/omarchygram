@@ -2656,12 +2656,21 @@ impl ShellInner {
             MainMenuAction::Settings | MainMenuAction::Shortcuts => self.toggle_settings(),
             MainMenuAction::About => {
                 if let Some(window) = self.window() {
-                    gtk::AlertDialog::builder()
-                        .message("Omarchygram")
-                        .detail("A Telegram client for Omarchy")
-                        .buttons(["Close"])
-                        .build()
-                        .show(Some(&window));
+                    let dialog = gtk::AboutDialog::builder()
+                        .program_name("Omarchygram")
+                        .version(env!("CARGO_PKG_VERSION"))
+                        .comments("A Telegram client for Omarchy")
+                        .website(env!("CARGO_PKG_REPOSITORY"))
+                        .website_label("GitHub")
+                        .transient_for(&window)
+                        .modal(true)
+                        .build();
+                    let weak = Rc::downgrade(&self);
+                    dialog.connect_activate_link(move |_, uri| {
+                        if let Some(this) = weak.upgrade() { this.open_in_browser(uri); }
+                        glib::Propagation::Stop
+                    });
+                    dialog.present();
                 }
             }
             MainMenuAction::LogOut => self.confirm_log_out(),
@@ -9463,6 +9472,24 @@ impl ShellInner {
         }
         self.main_menu.dismiss();
 
+        probe_step("About version and GitHub link");
+        self.clone().handle_main_menu(MainMenuAction::About);
+        let about = gtk::Window::list_toplevels().into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::AboutDialog>().ok())
+            .find(|dialog| dialog.transient_for() == self.window().map(|window| window.upcast()));
+        let Some(about) = about else { probe_fail("About dialog missing"); return };
+        if !poll_until(1000, || about.is_mapped()).await
+            || about.version().as_deref() != Some(env!("CARGO_PKG_VERSION"))
+            || about.website().as_deref() != Some(env!("CARGO_PKG_REPOSITORY")) {
+            probe_fail("About build metadata");
+            return;
+        }
+        let launches = self.probe_uri_launches.get();
+        about.emit_by_name::<bool>("activate-link", &[&env!("CARGO_PKG_REPOSITORY")]);
+        if self.probe_uri_launches.get() != launches + 1 { probe_fail("About GitHub action"); return; }
+        self.probe_capture_widget("about", about.upcast_ref()).await;
+        about.close();
+
         probe_step("archived list");
         self.chatlist.show_archived();
         if !poll_until(1000, || {
@@ -12979,16 +13006,19 @@ impl ShellInner {
     }
 
     async fn probe_capture(&self, name: &str) {
+        self.probe_capture_widget(name, self.widget.upcast_ref()).await;
+    }
+
+    async fn probe_capture_widget(&self, name: &str, widget: &gtk::Widget) {
         let Some(directory) = std::env::var_os("OMG_PROBE_ARTIFACTS") else { return };
         let directory = PathBuf::from(directory);
         if std::fs::create_dir_all(&directory).is_err() { probe_fail("create probe artifact directory"); return; }
         for _ in 0..5 {
-            wait_for_frame(self.widget.upcast_ref()).await;
-            let Some(window) = self.window() else { return };
-            let Some(renderer) = window.renderer() else { return };
-            let paintable = gtk::WidgetPaintable::new(Some(&self.widget));
+            wait_for_frame(widget).await;
+            let Some(renderer) = widget.native().and_then(|native| native.renderer()) else { return };
+            let paintable = gtk::WidgetPaintable::new(Some(widget));
             let snapshot = gtk::Snapshot::new();
-            let (width, height) = (self.widget.width() as f64, self.widget.height() as f64);
+            let (width, height) = (widget.width() as f64, widget.height() as f64);
             paintable.snapshot(&snapshot, width, height);
             if let Some(node) = snapshot.to_node() {
                 let texture = renderer.render_texture(&node, Some(&gtk::graphene::Rect::new(0.0, 0.0, width as f32, height as f32)));

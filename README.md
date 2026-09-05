@@ -104,6 +104,10 @@ Use **☰ → Quit Omarchygram**, **Ctrl+Q**, or `omarchygram --quit` to stop it
 `omarchygram --background` starts with the window hidden; login still opens a
 window when needed. This does not enable automatic startup at login.
 
+**☰ → About** shows the running version and a clickable GitHub link. After
+updating, quit and reopen the app to load the new executable; closing and
+restoring its window keeps the previous process running.
+
 Omarchygram reports online while its window is visible, focused and used within
 the last five minutes. Hiding it, moving focus elsewhere or becoming idle
 requests offline status. Ghost mode always requests offline. Telegram privacy

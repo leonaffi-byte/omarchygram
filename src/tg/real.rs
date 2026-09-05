@@ -1358,8 +1358,9 @@ async fn download_complete<D: grammers_client::media::Downloadable>(
     if complete_file(path) { return Ok(()); }
     let _permit = ctx.download_slots.acquire().await.map_err(|_| "download service stopped")?;
     let pending = crate::storage::PendingFile::new(path).map_err(|e| e.to_string())?;
-    // Keep grammers' parallel downloader and allow large files on slow
-    // links; a total-transfer deadline would restart them indefinitely.
+    // The vendored grammers patch flushes both download paths before returning.
+    // Keep its parallel downloader and allow large files on slow links; a
+    // total-transfer deadline would restart them indefinitely.
     client.download_media(media, pending.path()).await.map_err(|e| format!("download failed: {e}"))?;
     if !complete_file(pending.path()) { return Err("download returned an empty file; try again".into()); }
     let destination = path.to_owned();
@@ -4082,6 +4083,37 @@ mod media_recovery_tests {
     use super::*;
     use std::cell::Cell;
     use std::future::ready;
+
+    /// Uses the real downloader and atomic cache writer without a Telegram
+    /// connection. Small downloads used to return before Tokio's last write,
+    /// so complete_file rejected them as empty (or published a truncated file).
+    #[tokio::test]
+    async fn small_download_is_fully_written_before_cache_publication() {
+        struct Embedded(Vec<u8>);
+        impl grammers_client::media::Downloadable for Embedded {
+            fn to_raw_input_location(&self) -> Option<tl::enums::InputFileLocation> { None }
+            fn to_data(&self) -> Option<Vec<u8>> { Some(self.0.clone()) }
+            fn size(&self) -> Option<usize> { Some(self.0.len()) }
+        }
+        let session = Arc::new(grammers_session::storages::MemorySession::default());
+        let pool = SenderPool::new(session, 0);
+        let client = Client::new(pool.handle);
+        // No runner is started: an embedded download cannot make a network call.
+        let (events, _) = async_channel::unbounded();
+        let ctx = Ctx::new(0, BackendFlags::default(), events).await.unwrap();
+        let dir = std::env::temp_dir().join(format!("omg-download-flush-{}-{}", std::process::id(), random_id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("media.bin");
+        let fixture = Embedded((0..65_539).map(|i| (i % 251) as u8).collect());
+        for _ in 0..16 {
+            download_complete(&client, &ctx, &fixture, &path, false).await.unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), fixture.0, "cache must include the final bytes immediately");
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            std::fs::remove_file(&path).unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "no partial files remain");
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn cold_history_reference_is_fetched_before_download() {

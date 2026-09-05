@@ -1,13 +1,19 @@
 [package]
 name = "omarchygram"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+repository = "https://github.com/leonaffi-byte/omarchygram"
 
 [features]
 # Voice/video calls via the vendored ntgcalls static lib (LGPL-3; see bin/fetch-ntgcalls).
 # Included by default; --no-default-features is an explicit build without calls.
 default = ["calls"]
 calls = ["dep:ntgcalls"]
+
+# 0.10.0 returns before its final asynchronous file write completes. Keep the
+# upstream downloader (including parallel large transfers) with two flushes.
+[patch.crates-io]
+grammers-client = { path = "vendor/grammers-client" }
 
 # Wave 8A optimization (specs/spec-wave8.md): smaller + faster release binary.
 # codegen-units = 1 + opt-level = 3 optimize the whole crate as a unit; strip
