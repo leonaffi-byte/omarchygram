@@ -153,7 +153,7 @@ pub fn key_actions() -> &'static [KeyAction] {
 #[serde(default)]
 pub struct AiSettings {
     pub enabled: bool,
-    /// Transcribe voice messages automatically when they arrive/open.
+    /// Transcribe only new incoming voice messages received while enabled.
     pub transcribe_auto: bool,
     /// Provider ids ("" = auto-detect best available): ollama, anthropic,
     /// openai, groq, gemini for chat; whisper, groq, openai for transcribe.

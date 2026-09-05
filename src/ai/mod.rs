@@ -517,17 +517,7 @@ pub async fn transcribe(prefs: &Prefs, path: &Path) -> Result<Transcript, String
 }
 
 async fn audio_api(name: &str, base: &str, key: &str, model: &str, path: &Path) -> Result<String, String> {
-    // Never leak chat/message ids (the cache filename) to a vendor.
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("ogg");
-    let fname = format!("audio.{ext}");
-    let mime = match path.extension().and_then(|e| e.to_str()) {
-        Some("oga") | Some("ogg") | Some("opus") => "audio/ogg",
-        Some("mp3") => "audio/mpeg",
-        Some("wav") => "audio/wav",
-        Some("m4a") | Some("mp4") => "audio/mp4",
-        _ => "application/octet-stream",
-    };
-    let part = reqwest::multipart::Part::file(path).await.map_err(|e| format!("read audio: {e}"))?.file_name(fname).mime_str(mime).map_err(|e| e.to_string())?;
+    let part = audio_part(path).await?;
     let form = reqwest::multipart::Form::new().text("model", model.to_string()).part("file", part);
     let resp = client()?
         .post(format!("{base}/audio/transcriptions"))
@@ -539,10 +529,46 @@ async fn audio_api(name: &str, base: &str, key: &str, model: &str, path: &Path) 
     let status = resp.status();
     let text = resp.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(http_err(name, status, &text));
+        return Err(http_err(name, status, &text).replace(key, "[redacted]"));
     }
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("{name}: bad json: {e}"))?;
     v.get("text").and_then(|t| t.as_str()).map(|s| s.trim().to_string()).ok_or_else(|| format!("{name}: no text in response"))
+}
+
+/// Cache extensions are not a reliable format indicator: Telegram voice notes
+/// commonly have no filename and older cache entries end in .bin. Inspect a
+/// small header, keep streaming the original bytes, and use an anonymous name.
+async fn audio_part(path: &Path) -> Result<reqwest::multipart::Part, String> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await.map_err(|e| format!("read audio: {e}"))?;
+    let mut header = Vec::with_capacity(64);
+    file.take(64).read_to_end(&mut header).await.map_err(|e| format!("read audio: {e}"))?;
+    if header.is_empty() { return Err("Voice message file is empty. Download it again and retry.".into()); }
+    let (ext, mime) = audio_format(&header, path)
+        .ok_or_else(|| "Unsupported audio format. Download the voice message again and retry.".to_string())?;
+    reqwest::multipart::Part::file(path).await.map_err(|e| format!("read audio: {e}"))?
+        .file_name(format!("audio.{ext}"))
+        .mime_str(mime).map_err(|e| e.to_string())
+}
+
+fn audio_format(header: &[u8], path: &Path) -> Option<(&'static str, &'static str)> {
+    let ext = if header.starts_with(b"OggS") { "ogg" }
+        else if header.starts_with(b"fLaC") { "flac" }
+        else if header.starts_with(b"RIFF") && header.get(8..12) == Some(b"WAVE") { "wav" }
+        else if header.starts_with(b"ID3") || (header.len() >= 2 && header[0] == 0xff && header[1] & 0xe0 == 0xe0) { "mp3" }
+        else if header.get(4..8) == Some(b"ftyp") { "mp4" }
+        else if header.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) { "webm" }
+        else { "" };
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    match if ext.is_empty() { extension.as_str() } else { ext } {
+        "ogg" | "oga" | "opus" => Some(("ogg", "audio/ogg")),
+        "mp3" | "mpeg" | "mpga" => Some(("mp3", "audio/mpeg")),
+        "wav" => Some(("wav", "audio/wav")),
+        "flac" => Some(("flac", "audio/flac")),
+        "mp4" | "m4a" => Some(("mp4", "audio/mp4")),
+        "webm" => Some(("webm", "audio/webm")),
+        _ => None,
+    }
 }
 
 /// Removes the temp wav on every exit path.
@@ -615,4 +641,71 @@ async fn process_output(command: &mut tokio::process::Command, timeout: Duration
         tokio::try_join!(child.wait(), read(stdout, 8 * 1024 * 1024), read(stderr, 256 * 1024))
     }).await.map_err(|_| format!("{name} timed out"))?.map_err(|e| format!("{name}: {e}"))?;
     Ok(std::process::Output { status, stdout, stderr })
+}
+
+#[cfg(test)]
+mod audio_upload_tests {
+    use super::*;
+
+    #[test]
+    fn audio_headers_override_missing_or_misleading_cache_extensions() {
+        for name in ["cached.bin", "voice", "voice.OGA", "incorrect.mp3"] {
+            assert_eq!(audio_format(b"OggS\0fixture", Path::new(name)), Some(("ogg", "audio/ogg")));
+        }
+        for (header, ext, mime) in [
+            (&b"fLaCfixture"[..], "flac", "audio/flac"),
+            (&b"RIFF1234WAVE"[..], "wav", "audio/wav"),
+            (&b"ID3fixture"[..], "mp3", "audio/mpeg"),
+            (&b"\0\0\0\x20ftypM4A "[..], "mp4", "audio/mp4"),
+            (&b"\x1a\x45\xdf\xa3fixture"[..], "webm", "audio/webm"),
+        ] {
+            assert_eq!(audio_format(header, Path::new("cached.bin")), Some((ext, mime)));
+        }
+        assert_eq!(audio_format(b"unrecognized", Path::new("voice.OPUS")), Some(("ogg", "audio/ogg")));
+        assert_eq!(audio_format(b"unrecognized", Path::new("voice.bin")), None);
+    }
+
+    #[tokio::test]
+    async fn bin_voice_upload_has_supported_name_mime_and_unchanged_bytes() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/openai/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut buffer = [0u8; 1024];
+                let n = socket.read(&mut buffer).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break end + 4; }
+                assert!(bytes.len() < 8192);
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
+            let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap().trim().parse().unwrap();
+            assert!(length < 8192);
+            while bytes.len() < header_end + length {
+                let mut buffer = [0u8; 1024];
+                let n = socket.read(&mut buffer).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+            }
+            let response = r#"{"text":"fixture transcript"}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            String::from_utf8(bytes[header_end..].to_vec()).unwrap()
+        });
+        let path = std::env::temp_dir().join(format!("omg-audio-upload-{}-987_654.bin", std::process::id()));
+        std::fs::write(&path, b"OggSoriginal-fixture-bytes").unwrap();
+        // A local test server needs no credential. This stub never leaves localhost.
+        let result = audio_api("fixture", &base, "test-only", "whisper-large-v3-turbo", &path).await;
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result.unwrap(), "fixture transcript");
+        let body = server.join().unwrap();
+        assert!(body.contains("filename=\"audio.ogg\""));
+        assert!(body.contains("Content-Type: audio/ogg") || body.contains("content-type: audio/ogg"));
+        assert!(body.contains("OggSoriginal-fixture-bytes"));
+        assert!(!body.contains("987_654"));
+    }
 }

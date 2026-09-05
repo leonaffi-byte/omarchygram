@@ -204,7 +204,7 @@ edit the file by hand). Everything below is off until you turn it on.
   through), *Keep edit history* (right-click an edited message → Edit history).
   Messages are recorded in a local archive at
   `~/.local/share/omarchygram/accounts/<account-id>/archive.sqlite` (private to your user and separated by Telegram account). Older unscoped history can be imported from Settings → Privacy after confirming which account it belongs to; the original file is preserved.
-- **AI** — enable the Assistant chat and the AI actions; auto-transcribe voice
+- **AI** — enable the Assistant chat and the AI actions; auto-transcribe new incoming voice
   messages; pin a provider/model if you don't want auto-detection.
 - **Omarchy actions** — enable the Omarchy chat; allow shell commands (each one
   is confirmed in a dialog before it runs).
@@ -213,6 +213,14 @@ Right-click any message for Copy, Reply, Edit, Delete, Copy message id / user
 id, and — with AI on — Draft reply, Translate, Summarize. Voice messages get a
 *transcribe* button. "Jump…" in the header jumps to a date; ▼ returns to the
 latest messages.
+
+**Auto-transcribe voice** applies only to new incoming voice messages received
+while the app is running and the setting is enabled, including in the
+background. Enabling it, reopening a chat, loading history, or receiving an edit
+does not transcribe older messages. One automatic transcription runs at a time;
+manual transcription remains available. Turning auto off cancels its queued and
+active work. Groq uploads recognize the audio format even for older `.bin`
+cache files, without converting the recording.
 
 ## Assistant and Omarchy chats
 

@@ -57,6 +57,22 @@ use super::virtual_chat::{
 };
 
 const LOG_RING_CAPACITY: usize = 128;
+const MAX_AUTO_TRANSCRIPTIONS: usize = 64;
+
+struct TranscriptionJob {
+    automatic: bool,
+    task: glib::JoinHandle<()>,
+}
+
+fn fresh_voice(message: &Msg, enabled_since: Option<i64>) -> bool {
+    enabled_since.is_some_and(|since| message.ts.timestamp() >= since)
+        && message.id > 0 && !message.outgoing && !message.deleted
+        && message.media == Some(MediaKind::Voice) && !is_virtual(message.chat_id)
+}
+
+fn transcription_chat(chat_id: i64) -> i64 {
+    crate::tg::split_topic_chat_id(chat_id).map(|(forum, _)| forum).unwrap_or(chat_id)
+}
 const PROBE_API_HASH: &str = "0123456789abcdef0123456789abcdef";
 
 thread_local! {
@@ -791,11 +807,12 @@ struct ShellInner {
     mark_reads: RefCell<HashMap<i64, ReadState>>,
     last_by_chat: RefCell<HashMap<i64, Msg>>,
     settings_gen: Cell<u64>,
-    last_applied_settings: RefCell<Settings>,
     tombstones: RefCell<HashMap<i64, HashSet<i32>>>,
     virtual_stores: RefCell<HashMap<i64, VirtualStore>>,
     aux: RefCell<AuxState>,
-    transcription_active: RefCell<HashSet<(i64, i32)>>,
+    transcription_active: RefCell<HashMap<(i64, i32), TranscriptionJob>>,
+    transcription_queue: RefCell<VecDeque<(i64, i32)>>,
+    auto_transcribe_since: Cell<Option<i64>>,
     recent_real_chats: RefCell<Vec<i64>>,
     recent_incoming: RefCell<HashMap<i64, DateTime<Local>>>,
     flags_initialized: Cell<bool>,
@@ -885,7 +902,6 @@ impl Shell {
         let video_fullscreen = player::Fullscreen::new();
         player::install_fullscreen(video_fullscreen.clone());
         let switcher = Switcher::new();
-        let last_applied_settings = settings.get();
         let settings_view = SettingsView::new(settings.clone(), effects.clone());
         let local = LocalServices::spawn();
 
@@ -1056,11 +1072,12 @@ impl Shell {
             mark_reads: RefCell::new(HashMap::new()),
             last_by_chat: RefCell::new(HashMap::new()),
             settings_gen: Cell::new(0),
-            last_applied_settings: RefCell::new(last_applied_settings),
             tombstones: RefCell::new(HashMap::new()),
             virtual_stores: RefCell::new(virtual_stores),
             aux: RefCell::new(AuxState::default()),
-            transcription_active: RefCell::new(HashSet::new()),
+            transcription_active: RefCell::new(HashMap::new()),
+            transcription_queue: RefCell::new(VecDeque::new()),
+            auto_transcribe_since: Cell::new(None),
             recent_real_chats: RefCell::new(Vec::new()),
             recent_incoming: RefCell::new(HashMap::new()),
             flags_initialized: Cell::new(false),
@@ -1636,6 +1653,8 @@ impl ShellInner {
         if !self.session_ready.replace(false) {
             return;
         }
+        self.auto_transcribe_since.set(None);
+        self.cancel_transcriptions(false);
         // Story content is account-scoped and sits above the auth stack.
         // Tear it down synchronously before any logout await can yield.
         self.stories_generation
@@ -1709,6 +1728,7 @@ impl ShellInner {
                 // backend loses the final reference.
                 self.messages.retire_player_media_session();
                 self.me.borrow_mut().take();
+                self.aux.borrow_mut().transcripts.clear();
                 self.chat_info.borrow_mut().clear();
                 self.drafts.borrow_mut().clear();
                 // Only a logout that succeeded zeroes the bar badge; a failed
@@ -1742,12 +1762,14 @@ impl ShellInner {
     /// Push settings into the UI and the backend (clock, ghost pill, message
     /// time format, backend flags). Called on READY and on every change.
     fn apply_settings(self: &Rc<Self>, settings: &Settings) {
-        let transcribe_auto_just_enabled = {
-            let mut previous = self.last_applied_settings.borrow_mut();
-            let just_enabled = !previous.ai.transcribe_auto && settings.ai.transcribe_auto;
-            *previous = settings.clone();
-            just_enabled
-        };
+        if settings.ai.enabled && settings.ai.transcribe_auto && self.session_ready.get() {
+            if self.auto_transcribe_since.get().is_none() {
+                self.auto_transcribe_since.set(Some(Local::now().timestamp()));
+            }
+        } else {
+            self.auto_transcribe_since.set(None);
+            self.cancel_transcriptions(settings.ai.enabled);
+        }
         let generation = self.settings_gen.get().wrapping_add(1);
         self.settings_gen.set(generation);
         self.messages.set_time_format(settings.time_format());
@@ -1792,8 +1814,6 @@ impl ShellInner {
             let epoch = self.bump_epoch();
             self.open_chat.set(None);
             self.messages.clear_selection(epoch);
-        } else if settings.ai.enabled && transcribe_auto_just_enabled {
-            self.arm_visible_transcriptions();
         }
         let flags = BackendFlags {
             ghost_mode: settings.ghost_mode,
@@ -5271,6 +5291,7 @@ impl ShellInner {
         if !own && !message.deleted && (!active || !is_open) {
             self.notify(&message);
         }
+        self.queue_auto_transcription(&message);
     }
 
     fn notify(self: &Rc<Self>, message: &Msg) {
@@ -8414,31 +8435,8 @@ impl ShellInner {
     fn post_render(self: &Rc<Self>, ids: Vec<i32>) {
         self.resolve_missing_quotes();
         self.start_image_downloads(ids.clone());
-        let settings = self.settings.get();
         for msg_id in ids {
             self.render_aux_for(msg_id);
-            if self.messages.media_kind(msg_id) != Some(MediaKind::Voice) || !settings.ai.enabled {
-                continue;
-            }
-            let state = self.open_chat.get().and_then(|chat_id| {
-                self.aux
-                    .borrow()
-                    .transcripts
-                    .get(&(chat_id, msg_id))
-                    .cloned()
-            });
-            match state {
-                Some(ReqState::InFlight) if !self.messages.has_media_continuation(msg_id) => {
-                    let key = (self.open_chat.get().unwrap_or_default(), msg_id);
-                    if !self.transcription_active.borrow().contains(&key) {
-                        self.clone().arm_transcription(msg_id);
-                    }
-                }
-                None if settings.ai.transcribe_auto => {
-                    self.clone().request_transcription(msg_id);
-                }
-                _ => {}
-            }
         }
         if self.messages.search_is_open() {
             self.refresh_in_chat_search();
@@ -8496,7 +8494,7 @@ impl ShellInner {
         let (transcript, translation, summary) = {
             let aux = self.aux.borrow();
             (
-                done_text(aux.transcripts.get(&key)),
+                done_text(aux.transcripts.get(&(transcription_chat(chat_id), msg_id))),
                 done_text(aux.translations.get(&key)),
                 done_text(aux.summaries.get(&key)),
             )
@@ -8509,121 +8507,93 @@ impl ShellInner {
         );
     }
 
-    fn arm_visible_transcriptions(self: &Rc<Self>) {
-        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+    // Rendering cached/history rows never dispatches transcription. Only a
+    // fresh incoming event may enter this bounded queue, including while hidden.
+    fn queue_auto_transcription(self: &Rc<Self>, message: &Msg) {
+        if !fresh_voice(message, self.auto_transcribe_since.get()) { return; }
+        let key = (transcription_chat(message.chat_id), message.id);
+        if self.aux.borrow().transcripts.contains_key(&key) { return; }
+        if self.transcription_queue.borrow().len() >= MAX_AUTO_TRANSCRIPTIONS {
+            self.aux.borrow_mut().transcripts.insert(key, ReqState::Failed(
+                "Automatic transcription is busy. Use Transcribe to try this message.".into()));
             return;
-        };
-        let ids: Vec<i32> = self
-            .messages
-            .messages()
-            .into_iter()
-            .filter(|message| message.media == Some(MediaKind::Voice))
-            .map(|message| message.id)
-            .collect();
-        for msg_id in ids {
-            let key = (chat_id, msg_id);
-            let state = self.aux.borrow().transcripts.get(&key).cloned();
-            match state {
-                Some(ReqState::InFlight)
-                    if !self.messages.has_media_continuation(msg_id)
-                        && !self.transcription_active.borrow().contains(&key) =>
-                {
-                    self.clone().arm_transcription(msg_id);
-                }
-                None => self.clone().request_transcription(msg_id),
-                Some(ReqState::InFlight | ReqState::Done(_) | ReqState::Failed(_)) => {}
+        }
+        self.aux.borrow_mut().transcripts.insert(key, ReqState::InFlight);
+        self.transcription_queue.borrow_mut().push_back(key);
+        self.drive_auto_transcriptions();
+    }
+
+    fn drive_auto_transcriptions(self: &Rc<Self>) {
+        if self.auto_transcribe_since.get().is_none() || !self.session_ready.get()
+            || self.transcription_active.borrow().values().any(|job| job.automatic) {
+            return;
+        }
+        let next = self.transcription_queue.borrow_mut().pop_front();
+        if let Some(key) = next { self.start_transcription(key, true); }
+    }
+
+    fn cancel_transcriptions(&self, automatic_only: bool) {
+        let mut cancelled: Vec<_> = self.transcription_queue.borrow_mut().drain(..).collect();
+        self.transcription_active.borrow_mut().retain(|key, job| {
+            if !automatic_only || job.automatic {
+                job.task.abort();
+                cancelled.push(*key);
+                false
+            } else { true }
+        });
+        let mut aux = self.aux.borrow_mut();
+        for key in cancelled {
+            if matches!(aux.transcripts.get(&key), Some(ReqState::InFlight)) {
+                aux.transcripts.insert(key, ReqState::Failed("Transcription cancelled. Use Transcribe to retry.".into()));
             }
         }
     }
 
     fn request_transcription(self: Rc<Self>, msg_id: i32) {
-        if !self.settings.get().ai.enabled {
+        if !self.settings.get().ai.enabled || !self.session_ready.get() { return; }
+        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else { return; };
+        if self.messages.media_kind(msg_id) != Some(MediaKind::Voice) { return; }
+        let key = (transcription_chat(chat_id), msg_id);
+        if self.transcription_active.borrow().contains_key(&key)
+            || matches!(self.aux.borrow().transcripts.get(&key), Some(ReqState::Done(_))) {
             return;
         }
-        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
-            return;
-        };
-        if self.messages.media_kind(msg_id) != Some(MediaKind::Voice) {
-            return;
-        }
-        let key = (chat_id, msg_id);
-        {
-            let mut aux = self.aux.borrow_mut();
-            if matches!(
-                aux.transcripts.get(&key),
-                Some(ReqState::InFlight | ReqState::Done(_))
-            ) {
-                return;
-            }
-            aux.transcripts.insert(key, ReqState::InFlight);
-        }
-        // Remove a prior transcript error while preserving any completed
-        // translation or summary already rendered for this message.
+        // A manual click bypasses the automatic queue. One automatic job leaves
+        // the provider's second slot available for an explicit request.
+        self.transcription_queue.borrow_mut().retain(|queued| *queued != key);
+        self.aux.borrow_mut().transcripts.insert(key, ReqState::InFlight);
         self.render_aux_for(msg_id);
-        self.arm_transcription(msg_id);
+        self.start_transcription(key, false);
     }
 
-    fn arm_transcription(self: Rc<Self>, msg_id: i32) {
-        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
-            return;
-        };
-        if self.messages.has_media_continuation(msg_id) {
-            return;
-        }
-        let weak = Rc::downgrade(&self);
-        if !self.messages.on_media_ready(msg_id, move |path| {
-            if let Some(this) = weak.upgrade() {
-                this.start_transcription_path(chat_id, msg_id, path);
-            }
-        }) {
-            self.fail_transcription(chat_id, msg_id, "voice message is unavailable".into());
-            return;
-        }
-        if matches!(
-            self.messages.media_state(msg_id),
-            Some(MediaState::NotStarted | MediaState::Failed)
-        ) {
-            self.clone().start_media_download(msg_id, false);
-            if matches!(self.messages.media_state(msg_id), Some(MediaState::Failed)) {
-                self.messages.drop_media_continuations(msg_id);
-                self.fail_transcription(chat_id, msg_id, "voice message is unavailable".into());
-            }
-        }
-    }
-
-    fn start_transcription_path(self: Rc<Self>, chat_id: i64, msg_id: i32, path: PathBuf) {
-        if !matches!(
-            self.aux.borrow().transcripts.get(&(chat_id, msg_id)),
-            Some(ReqState::InFlight)
-        ) {
-            return;
-        }
-        if !self
-            .transcription_active
-            .borrow_mut()
-            .insert((chat_id, msg_id))
-        {
-            return;
-        }
+    fn start_transcription(self: &Rc<Self>, key: (i64, i32), automatic: bool) {
+        let (chat_id, msg_id) = key;
+        let session = self.session_epoch.get();
         let prefs = ai_prefs(&self.settings.get());
-        glib::MainContext::default().spawn_local(async move {
-            let result = self.local.transcribe(prefs, path).await;
-            self.transcription_active
-                .borrow_mut()
-                .remove(&(chat_id, msg_id));
+        let tg = self.tg.clone();
+        let local = self.local.clone();
+        let weak = Rc::downgrade(self);
+        let task = glib::MainContext::default().spawn_local(async move {
+            let result = async {
+                let path = tg.download_media(chat_id, msg_id).await?
+                    .ok_or_else(|| "Voice message is unavailable".to_string())?;
+                local.transcribe(prefs, path).await
+            }.await;
+            let Some(this) = weak.upgrade().filter(|this| this.session_ready.get()
+                && this.session_epoch.get() == session) else { return; };
+            this.transcription_active.borrow_mut().remove(&key);
             match result {
                 Ok(transcript) => {
-                    self.aux
-                        .borrow_mut()
-                        .transcripts
-                        .insert((chat_id, msg_id), ReqState::Done(transcript.text));
-                    if self.open_chat.get() == Some(chat_id) {
-                        self.render_aux_for(msg_id);
+                    this.aux.borrow_mut().transcripts.insert(key, ReqState::Done(transcript.text));
+                    if this.open_chat_is(chat_id) && this.messages.contains(msg_id) {
+                        this.render_aux_for(msg_id);
                     }
                 }
-                Err(error) => self.fail_transcription(chat_id, msg_id, error),
+                Err(error) => this.fail_transcription(chat_id, msg_id, error),
             }
+            this.drive_auto_transcriptions();
         });
+        self.transcription_active.borrow_mut().insert(key, TranscriptionJob { automatic, task });
     }
 
     fn fail_transcription(&self, chat_id: i64, msg_id: i32, error: String) {
@@ -8638,7 +8608,7 @@ impl ShellInner {
             .borrow_mut()
             .transcripts
             .insert(key, ReqState::Failed(error.clone()));
-        if self.open_chat.get() == Some(chat_id) && self.messages.contains(msg_id) {
+        if self.open_chat_is(chat_id) && self.messages.contains(msg_id) {
             self.messages.show_aux_error(msg_id, &error);
         }
     }
@@ -8883,26 +8853,7 @@ impl ShellInner {
                         if self.viewer.chat_id() == Some(chat_id) {
                             self.viewer.show_error(msg_id, self.viewer_generation.get(), "Image unavailable");
                         }
-                        let transcription_requested = kind == MediaKind::Voice
-                            && matches!(
-                                self.aux.borrow().transcripts.get(&(chat_id, msg_id)),
-                                Some(ReqState::InFlight)
-                            );
-                        let accepted =
-                            self.messages.fail_media(msg_id, media_generation, false);
-                        if accepted && transcription_requested && self.tg.is_mock {
-                            self.clone().start_transcription_path(
-                                chat_id,
-                                msg_id,
-                                PathBuf::from(format!("mock-voice-{chat_id}-{msg_id}.ogg")),
-                            );
-                        } else if accepted && transcription_requested {
-                            self.fail_transcription(
-                                chat_id,
-                                msg_id,
-                                "voice message is unavailable".into(),
-                            );
-                        }
+                        self.messages.fail_media(msg_id, media_generation, false);
                     }
                 }
                 Err(error) => {
@@ -8913,9 +8864,6 @@ impl ShellInner {
                     if self.is_current(chat_id, epoch) && self.messages.contains(msg_id)
                         && self.messages.fail_media(msg_id, media_generation, true) {
                             self.messages.show_error(&error);
-                            if kind == MediaKind::Voice {
-                                self.fail_transcription(chat_id, msg_id, error);
-                            }
                         }
                 }
             }
@@ -11740,6 +11688,7 @@ impl ShellInner {
             probe_fail("voice transcript dedupe");
             return;
         }
+        if !self.probe_auto_transcription(mom).await { return; }
 
         self.clone().open_chat(marta);
         probe_step("draft target");
@@ -13002,6 +12951,80 @@ impl ShellInner {
         glib::timeout_future(Duration::from_millis(1000)).await;
         if self.probe_notifications.get() != before { probe_fail("late notification after chat activation"); return false; }
         self.close_info_panel();
+        true
+    }
+
+    async fn probe_auto_transcription(self: &Rc<Self>, mom: i64) -> bool {
+        let previous = self.settings.get().ai.transcribe_auto;
+        self.settings.update(|s| s.ai.transcribe_auto = false);
+        self.clone().open_chat(8);
+        if !poll_until(3000, || self.open_chat.get() == Some(8) && self.messages.contains(800)
+            && !self.messages.is_loading()).await {
+            probe_fail("auto transcription voice fixture"); return false;
+        }
+        let Some(mut voice) = self.messages.message(800) else { return false };
+        self.aux.borrow_mut().transcripts.remove(&(8, 800));
+
+        probe_step("auto transcription never backfills loaded or cached history");
+        self.settings.update(|s| s.ai.transcribe_auto = true);
+        self.post_render(vec![800]);
+        self.clone().open_chat(mom);
+        self.clone().open_chat(8);
+        if !poll_until(3000, || self.open_chat.get() == Some(8) && !self.messages.is_loading()).await {
+            probe_fail("auto transcription cached history"); return false;
+        }
+        voice.ts = Local::now() - chrono::Duration::hours(1);
+        self.handle_event(Event::MessageChanged(voice.clone()));
+        self.handle_event(Event::NewMessage(voice.clone()));
+        glib::timeout_future(Duration::from_millis(100)).await;
+        if self.aux.borrow().transcripts.contains_key(&(8, 800))
+            || !self.transcription_active.borrow().is_empty() || !self.transcription_queue.borrow().is_empty() {
+            probe_fail("old history or replay started automatic transcription"); return false;
+        }
+
+        probe_step("new incoming voice transcribes once in a closed chat");
+        self.clone().open_chat(mom);
+        if !poll_until(3000, || self.open_chat.get() == Some(mom) && self.messages.contains(301)
+            && !self.messages.is_loading()).await { probe_fail("auto transcription background chat"); return false; }
+        voice.ts = Local::now();
+        self.handle_event(Event::NewMessage(voice.clone()));
+        self.handle_event(Event::NewMessage(voice.clone()));
+        if self.transcription_active.borrow().len() != 1 || !self.transcription_queue.borrow().is_empty() {
+            probe_fail("automatic voice event deduplication"); return false;
+        }
+
+        probe_step("manual transcription remains available beside automatic work");
+        self.aux.borrow_mut().transcripts.remove(&(mom, 301));
+        self.clone().request_transcription(301);
+        if self.transcription_active.borrow().len() != 2 {
+            probe_fail("manual transcription was queued behind automatic work"); return false;
+        }
+        if !poll_until(3500, || {
+            let aux = self.aux.borrow();
+            matches!(aux.transcripts.get(&(8, 800)), Some(ReqState::Done(_)))
+                && matches!(aux.transcripts.get(&(mom, 301)), Some(ReqState::Done(_)))
+        }).await { probe_fail("automatic and manual transcription completion"); return false; }
+
+        probe_step("automatic bursts are bounded and disabling cancels pending work");
+        for index in 0..MAX_AUTO_TRANSCRIPTIONS + 3 {
+            let mut incoming = voice.clone();
+            incoming.id = 100_000 + index as i32;
+            self.queue_auto_transcription(&incoming);
+        }
+        if self.transcription_active.borrow().len() != 1
+            || self.transcription_queue.borrow().len() != MAX_AUTO_TRANSCRIPTIONS {
+            probe_fail("automatic transcription queue bound"); return false;
+        }
+        self.settings.update(|s| s.ai.transcribe_auto = false);
+        if !self.transcription_active.borrow().is_empty() || !self.transcription_queue.borrow().is_empty() {
+            probe_fail("disabling auto transcription did not cancel work"); return false;
+        }
+        glib::timeout_future(Duration::from_millis(400)).await;
+        if self.aux.borrow().transcripts.iter().any(|((chat, id), state)| *chat == 8 && *id >= 100_000
+            && matches!(state, ReqState::InFlight | ReqState::Done(_))) {
+            probe_fail("cancelled transcription completed late"); return false;
+        }
+        self.settings.update(|s| s.ai.transcribe_auto = previous);
         true
     }
 
@@ -15346,6 +15369,26 @@ fn should_report_online(visible: bool, focused: bool, inactive_for: Duration) ->
 
 #[cfg(test)]
 mod wave5_tests {
+    #[test]
+    fn auto_transcription_accepts_only_fresh_incoming_voice() {
+        use super::{fresh_voice, transcription_chat, MediaKind, Msg};
+        use chrono::{Local, TimeZone};
+        let mut message = Msg { id: 1, chat_id: 2, media: Some(MediaKind::Voice),
+            ts: Local.timestamp_opt(1000, 0).unwrap(), ..Msg::default() };
+        assert!(fresh_voice(&message, Some(1000)));
+        assert!(!fresh_voice(&message, None));
+        assert!(!fresh_voice(&message, Some(1001)), "reconnect backlog is older than activation");
+        message.outgoing = true;
+        assert!(!fresh_voice(&message, Some(999)));
+        message.outgoing = false;
+        message.deleted = true;
+        assert!(!fresh_voice(&message, Some(999)));
+        message.deleted = false;
+        message.media = Some(MediaKind::Audio);
+        assert!(!fresh_voice(&message, Some(999)));
+        let forum = -1_000_000_123_456;
+        assert_eq!(transcription_chat(crate::tg::topic_chat_id(forum, 7)), forum);
+    }
     #[test]
     fn presence_requires_visible_focused_recent_activity() {
         use super::should_report_online;

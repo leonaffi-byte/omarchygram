@@ -637,7 +637,7 @@ impl SettingsView {
         );
         self.add_switch(
             store,
-            &ai, ("Auto-transcribe voice", "Transcribe voice messages automatically when they arrive."),
+            &ai, ("Auto-transcribe voice", "Transcribe new incoming voice messages while the app is running, including in the background. Older messages stay manual. Turning this off cancels automatic work."),
             initial.ai.transcribe_auto,
             |s, v| s.ai.transcribe_auto = v,
             |s| s.ai.transcribe_auto,
