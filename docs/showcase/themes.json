@@ -1,0 +1,34 @@
+{
+  "name": "themes",
+  "source_frames": 149,
+  "capture_elapsed_seconds": 12.3301,
+  "mean_capture_fps": 12.0,
+  "output_fps": 25,
+  "speed": 1,
+  "renderer": "cairo",
+  "scene": {
+    "renderer": "cairo",
+    "capture_fps": 12,
+    "title": "Your theme, throughout",
+    "theme": "tokyo-night",
+    "chat": "Marta",
+    "ms": 12500,
+    "info": true,
+    "themes": [
+      [
+        4,
+        "gruvbox"
+      ],
+      [
+        7,
+        "catppuccin"
+      ],
+      [
+        10,
+        "catppuccin-latte"
+      ]
+    ]
+  },
+  "gif_bytes": 1099213,
+  "sha256": "26505884ad8b52a1a7a64ff8d5631432e2a458169fe545fe9d94192b9dc26f30"
+}

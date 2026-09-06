@@ -2972,7 +2972,7 @@ impl ShellInner {
         };
         self.probe_notifications
             .set(self.probe_notifications.get().wrapping_add(1));
-        if self.probe {
+        if self.probe || !application.is_registered() {
             return;
         }
         let title = glib::markup_escape_text(title);
@@ -2982,7 +2982,8 @@ impl ShellInner {
     }
 
     fn withdraw_call_notification(&self) {
-        if let Some(application) = self.window().and_then(|window| window.application()) {
+        if let Some(application) = self.window().and_then(|window| window.application())
+            && application.is_registered() {
             application.withdraw_notification("incoming-call");
         }
     }
@@ -5374,7 +5375,9 @@ impl ShellInner {
             let Some(this) = weak.upgrade() else { return };
             if this.pending_notifications.borrow().get(&chat_id) != Some(&sequence) { return; }
             this.pending_notifications.borrow_mut().remove(&chat_id);
-            if !this.is_session_current(session)
+            // The avatar lookup can complete during application shutdown,
+            // after GApplication has unregistered from the session bus.
+            if !application.is_registered() || !this.is_session_current(session)
                 || (this.window_is_active() && this.open_chat.get().is_some_and(|id| dialog_id(id) == avatar_peer))
                 || effective_mute(this.pending_mutes.borrow().get(&chat_id).copied(),
                     this.chatlist.summary(avatar_peer).map(|chat| chat.muted)) { return; }

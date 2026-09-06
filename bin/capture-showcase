@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Capture the README's offline demos. Every GUI run uses bin/headless."""
+
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+DEST = ROOT / "docs/showcase"
+WORK = ROOT / "target/readme-showcase"
+ART = DEST / "artwork"
+THEMES = Path("/usr/share/omarchy/themes")
+FONT = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"
+RENDERER = os.environ.get("OMG_SHOWCASE_RENDERER")
+QUIET = """[animations]
+entrynone = true
+sendnone = true
+switchnone = true
+thememorph = true
+"""
+ANIMATED = """[animations]
+typewriter = true
+phosphorburn = true
+cascade = true
+ellipsis = true
+badgepop = true
+onlinebreathe = true
+receiptdraw = true
+thememorph = true
+sendnone = true
+flicker = false
+staticerror = false
+"""
+CLIPS = {
+    "speed": {
+        "renderer": "cairo",
+        "title": "Quick chat switching",
+        "theme": "tokyo-night", "chat": "Marta", "ms": 11500,
+        "env": {"OMG_SMOKE_OPEN_SEQUENCE": "Deni@1900,Polls@3400,Saved Messages@4900,Omarchy Bot@6400,Marta@7900,Deni@9400,Marta@10300"},
+    },
+    "animations": {
+        "renderer": "cairo",
+        "title": "A little motion. Your choice.",
+        "theme": "catppuccin", "chat": "Marta", "ms": 12000,
+        "animated": True,
+        "env": {"OMG_MOCK_LIVE_MS": "2600", "OMG_SMOKE_OPEN_SEQUENCE": "Deni@1600,Marta@3200"},
+    },
+    "themes": {
+        "renderer": "cairo",
+        "capture_fps": 12,
+        "title": "Your theme, throughout",
+        "theme": "tokyo-night", "chat": "Marta", "ms": 12500,
+        "info": True,
+        "themes": [(4, "gruvbox"), (7, "catppuccin"), (10, "catppuccin-latte")],
+    },
+}
+STILLS = {
+    "hero": {"theme": "tokyo-night", "chat": "Marta", "info": True},
+    "catppuccin": {"theme": "catppuccin", "chat": "Marta", "info": True},
+    "gruvbox": {"theme": "gruvbox", "chat": "Marta", "info": True},
+    "light": {"theme": "catppuccin-latte", "chat": "Marta", "info": True},
+}
+
+
+def run(args, **kwargs):
+    return subprocess.run(args, cwd=ROOT, check=True, **kwargs)
+
+
+def artwork():
+    dest = WORK / "artwork"
+    dest.mkdir(parents=True, exist_ok=True)
+    for number, name in {1: "marta", 100: "ridge", 103: "ridge"}.items():
+        target = dest / f"{number}.png"
+        if target.is_symlink():
+            target.unlink()
+        shutil.copyfile(ART / f"{name}.png", target)
+    for number, name in {4: "group", 106: "trail", 4001: "robin"}.items():
+        run(["magick", "-background", "none", str(ART / f"{name}.svg"), str(dest / f"{number}.png")])
+    return dest
+
+
+def set_theme(state, name):
+    dest = state / "omarchy/current/theme"
+    dest.mkdir(parents=True, exist_ok=True)
+    # Write in place: the running app watches this file, just as on Omarchy.
+    shutil.copyfile(THEMES / name / "colors.toml", dest / "colors.toml")
+    (dest.parent / "theme.name").write_text(name + "\n")
+
+
+def capture(name, scene, art):
+    renderer = RENDERER or scene.get("renderer", "vulkan")
+    private = WORK / (name + "-" + str(time.time_ns()))
+    private.mkdir(parents=True)
+    # Unix socket paths are limited to about 108 bytes. Keep this independent
+    # of the checkout path and the descriptive capture directory name.
+    runtime = Path(tempfile.mkdtemp(prefix="omg-show-"))
+    state = private / "state"
+    set_theme(state, scene["theme"])
+    settings = private / "settings.toml"
+    settings.write_text(ANIMATED if scene.get("animated") else QUIET)
+    seed = private / "window.toml"
+    seed.write_text("window_w = 1220\nwindow_h = 960\nsidebar_width = 278\ninfo_width = 280\ninfo_panel_open = " + str(scene.get("info", False)).lower() + "\n")
+    # Do not inherit another probe, account, recording or UI-state override.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OMG_")}
+    env.update({
+        "XDG_RUNTIME_DIR": str(runtime), "XDG_STATE_HOME": str(state),
+        "XDG_CONFIG_HOME": str(private / "config"), "XDG_CACHE_HOME": str(private / "cache"),
+        "XDG_DATA_HOME": str(private / "data"), "OMG_UISTATE_PATH": str(seed),
+        "OMG_SMOKE_SETTINGS_SEED": str(settings), "OMG_MOCK_IMAGE_DIR": str(art),
+        "OMG_HEADLESS_WIDTH": "1320", "OMG_HEADLESS_HEIGHT": "1040",
+        "OMG_HEADLESS_RENDERER": "gl", "GSK_RENDERER": renderer, "G_DEBUG": "fatal-criticals",
+        "OMG_SMOKE_OPEN": scene["chat"], "OMG_SMOKE_SHOT_DELAY_MS": "1000" if "ms" in scene else "4000",
+    })
+    env.update(scene.get("env", {}))
+    frames = private / "frames"
+    shot = private / "shot.png"
+    if "ms" in scene:
+        env.update(OMG_SMOKE_RECORD_DIR=str(frames), OMG_SMOKE_RECORD_FPS=str(scene.get("capture_fps", 30)), OMG_SMOKE_RECORD_MS=str(scene["ms"]))
+    else:
+        env["OMG_SMOKE_SHOT"] = str(shot)
+    start = time.monotonic()
+    with (private / "capture.log").open("w") as log:
+        process = subprocess.Popen([str(ROOT / "bin/headless"), str(ROOT / "target/release/omarchygram"), "--smoke"], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            for offset, theme in scene.get("themes", []):
+                time.sleep(max(0, start + offset - time.monotonic()))
+                if process.poll() is not None:
+                    raise RuntimeError(f"{name}: app exited before theme change")
+                set_theme(state, theme)
+            code = process.wait(timeout=50)
+            if code:
+                raise RuntimeError(f"{name}: exit {code}; see {private / 'capture.log'}")
+        finally:
+            # Also reap the private compositor on timeout or interruption.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+            shutil.rmtree(runtime)
+    if "ms" in scene:
+        images = sorted(frames.glob("frame-*.png"))
+        if len(images) < 20:
+            raise RuntimeError(f"{name}: insufficient captured frames")
+        times = [f.stat().st_mtime_ns / 1e9 for f in images]
+        manifest = {"name": name, "scene": scene, "renderer": renderer, "frames": [str(f.relative_to(ROOT)) for f in images], "times": times}
+        (WORK / f"{name}.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        print(f"{name}: {len(images)} frames in {times[-1] - times[0]:.2f}s", flush=True)
+    else:
+        flatten(shot, DEST / f"{name}.png")
+        print(f"{name}: screenshot saved", flush=True)
+
+
+def flatten(source, dest):
+    # WidgetPaintable omits the window background in transparent gutters.
+    # Restore it from an empty conversation pixel in this same frame.
+    # This changes no widget, text, artwork, layout or timing.
+    run(["magick", str(source), "-background", "%[pixel:p{895,150}]", "-alpha", "remove", "-alpha", "off", str(dest)], stdout=subprocess.DEVNULL)
+
+
+def encode(name):
+    manifest = json.loads((WORK / f"{name}.json").read_text())
+    frames = [ROOT / f for f in manifest["frames"]]
+    times = manifest["times"]
+    prepared = frames[0].parent.parent / "opaque"
+    prepared.mkdir(exist_ok=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda p: flatten(p, prepared / p.name), frames))
+    timeline = prepared / "timeline.ffconcat"
+    durations = [b - a for a, b in zip(times, times[1:])]
+    if any(d <= 0 for d in durations):
+        raise RuntimeError("Capture timestamps must be strictly increasing")
+    durations.append(1 / 30)
+    # Preserve actual capture time, including missed frames. No speed-up.
+    timeline.write_text("ffconcat version 1.0\n" + "".join(f"file '{p.name}'\noption framerate 1000\nduration {duration:.9f}\n" for p, duration in zip(frames, durations)) + f"file '{frames[-1].name}'\noption framerate 1000\n")
+    if not Path(FONT).exists():
+        raise RuntimeError(f"Missing demo caption font: {FONT}")
+    title = manifest["scene"]["title"]
+    filters = ("fps=25,scale=1000:-2:flags=lanczos,pad=iw:ih+48:0:48:color=0x101521,"
+               f"drawtext=fontfile={FONT}:text='{title}':x=18:y=16:fontsize=17:fontcolor=0xe2e8f0,"
+               f"drawtext=fontfile={FONT}:text='OFFLINE DEMO / 1x SPEED':x=w-tw-18:y=18:fontsize=12:fontcolor=0x9aa8bf")
+    gif = DEST / f"{name}.gif"
+    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(timeline),
+         "-filter_complex", filters + ",split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle", "-loop", "0", str(gif)])
+    # A full-color alternative, at the same elapsed speed, for larger displays.
+    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(timeline),
+         "-vf", filters, "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(DEST / f"{name}.mp4")])
+    result = {"name": name, "source_frames": len(frames), "capture_elapsed_seconds": round(times[-1] - times[0], 6),
+              "mean_capture_fps": round((len(frames) - 1) / (times[-1] - times[0]), 2), "output_fps": 25,
+              "speed": 1, "renderer": manifest.get("renderer", "vulkan"), "scene": manifest["scene"], "gif_bytes": gif.stat().st_size,
+              "sha256": hashlib.sha256(gif.read_bytes()).hexdigest()}
+    (DEST / f"{name}.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(f"{name}: encoded {gif.stat().st_size / 1e6:.2f} MB GIF at real-time speed", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--only", choices=["all", "stills", "speed", "animations", "themes", "encode"], default="all")
+    args = parser.parse_args()
+    WORK.mkdir(parents=True, exist_ok=True)
+    DEST.mkdir(parents=True, exist_ok=True)
+    if args.only != "encode":
+        art = artwork()
+        if args.only in {"all", "stills"}:
+            for name, scene in STILLS.items():
+                capture(name, scene, art)
+        # Record sequentially, without simultaneous builds or encoders.
+        for name, scene in CLIPS.items():
+            if args.only in {"all", name}:
+                capture(name, scene, art)
+    for name in CLIPS:
+        if args.only in {"all", "encode", name}:
+            encode(name)
+
+
+if __name__ == "__main__":
+    main()

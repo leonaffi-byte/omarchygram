@@ -1,0 +1,21 @@
+{
+  "name": "speed",
+  "source_frames": 310,
+  "capture_elapsed_seconds": 11.433094,
+  "mean_capture_fps": 27.03,
+  "output_fps": 25,
+  "speed": 1,
+  "renderer": "cairo",
+  "scene": {
+    "renderer": "cairo",
+    "title": "Quick chat switching",
+    "theme": "tokyo-night",
+    "chat": "Marta",
+    "ms": 11500,
+    "env": {
+      "OMG_SMOKE_OPEN_SEQUENCE": "Deni@1900,Polls@3400,Saved Messages@4900,Omarchy Bot@6400,Marta@7900,Deni@9400,Marta@10300"
+    }
+  },
+  "gif_bytes": 758753,
+  "sha256": "9e7eea123340a7b753d56fc2329ed7baf94fe85387acf7264538c657b6cd2a93"
+}

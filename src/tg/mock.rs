@@ -169,6 +169,14 @@ fn t(minutes_ago: i64) -> DateTime<Local> {
 /// Theme preview images double as photos/avatars; `n` picks a different
 /// one per chat so avatars are distinguishable.
 fn sample_image_n(n: usize) -> Option<PathBuf> {
+    // Optional artwork for offline screenshots and recordings. Numeric file
+    // names match the mock chat/message ids; normal fixtures stay unchanged.
+    if let Some(dir) = std::env::var_os("OMG_MOCK_IMAGE_DIR") {
+        let path = PathBuf::from(dir).join(format!("{n}.png"));
+        if path.is_file() {
+            return Some(path);
+        }
+    }
     let mut hits: Vec<PathBuf> = std::fs::read_dir("/usr/share/omarchy/themes")
         .into_iter()
         .flatten()

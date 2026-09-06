@@ -1,0 +1,22 @@
+{
+  "name": "animations",
+  "source_frames": 252,
+  "capture_elapsed_seconds": 11.934099,
+  "mean_capture_fps": 21.03,
+  "output_fps": 25,
+  "speed": 1,
+  "renderer": "cairo",
+  "scene": {
+    "title": "A little motion. Your choice.",
+    "theme": "catppuccin",
+    "chat": "Marta",
+    "ms": 12000,
+    "animated": true,
+    "env": {
+      "OMG_MOCK_LIVE_MS": "2600",
+      "OMG_SMOKE_OPEN_SEQUENCE": "Deni@1600,Marta@3200"
+    }
+  },
+  "gif_bytes": 1137442,
+  "sha256": "1286c11b3afdaf06aa7259f194cc988a021310a1767b1ed043fb88220de86474"
+}

@@ -1,33 +1,86 @@
 # Omarchygram
 
-A Telegram client for Omarchy that takes its colors from the active Omarchy theme.
+**Telegram at native speed. Dressed in your Omarchy theme.**
 
-![Omarchygram: boot log, typing indicator, typewriter message reveal, chat-switch cascade, unread badges, and live re-theming as the Omarchy theme changes](docs/themes.gif)
+A fast, lightweight Telegram client built with **Rust + GTK 4**. Quick chat
+switching, bounded caches, and a **39.95 MB release executable** with voice
+calls enabled. Your Omarchy colors carry through the entire app, live.
 
-Switch your Omarchy theme and the client follows instantly — every bundled
-theme, no restart. The clip also shows a few of the optional terminal-style
-animations: the boot log, the typing indicator, typewriter message reveal with
-phosphor burn-in, the chat-switch cascade, badge pops and scanlines.
-([video](https://github.com/leonaffi-byte/omarchygram/releases/download/v0.1.0/omarchygram-demo.mp4))
+![Omarchygram in Tokyo Night: a dummy conversation with a mountain photo, replies, a sticker, and the contact details panel](docs/showcase/hero.png)
 
-![A conversation in the miasma theme](docs/hero-marta.png)
+## Fast where you feel it
 
-![Six Omarchy themes: tokyo-night, gruvbox, catppuccin, nord, rose-pine, kanagawa](docs/themes.png)
+Measured with the optimized **0.1.8 source build**:
 
-Native GTK 4 in Rust — no Electron, no web view. Keyboard-first and dense,
-closer to a terminal than to Telegram Desktop. Voice calls, inline media,
-stickers and animated stickers, polls, topics, stories, a local AI assistant
-over your own chats, anti-delete and edit history, Omarchy actions from a chat,
-and 54 optional terminal-style animations.
+| Interaction / footprint | Measured result |
+| --- | ---: |
+| Paint the first screen of a 500-message history | **31 ms** median |
+| Reopen a chat in the offline app | **33 ms** median |
+| Local search across 1,000 chats | **28 ms** median |
+| Message scrolling, selected effects enabled | **118 FPS** on a 120 Hz headless output |
+| Largest phase-end RAM in the loaded scrolling run | **193.9 MB**; brief peak **243.2 MB** |
+| Release executable, including calls | **39.95 MB** |
 
-Group messages show the sender's picture beside the bubble; click it to open
-their profile, send a private message, or expand their profile photo. Pictures
-and chat media load around the visible area. Small cached previews keep the
-message view light, while zooming and saving use the original files.
+The 500-message history's first screen paints about **41× faster** than the
+0.1.7 baseline; the executable is **30% smaller**. In a separate paired
+comparison, message scrolling used **43% less CPU**, with roughly 2% lower FPS
+and longer cold frame tails. Full controls are built near the viewport,
+distant decoded images are released, and recent chat history stays cached.
+Original media, message history, and calling support are retained.
+
+These are **local, offline benchmarks**, not Telegram network latency or a
+promise for every machine. Measured on a Core Ultra 9 285H with Intel graphics;
+scrolling used a private 120 Hz output at 1.6× scale. The first row measures
+history rendering after data is available; opening an uncached chat also
+needs a Telegram response. Read the [results, methods, and tradeoffs](specs/performance-audit-0.1.8.md).
+
+### Move between conversations
+
+![Real-time dummy-account recording switching between conversations, polls, saved messages, and a bot, then revisiting recent chats](docs/showcase/speed.gif)
+
+Real-time playback, including first visits and returns to recent chats.
+[Full-color video](docs/showcase/speed.mp4).
+
+### Your theme, throughout
+
+![One running Omarchygram window changing live from Tokyo Night to Gruvbox, Catppuccin, and Catppuccin Latte](docs/showcase/themes.gif)
+
+Change the Omarchy theme and the conversation, sidebar, controls, and profile
+panel follow. No restart. [Full-color video](docs/showcase/themes.mp4).
+
+| Catppuccin | Gruvbox | Catppuccin Latte |
+| :---: | :---: | :---: |
+| [![Catppuccin dark theme](docs/showcase/catppuccin.png)](docs/showcase/catppuccin.png) | [![Gruvbox warm dark theme](docs/showcase/gruvbox.png)](docs/showcase/gruvbox.png) | [![Catppuccin Latte light theme](docs/showcase/light.png)](docs/showcase/light.png) |
+
+### A little motion. Your choice.
+
+![Optional staggered chat transitions, typing dots, and typewriter reveal as new dummy messages arrive](docs/showcase/animations.gif)
+
+54 individually selectable effects, from subtle transitions to terminal-style
+message reveals. All are off by default. This demo enables a small selection;
+whole-window flicker stays off. [Full-color video](docs/showcase/animations.mp4).
+
+All media above comes from the real app's **offline dummy account**, captured
+headlessly. The profile and landscape artwork are generated; the UI is the
+actual GTK rendering. GIFs play at **1× elapsed speed**; capture overhead limits
+their frame rate, so use the benchmark table for application FPS. [Reproduce the captures](docs/showcase/README.md).
+
+## A full Telegram client
+
+Keyboard-first, with inline photos, voice messages, video, stickers and animated
+stickers, polls, forum topics, stories, voice calls, and background notifications.
+Group messages show sender pictures; click through to a profile, a private
+conversation, or an expanded profile photo. Small previews keep scrolling light,
+while zooming and saving use the original files.
+
+An AI assistant can summarize selected message ranges, including voice
+transcripts, using a local or configured cloud provider. Anti-delete and edit
+history, Omarchy actions from chat, and per-chat drafts are built in.
 
 ## Install (Omarchy / Arch)
 
-A prebuilt package is attached to each release:
+The latest prebuilt package is **0.1.0**. For the **0.1.8 performance improvements
+shown above**, [build the current source](#build-and-run).
 
 ```
 sudo pacman -U https://github.com/leonaffi-byte/omarchygram/releases/download/v0.1.0/omarchygram-0.1.0-1-x86_64.pkg.tar.zst
@@ -64,13 +117,14 @@ sudo pacman -S --needed gtk4 rust
 ## Build and run
 
 ```
-cargo build            # build
-cargo run              # run against real Telegram (needs credentials, see below)
-cargo run -- --smoke   # run offline against mock data, no login needed
-cargo test             # run the tests
+cargo build --release               # optimized build
+cargo run --release                 # real Telegram (credentials below)
+bin/headless target/release/omarchygram --smoke --probe  # offline GUI check
+cargo test                          # run the tests
 ```
 
-Use `--smoke` to look at the app without setting anything up.
+Use `--smoke` for offline dummy data without logging in. Automated captures and
+GUI checks use `bin/headless`; see [the showcase instructions](docs/showcase/README.md).
 
 ## Telegram API credentials (one-time)
 
