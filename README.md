@@ -20,6 +20,11 @@ stickers and animated stickers, polls, topics, stories, a local AI assistant
 over your own chats, anti-delete and edit history, Omarchy actions from a chat,
 and 54 optional terminal-style animations.
 
+Group messages show the sender's picture beside the bubble; click it to open
+their profile, send a private message, or expand their profile photo. Pictures
+and chat media load around the visible area. Small cached previews keep the
+message view light, while zooming and saving use the original files.
+
 ## Install (Omarchy / Arch)
 
 A prebuilt package is attached to each release:

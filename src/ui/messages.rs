@@ -286,6 +286,7 @@ pub enum MessageAction {
     OpenLink(String),
     OpenMention(i64),
     OpenSender(i32),
+    LoadVisibleMedia,
     Vote { msg_id: i32, options: Vec<usize> },
     RetractVote(i32),
     AddContact(i32),
@@ -337,10 +338,13 @@ pub enum MediaState {
 
 #[derive(Clone)]
 struct MessageRow {
-    widget: BubbleClamp,
+    widget: gtk::Box,
+    bubble: BubbleClamp,
     selection: gtk::CheckButton,
     forwarded: gtk::Label,
     sender: gtk::Label,
+    sender_avatar: Option<(Avatar, gtk::Button)>,
+    avatar_requested: Rc<Cell<bool>>,
     quote: gtk::Label,
     text_block: gtk::Box,
     text: Rc<RefCell<Option<gtk::Label>>>,
@@ -568,6 +572,9 @@ struct MessagesInner {
     settings: RefCell<Option<Rc<SettingsStore>>>,
     probe: Cell<bool>,
     player_throttle: RefCell<Option<glib::SourceId>>,
+    avatar_backend: RefCell<Option<Tg>>,
+    show_sender_avatars: Cell<bool>,
+    last_scroll: Cell<std::time::Instant>,
     widget: gtk::Box,
 }
 
@@ -1200,6 +1207,9 @@ impl MessagesView {
             settings: RefCell::new(None),
             probe: Cell::new(false),
             player_throttle: RefCell::new(None),
+            avatar_backend: RefCell::new(None),
+            show_sender_avatars: Cell::new(true),
+            last_scroll: Cell::new(std::time::Instant::now()),
             widget: widget.clone(),
         });
         let view = Self { widget, inner };
@@ -1661,8 +1671,6 @@ impl MessagesView {
             let adjustment = self.inner.scroll.vadjustment();
             adjustment.connect_value_changed(move |adjustment| {
                 let Some(inner) = weak.upgrade() else { return };
-                // Wave 6D: scrolling a sticker out of view pauses it.
-                sync_lottie_visibility(&inner);
                 MessagesView::of(&inner).player_visibility_throttled();
                 if inner.suppress_paging.get() {
                     return;
@@ -1679,22 +1687,7 @@ impl MessagesView {
                         || adjustment.upper() - adjustment.page_size() - adjustment.value()
                             > adjustment.page_size(),
                 );
-                update_date_chip_label(&inner, adjustment);
-                inner.effects.date_chip(inner.date_chip.upcast_ref(), true);
-                if let Some(source) = inner.date_timeout.borrow_mut().take() {
-                    remove_source_if_present(source);
-                }
-                let weak = Rc::downgrade(&inner);
-                let source = glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(900),
-                    move || {
-                        if let Some(inner) = weak.upgrade() {
-                            inner.date_timeout.borrow_mut().take();
-                            inner.effects.date_chip(inner.date_chip.upcast_ref(), false);
-                        }
-                    },
-                );
-                *inner.date_timeout.borrow_mut() = Some(source);
+                inner.last_scroll.set(std::time::Instant::now());
                 if adjustment.value() <= 4.0 && !inner.paging.get() && !inner.exhausted.get()
                     && let Some(callback) = inner.action.borrow().as_ref().cloned() {
                         callback(MessageAction::Paginate);
@@ -1713,6 +1706,20 @@ impl MessagesView {
                 .connect_changed(move |_| {
                     if let Some(inner) = weak.upgrade() { MessagesView::of(&inner).player_visibility_throttled(); }
                 });
+        }
+        {
+            // A wheel/touchpad gesture owns the viewport even while cached
+            // history or an image is waiting for its layout callback.
+            let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+            controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = Rc::downgrade(&self.inner);
+            controller.connect_scroll(move |_, _, _| {
+                if let Some(inner) = weak.upgrade() {
+                    MessagesView::of(&inner).claim_scroll();
+                }
+                glib::Propagation::Proceed
+            });
+            self.inner.scroll.add_controller(controller);
         }
     }
 
@@ -2188,6 +2195,12 @@ impl MessagesView {
         }
     }
 
+    fn claim_scroll(&self) {
+        self.cancel_pending_scroll();
+        self.inner.suppress_paging.set(false);
+        self.inner.stick_to_bottom.set(false);
+    }
+
     fn clear_rows(&self) {
         self.move_focus_before_removal(&self.inner.list);
         let rows: Vec<MessageRow> = self
@@ -2588,12 +2601,22 @@ impl MessagesView {
             }
         }
         let inserted = self.merge(messages, false, false);
+        for entry in self.inner.store.borrow().entries.values() {
+            if entry.row.sender_avatar.as_ref().is_some_and(|(avatar, _)| !avatar.photo_loaded()) {
+                entry.row.avatar_requested.set(false);
+            }
+        }
+        self.player_visibility_throttled();
         self.refresh_reply_bar();
         self.finish_history_status();
         self.inner.loading.set_visible(self.inner.store.borrow().order.is_empty());
         self.inner.loading.set_label("No messages yet");
+        let inner = self.inner.clone();
         self.after_next_upper_or_tick(move |adjustment| {
             adjustment.set_value(if stick { (adjustment.upper() - adjustment.page_size()).max(0.0) } else { saved_value });
+            // A fast refresh can replace finish_initial's layout callback.
+            // Its replacement must release the initial paging suppression too.
+            inner.suppress_paging.set(false);
         });
         inserted
     }
@@ -2764,8 +2787,13 @@ impl MessagesView {
         } else {
             gtk::Align::Start
         });
-        let widget = BubbleClamp::new(&row_layout, self.inner.pane_width.clone());
+        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let bubble = BubbleClamp::new(&row_layout, self.inner.pane_width.clone());
+        bubble.add_css_class("omg-msg");
+        bubble.add_css_class("omg-msg-bubble");
+        bubble.add_css_class(if message.outgoing { "omg-msg-out" } else { "omg-msg-in" });
         widget.add_css_class("omg-msg");
+        widget.add_css_class("omg-msg-row");
         // The viewer returns keyboard focus to its originating message.  The
         // bubble wrapper therefore needs to be an explicit focus target.
         widget.set_focusable(true);
@@ -2788,6 +2816,30 @@ impl MessagesView {
         selection.set_sensitive(!message.deleted);
         selection.set_active(self.inner.selection.borrow().ids.contains(&message.id));
         row_layout.append(&selection);
+
+        let sender_avatar = if self.inner.chat_kind.get() == ChatKind::Group && !message.outgoing {
+            let avatar = Avatar::new(32);
+            let button = gtk::Button::new();
+            button.add_css_class("omg-sender-avatar");
+            button.set_valign(gtk::Align::End);
+            button.set_child(Some(&avatar.widget));
+            button.set_visible(self.inner.show_sender_avatars.get());
+            button.set_sensitive(message.sender_id.is_some_and(|id| id > 0));
+            button.set_tooltip_text(Some(&format!("View {}'s profile", message.sender)));
+            button.update_property(&[gtk::accessible::Property::Label(&format!("View {}'s profile", message.sender))]);
+            if let Some(tg) = self.inner.avatar_backend.borrow().as_ref() {
+                avatar.bind(tg, message.sender_id.unwrap_or(0), &message.sender, false);
+            }
+            let weak = Rc::downgrade(&self.inner);
+            let id = message.id;
+            button.connect_clicked(move |_| {
+                let callback = weak.upgrade().and_then(|inner| inner.action.borrow().clone());
+                if let Some(callback) = callback { callback(MessageAction::OpenSender(id)); }
+            });
+            widget.append(&button);
+            Some((avatar, button))
+        } else { None };
+        widget.append(&bubble);
 
         let bubble_column = gtk::Box::new(gtk::Orientation::Vertical, 4);
         bubble_column.set_halign(gtk::Align::Fill);
@@ -3128,9 +3180,12 @@ impl MessagesView {
 
         let row = MessageRow {
             widget,
+            bubble,
             selection,
             forwarded,
             sender,
+            sender_avatar,
+            avatar_requested: Rc::new(Cell::new(false)),
             quote,
             text_block,
             text: Rc::new(RefCell::new(text)),
@@ -3207,6 +3262,20 @@ impl MessagesView {
         );
         row.forwarded.set_visible(message.forwarded_from.is_some());
         row.sender.set_markup(&sender_markup(&message));
+        if let Some((avatar, button)) = &row.sender_avatar {
+            let id = message.sender_id.unwrap_or(0);
+            if avatar.key() != id || avatar.widget.tooltip_text().as_deref() != Some(message.sender.as_str()) {
+                row.avatar_requested.set(false);
+                if let Some(tg) = self.inner.avatar_backend.borrow().as_ref() {
+                    avatar.bind(tg, id, &message.sender, false);
+                }
+                self.player_visibility_throttled();
+            }
+            button.set_sensitive(id > 0);
+            let label = format!("View {}'s profile", message.sender);
+            button.set_tooltip_text(Some(&label));
+            button.update_property(&[gtk::accessible::Property::Label(&label)]);
+        }
         row.sender.set_tooltip_text(message.sender_id.filter(|id| *id > 0).map(|_| "View profile"));
         row.sender.set_visible(
             self.inner.chat_kind.get() == ChatKind::Group
@@ -4894,6 +4963,7 @@ impl MessagesView {
             entry.media_generation = entry.media_generation.wrapping_add(1);
             entry.media_state = MediaState::InFlight;
             entry.media_retryable = false;
+            entry.row.media_slot.set_tooltip_text(None);
             (kind, entry.media_generation, entry.row.media_button.clone())
         };
         player::download_started(msg_id);
@@ -5284,6 +5354,14 @@ impl MessagesView {
                 picture.set_content_fit(gtk::ContentFit::Cover);
                 map_slot.append(&picture);
             }
+            if should_stick {
+                let inner = self.inner.clone();
+                self.after_upper_change(saved_upper, move |adjustment, changed| {
+                    if changed { adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0)); }
+                    inner.stick_to_bottom.set(true);
+                    inner.suppress_paging.set(false);
+                });
+            }
             return true;
         }
         self.move_focus_before_removal(&media_slot);
@@ -5500,6 +5578,17 @@ impl MessagesView {
 
     pub fn drop_media_continuations(&self, msg_id: i32) {
         self.inner.media_ready.borrow_mut().remove(&msg_id);
+    }
+
+    pub fn set_media_error_detail(&self, msg_id: i32, error: &str) {
+        if let Some(entry) = self.inner.store.borrow().entries.get(&msg_id) {
+            entry.row.media_slot.set_tooltip_text(Some(error));
+        }
+    }
+
+    pub fn media_error_detail(&self, msg_id: i32) -> String {
+        self.inner.store.borrow().entries.get(&msg_id)
+            .and_then(|entry| entry.row.media_slot.tooltip_text()).map(|text| text.to_string()).unwrap_or_default()
     }
 
     pub fn fail_media(&self, msg_id: i32, generation: u64, retryable: bool) -> bool {
@@ -6142,6 +6231,8 @@ impl MessagesView {
     /// back, and start autoplay downloads for visible gifs/circles (§2.2/§2.3).
     fn player_visibility(&self) {
         player::visibility_tick(&|id| self.row_visible(id));
+        let callback = self.inner.action.borrow().clone();
+        if let Some(callback) = callback { callback(MessageAction::LoadVisibleMedia); }
         let Some(settings) = self.inner.settings.borrow().clone() else {
             return;
         };
@@ -6154,8 +6245,7 @@ impl MessagesView {
         // Collect first: the action callback re-enters the store.
         let pending: Vec<i32> = {
             let store = self.inner.store.borrow();
-            store
-                .order
+            nearby_message_ids(&self.inner, 0.0)
                 .iter()
                 .filter_map(|id| {
                     let entry = store.entries.get(id)?;
@@ -6216,20 +6306,82 @@ impl MessagesView {
     /// Throttled entry point for adjustment/page-size and post-layout changes
     /// (§2.3, §5.2).
     fn player_visibility_throttled(&self) {
-        if let Some(source) = self.inner.player_throttle.borrow_mut().take() {
-            remove_source_if_present(source);
-        }
-        let inner = self.inner.clone();
-        let epoch = inner.scroll_epoch.get();
-        let source = glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
-            let _ = inner.player_throttle.borrow_mut().take();
-            if inner.scroll_epoch.get() != epoch {
-                return;
-            }
+        // Coalesce continuous scrolling without postponing work forever.
+        if self.inner.player_throttle.borrow().is_some() { return; }
+        let weak = Rc::downgrade(&self.inner);
+        let source = glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+            let Some(inner) = weak.upgrade() else { return };
+            inner.player_throttle.borrow_mut().take();
             sync_lottie_visibility(&inner);
-            MessagesView::of(&inner).player_visibility();
+            let view = MessagesView::of(&inner);
+            view.bind_visible_sender_avatars();
+            view.player_visibility();
+            if inner.effects.on("datefloat") && !inner.suppress_paging.get()
+                && inner.last_scroll.get().elapsed().as_millis() < 900 {
+                update_date_chip_label(&inner, &inner.scroll.vadjustment());
+                inner.effects.date_chip(inner.date_chip.upcast_ref(), true);
+                if inner.date_timeout.borrow().is_none() {
+                    let weak = Rc::downgrade(&inner);
+                    let timer = glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                        let Some(inner) = weak.upgrade() else { return glib::ControlFlow::Break };
+                        if inner.last_scroll.get().elapsed().as_millis() < 900 { return glib::ControlFlow::Continue; }
+                        inner.date_timeout.borrow_mut().take();
+                        inner.effects.date_chip(inner.date_chip.upcast_ref(), false);
+                        glib::ControlFlow::Break
+                    });
+                    *inner.date_timeout.borrow_mut() = Some(timer);
+                }
+            }
         });
         *self.inner.player_throttle.borrow_mut() = Some(source);
+    }
+
+    pub fn set_show_sender_avatars(&self, show: bool) {
+        if self.inner.show_sender_avatars.replace(show) == show { return; }
+        for entry in self.inner.store.borrow().entries.values() {
+            if let Some((_, button)) = &entry.row.sender_avatar { button.set_visible(show); }
+        }
+        self.player_visibility_throttled();
+    }
+
+    fn bind_visible_sender_avatars(&self) {
+        if !self.inner.show_sender_avatars.get() { return; }
+        let Some(tg) = self.inner.avatar_backend.borrow().clone() else { return };
+        let store = self.inner.store.borrow();
+        for id in nearby_message_ids(&self.inner, 240.0) {
+            let Some(entry) = store.entries.get(&id) else { continue };
+            if let Some((avatar, _)) = &entry.row.sender_avatar
+                && !entry.row.avatar_requested.replace(true) {
+                avatar.bind(&tg, entry.msg.sender_id.unwrap_or(0), &entry.msg.sender, true);
+            }
+        }
+    }
+
+    pub fn nearby_media_ids(&self) -> Vec<i32> { nearby_message_ids(&self.inner, 240.0) }
+
+    pub fn probe_paging_suppressed(&self) -> bool { self.inner.suppress_paging.get() }
+
+    pub fn probe_scroll_state(&self, id: i32) -> String {
+        let adjustment = self.inner.scroll.vadjustment();
+        let bounds = self.inner.store.borrow().entries.get(&id)
+            .and_then(|entry| entry.row.widget.compute_bounds(&self.inner.list));
+        format!("value={} upper={} page={} suppressed={} stick={} pending={} row={bounds:?} nearby={:?}",
+            adjustment.value(), adjustment.upper(), adjustment.page_size(), self.inner.suppress_paging.get(),
+            self.inner.stick_to_bottom.get(), self.inner.upper_tick.borrow().is_some(), self.nearby_media_ids())
+    }
+
+    pub fn probe_sender_avatar(&self, id: i32) -> Option<(i64, bool, bool)> {
+        let store = self.inner.store.borrow();
+        let (avatar, button) = store.entries.get(&id)?.row.sender_avatar.as_ref()?;
+        Some((avatar.key(), avatar.photo_loaded(), button.is_visible()))
+    }
+
+    pub fn probe_click_sender_avatar(&self, id: i32) -> bool {
+        let button = self.inner.store.borrow().entries.get(&id)
+            .and_then(|entry| entry.row.sender_avatar.as_ref().map(|(_, button)| button.clone()));
+        if let Some(button) = button.filter(|button| button.is_visible() && button.is_sensitive()) {
+            button.emit_clicked(); true
+        } else { false }
     }
 
     pub fn set_typing(&self, name: &str) -> u64 {
@@ -6393,6 +6545,7 @@ impl MessagesView {
     }
 
     pub fn set_chat_summary(&self, summary: &ChatSummary, tg: &Tg) {
+        *self.inner.avatar_backend.borrow_mut() = Some(tg.clone());
         let title = self
             .inner
             .topic_breadcrumb
@@ -6566,11 +6719,11 @@ impl MessagesView {
             .borrow()
             .entries
             .values()
-            // The clamp fills the row; its child is the visible bubble.
+            // Measure the bubble itself; the sender picture is an adjacent gutter.
             .map(|entry| {
                 entry
                     .row
-                    .widget
+                    .bubble
                     .first_child()
                     .map(|c| c.width())
                     .unwrap_or(0)
@@ -6940,6 +7093,10 @@ impl MessagesView {
         let Some(bounds) = row.compute_bounds(&self.inner.list) else {
             return false;
         };
+        if bounds.height() <= 0.0 { return false; }
+        // Search/pinned-message navigation must supersede an earlier request
+        // to keep the old bottom visible after a pending layout.
+        self.claim_scroll();
         let adjustment = self.inner.scroll.vadjustment();
         adjustment.set_value(
             (f64::from(bounds.y()) - adjustment.page_size() / 3.0)
@@ -6966,7 +7123,7 @@ fn apply_pane_width(inner: &MessagesInner, width: i32) {
     if width > 0 && inner.pane_width.replace(width) != width {
         inner.search_older.set_label(if width < 600 { icons::DOWN } else { "Load older" });
         for entry in inner.store.borrow().entries.values() {
-            entry.row.widget.queue_resize();
+            entry.row.bubble.queue_resize();
         }
     }
 }
@@ -7028,20 +7185,31 @@ fn sync_lottie_visibility(inner: &Rc<MessagesInner>) {
     }
 }
 
-fn update_date_chip_label(inner: &MessagesInner, adjustment: &gtk::Adjustment) {
-    let visible_top = adjustment.value() as f32;
+/// Rows are in vertical order. Locate the viewport with a binary search, then
+/// inspect only its contents instead of walking all loaded history per scroll.
+fn nearby_message_ids(inner: &MessagesInner, overscan: f32) -> Vec<i32> {
+    let adjustment = inner.scroll.vadjustment();
+    if adjustment.page_size() <= 0.0 { return Vec::new(); }
+    let top = adjustment.value() as f32 - overscan;
+    let bottom = (adjustment.value() + adjustment.page_size()) as f32 + overscan;
     let store = inner.store.borrow();
-    let first_visible = store
-        .order
-        .iter()
-        .filter_map(|id| store.entries.get(id))
-        .find(|entry| {
-            entry
-                .row
-                .widget
-                .compute_bounds(&inner.list)
-                .is_some_and(|bounds| bounds.y() + bounds.height() >= visible_top)
-        })
+    let start = store.order.partition_point(|id| {
+        store.entries.get(id).and_then(|entry| entry.row.widget.compute_bounds(&inner.list))
+            .is_some_and(|bounds| bounds.y() + bounds.height() < top)
+    });
+    store.order[start..].iter().filter_map(|id| {
+        let bounds = store.entries.get(id)?.row.widget.compute_bounds(&inner.list)?;
+        Some((*id, bounds))
+    }).take_while(|(_, bounds)| bounds.y() <= bottom)
+        .filter(|(_, bounds)| bounds.height() > 0.0)
+        .map(|(id, _)| id).collect()
+}
+
+fn update_date_chip_label(inner: &MessagesInner, adjustment: &gtk::Adjustment) {
+    let _ = adjustment;
+    let first = nearby_message_ids(inner, 0.0).first().copied();
+    let store = inner.store.borrow();
+    let first_visible = first.and_then(|id| store.entries.get(&id))
         .or_else(|| store.order.last().and_then(|id| store.entries.get(id)));
     let Some(message) = first_visible.map(|entry| &entry.msg) else {
         inner.date_chip.set_label("");
@@ -7052,7 +7220,7 @@ fn update_date_chip_label(inner: &MessagesInner, adjustment: &gtk::Adjustment) {
     } else {
         message.ts.format("%b %-d, %Y").to_string()
     };
-    inner.date_chip.set_label(&text);
+    if inner.date_chip.label() != text { inner.date_chip.set_label(&text); }
 }
 
 fn remove_source_if_present(source_id: glib::SourceId) {

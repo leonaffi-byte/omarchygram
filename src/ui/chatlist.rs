@@ -50,6 +50,7 @@ struct ChatRow {
     pin: gtk::Label,
     ticks: gtk::Label,
     avatar_binding: Rc<RefCell<Option<AvatarBinding>>>,
+    avatar_requested: Rc<Cell<bool>>,
     title_text: Rc<RefCell<String>>,
     unread_count: Rc<Cell<i32>>,
 }
@@ -99,6 +100,7 @@ pub struct ChatList {
     prior_mode: Rc<RefCell<SidebarMode>>,
     collapsed: Rc<Cell<bool>>,
     show_avatars: Rc<Cell<bool>>,
+    avatar_loader: Rc<dyn Fn()>,
     search_data: Rc<RefCell<SearchData>>,
     on_open: Rc<RefCell<Option<OpenCallback>>>,
     on_search_open: Rc<RefCell<Option<SearchOpenCallback>>>,
@@ -253,6 +255,8 @@ impl ChatList {
             });
         }
 
+        let show_avatars = Rc::new(Cell::new(true));
+        let avatar_loader = visible_avatar_loader(&scroll, &list, rows.clone(), summaries.clone(), show_avatars.clone(), tg.clone());
         let this = Self {
             widget,
             tg,
@@ -279,7 +283,8 @@ impl ChatList {
             mode,
             prior_mode,
             collapsed,
-            show_avatars: Rc::new(Cell::new(true)),
+            show_avatars,
+            avatar_loader,
             search_data,
             on_open,
             on_search_open,
@@ -292,6 +297,10 @@ impl ChatList {
             effects,
         };
         this.connect_mode_controls();
+        let load = this.avatar_loader.clone();
+        this.scroll.vadjustment().connect_value_changed(move |_| load());
+        let load = this.avatar_loader.clone();
+        this.scroll.vadjustment().connect_changed(move |_| load());
         this
     }
 
@@ -827,6 +836,20 @@ impl ChatList {
             .all(|(chat_id, row)| row.avatar.key() == *chat_id)
     }
 
+    pub fn probe_update_preserves_mapped_rows(&self) -> bool {
+        let count = Rc::new(Cell::new(0usize));
+        let watched: Vec<_> = self.rows.borrow().values().filter(|row| row.widget.is_mapped()).map(|row| {
+            let count = count.clone();
+            let handler = row.widget.connect_unmap(move |_| count.set(count.get() + 1));
+            (row.widget.clone(), handler)
+        }).collect();
+        let summary = self.summaries.borrow().values().next().cloned();
+        if let Some(summary) = summary { self.set_summary(summary); }
+        let mapped = !watched.is_empty() && count.get() == 0;
+        for (row, handler) in watched { row.disconnect(handler); }
+        mapped
+    }
+
     pub fn ordered(&self) -> Vec<(i64, String)> {
         let summaries = self.summaries.borrow();
         self.order
@@ -1175,6 +1198,9 @@ impl ChatList {
         }
         let widget = gtk::ListBoxRow::new();
         widget.add_css_class("omg-chat-row");
+        widget.set_widget_name(&format!("chat-{chat_id}"));
+        let load = self.avatar_loader.clone();
+        widget.connect_map(move |_| load());
         widget.set_tooltip_text(Some(title));
         let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let avatar = Avatar::new(if self.collapsed.get() { 28 } else if self.widget.has_css_class("omg-compact-list") { 32 } else { 40 });
@@ -1276,6 +1302,7 @@ impl ChatList {
                 pin,
                 ticks,
                 avatar_binding: Rc::new(RefCell::new(None)),
+                avatar_requested: Rc::new(Cell::new(false)),
                 title_text: Rc::new(RefCell::new(title.to_string())),
                 unread_count: Rc::new(Cell::new(0)),
             },
@@ -1314,8 +1341,9 @@ impl ChatList {
         if row.avatar_binding.borrow().as_ref() != Some(&avatar_binding) {
             *row.avatar_binding.borrow_mut() = Some(avatar_binding);
             row.avatar.widget.set_visible(show_avatars);
-            row.avatar
-                .bind(&self.tg, chat_id, title, summary.has_photo && show_avatars);
+            row.avatar_requested.set(false);
+            row.avatar.bind(&self.tg, chat_id, title, false);
+            (self.avatar_loader)();
         }
         row.avatar.set_story_ring(summary.story_ring);
         row.muted.set_visible(summary.muted);
@@ -1400,14 +1428,27 @@ impl ChatList {
             self.render_search();
             return;
         }
-        self.context_popover.dismiss();
-        move_focus_before_removal(&self.widget, &self.list, Some(&self.search));
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
+        let wanted = self.visible_ids();
+        let wanted_set: HashSet<_> = wanted.iter().copied().collect();
+        let removed: Vec<_> = self.rows.borrow().iter()
+            .filter(|(id, row)| row.widget.parent().is_some() && !wanted_set.contains(id))
+            .map(|(_, row)| row.widget.clone()).collect();
+        for row in removed {
+            self.context_popover.dismiss();
+            move_focus_before_removal(&self.widget, &row, Some(&self.search));
+            self.list.remove(&row);
         }
-        for id in self.visible_ids() {
-            if let Some(row) = self.rows.borrow().get(&id) {
-                self.list.append(&row.widget);
+        // A new message usually moves one row. Preserve the other mapped
+        // widgets, their focus, hover state, pictures and scroll allocation.
+        for (index, id) in wanted.iter().enumerate() {
+            if let Some(row) = self.rows.borrow().get(id) {
+                if row.widget.parent().is_some() && row.widget.index() == index as i32 { continue; }
+                if row.widget.parent().is_some() {
+                    self.context_popover.dismiss();
+                    move_focus_before_removal(&self.widget, &row.widget, Some(&self.search));
+                    self.list.remove(&row.widget);
+                }
+                self.list.insert(&row.widget, index as i32);
             }
         }
         if let Some(selected) = self.selected.get()
@@ -1772,6 +1813,46 @@ fn move_focus_before_removal(
     if fallback.is_none_or(|entry| !entry.grab_focus()) {
         root.set_focus(None::<&gtk::Widget>);
     }
+}
+
+/// Hydrate the sidebar viewport, not every dialog in a large account.
+fn visible_avatar_loader(
+    scroll: &gtk::ScrolledWindow, list: &gtk::ListBox,
+    rows: Rc<RefCell<HashMap<i64, ChatRow>>>, summaries: Rc<RefCell<HashMap<i64, ChatSummary>>>,
+    show: Rc<Cell<bool>>, tg: Tg,
+) -> Rc<dyn Fn()> {
+    let pending = Rc::new(Cell::new(false));
+    let rows = Rc::downgrade(&rows);
+    let summaries = Rc::downgrade(&summaries);
+    let scroll = scroll.downgrade();
+    let list = list.downgrade();
+    Rc::new(move || {
+        if pending.replace(true) { return; }
+        let (pending, scroll, list, rows, summaries, show, tg) =
+            (pending.clone(), scroll.clone(), list.clone(), rows.clone(), summaries.clone(), show.clone(), tg.clone());
+        glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+            pending.set(false);
+            if !show.get() { return; }
+            let (Some(rows), Some(summaries)) = (rows.upgrade(), summaries.upgrade()) else { return };
+            let (Some(scroll), Some(list)) = (scroll.upgrade(), list.upgrade()) else { return };
+            if !scroll.is_mapped() { return; }
+            let adjustment = scroll.vadjustment();
+            let top = (adjustment.value() - 100.0).max(0.0);
+            let bottom = adjustment.value() + adjustment.page_size() + 100.0;
+            let mut current = list.row_at_y(top as i32);
+            while let Some(widget) = current {
+                if widget.compute_bounds(&list).is_none_or(|b| f64::from(b.y()) > bottom) { break; }
+                current = list.row_at_index(widget.index() + 1);
+                let Some(id) = widget.widget_name().strip_prefix("chat-").and_then(|id| id.parse::<i64>().ok()) else { continue };
+                let row = rows.borrow().get(&id).cloned();
+                let summary = summaries.borrow().get(&id).cloned();
+                if let (Some(row), Some(summary)) = (row, summary)
+                    && summary.has_photo && !row.avatar_requested.replace(true) {
+                    row.avatar.bind(&tg, id, &summary.title, true);
+                }
+            }
+        });
+    })
 }
 
 fn update_unread(current: i32, update: UnreadUpdate) -> i32 {

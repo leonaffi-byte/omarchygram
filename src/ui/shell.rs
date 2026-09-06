@@ -812,6 +812,7 @@ struct ShellInner {
     aux: RefCell<AuxState>,
     transcription_active: RefCell<HashMap<(i64, i32), TranscriptionJob>>,
     transcription_queue: RefCell<VecDeque<(i64, i32)>>,
+    media_downloads: RefCell<HashMap<i32, glib::JoinHandle<()>>>,
     auto_transcribe_since: Cell<Option<i64>>,
     recent_real_chats: RefCell<Vec<i64>>,
     recent_incoming: RefCell<HashMap<i64, DateTime<Local>>>,
@@ -1077,6 +1078,7 @@ impl Shell {
             aux: RefCell::new(AuxState::default()),
             transcription_active: RefCell::new(HashMap::new()),
             transcription_queue: RefCell::new(VecDeque::new()),
+            media_downloads: RefCell::new(HashMap::new()),
             auto_transcribe_since: Cell::new(None),
             recent_real_chats: RefCell::new(Vec::new()),
             recent_incoming: RefCell::new(HashMap::new()),
@@ -1729,6 +1731,7 @@ impl ShellInner {
                 self.messages.retire_player_media_session();
                 self.me.borrow_mut().take();
                 self.aux.borrow_mut().transcripts.clear();
+                super::media_image::clear_cache();
                 self.chat_info.borrow_mut().clear();
                 self.drafts.borrow_mut().clear();
                 // Only a logout that succeeded zeroes the bar badge; a failed
@@ -1779,6 +1782,7 @@ impl ShellInner {
         self.messages.set_ai_enabled(settings.ai.enabled);
         self.call.set_ringtone_enabled(settings.calls.ringtone);
         self.chatlist.set_show_avatars(settings.ui.show_avatars);
+        self.messages.set_show_sender_avatars(settings.ui.show_avatars);
         self.chatlist.set_compact(settings.ui.compact_list);
         crate::theme::set_text_scale(settings.ui.text_scale);
         // A32: the info panel's own avatar, its member rows and the contacts
@@ -5944,6 +5948,7 @@ impl ShellInner {
             }
             MessageAction::OpenLink(url) => self.open_link(&url),
             MessageAction::OpenMention(user_id) => self.open_mention(user_id),
+            MessageAction::LoadVisibleMedia => self.start_image_downloads(Vec::new()),
             MessageAction::OpenSender(msg_id) => {
                 if let Some(message) = self.messages.message(msg_id)
                     && let Some(user_id) = message.sender_id.filter(|id| *id > 0) {
@@ -8613,9 +8618,11 @@ impl ShellInner {
         }
     }
 
-    fn start_image_downloads(self: &Rc<Self>, ids: Vec<i32>) {
+    fn start_image_downloads(self: &Rc<Self>, _ids: Vec<i32>) {
         let map_tiles = self.settings.get().media.map_tiles;
-        for msg_id in ids {
+        for msg_id in self.messages.nearby_media_ids() {
+            if self.media_downloads.borrow().len() >= 2 { break; }
+            if !matches!(self.messages.media_state(msg_id), Some(MediaState::NotStarted)) { continue; }
             if matches!(
                 self.messages.media_kind(msg_id),
                 Some(MediaKind::Photo | MediaKind::Sticker)
@@ -8686,11 +8693,11 @@ impl ShellInner {
     /// while their media lands, which moves the target under the viewport.
     async fn scroll_into_view(&self, msg_id: i32) -> bool {
         for _ in 0..20 {
+            self.messages.scroll_to_message(msg_id);
+            glib::timeout_future(Duration::from_millis(150)).await;
             if self.messages.row_visible(msg_id) {
                 return true;
             }
-            self.messages.scroll_to_message(msg_id);
-            glib::timeout_future(Duration::from_millis(150)).await;
         }
         self.messages.row_visible(msg_id)
     }
@@ -8785,7 +8792,9 @@ impl ShellInner {
         let Some((kind, media_generation)) = self.messages.begin_media(msg_id) else {
             return;
         };
-        glib::MainContext::default().spawn_local(async move {
+        let this = self.clone();
+        let task = glib::MainContext::default().spawn_local(async move {
+            async {
             let result = if retry { self.tg.retry_media(chat_id, msg_id).await }
                 else { self.tg.download_media(chat_id, msg_id).await };
             match result {
@@ -8811,28 +8820,16 @@ impl ShellInner {
                     self.messages.finish_media_path(msg_id, media_generation, path);
                 }
                 Ok(Some(path)) if matches!(kind, MediaKind::Photo | MediaKind::Sticker | MediaKind::Location | MediaKind::Venue) => {
-                    let decode_path = path.clone();
-                    let decoded =
-                        gio::spawn_blocking(move || gdk::Texture::from_filename(&decode_path))
-                            .await;
-                    if !self.is_current(chat_id, epoch) || !self.messages.contains(msg_id) {
-                        return;
-                    }
+                    if !self.is_current(chat_id, epoch) || !self.messages.contains(msg_id) { return; }
+                    let edge = self.messages.widget.scale_factor().saturating_mul(360);
+                    let decoded = super::media_image::preview(path.clone(), edge, retry).await;
+                    if !self.is_current(chat_id, epoch) || !self.messages.contains(msg_id) { return; }
                     match decoded {
-                        Ok(Ok(texture)) => {
-                            self.messages
-                                .finish_image(msg_id, media_generation, path, &texture);
-                        }
-                        Ok(Err(error)) => {
+                        Ok(texture) => { self.messages.finish_image(msg_id, media_generation, path, &texture); }
+                        Err(error) => {
                             shell_log!("decode media ({chat_id}, {msg_id}): {error}");
                             if self.messages.fail_media(msg_id, media_generation, true) {
-                                self.messages.show_error(error.message());
-                            }
-                        }
-                        Err(_) => {
-                            shell_log!("decode media ({chat_id}, {msg_id}): decoder failed");
-                            if self.messages.fail_media(msg_id, media_generation, true) {
-                                self.messages.show_error("image unavailable");
+                                self.messages.set_media_error_detail(msg_id, &error);
                             }
                         }
                     }
@@ -8863,11 +8860,17 @@ impl ShellInner {
                     shell_log!("download_media({chat_id}, {msg_id}): {error}");
                     if self.is_current(chat_id, epoch) && self.messages.contains(msg_id)
                         && self.messages.fail_media(msg_id, media_generation, true) {
-                            self.messages.show_error(&error);
+                            self.messages.set_media_error_detail(msg_id, &error);
                         }
                 }
             }
+            }.await;
+            if self.epoch.get() == epoch {
+                self.media_downloads.borrow_mut().remove(&msg_id);
+                self.start_image_downloads(Vec::new());
+            }
         });
+        this.media_downloads.borrow_mut().insert(msg_id, task);
     }
 
     fn launch_media(&self, path: &PathBuf) {
@@ -8956,6 +8959,9 @@ impl ShellInner {
     }
 
     fn bump_epoch(&self) -> u64 {
+        // Downloads owned by the old view must not occupy the new chat's
+        // budget. Dropping their receiver also cancels backend transfer work.
+        for (_, job) in self.media_downloads.borrow_mut().drain() { job.abort(); }
         // The timeout may already have fired and removed itself (GLib-CRITICAL
         // "Source ID … was not found" aborted a log-out under fatal-criticals).
         if let Some(source) = self.typing_timeout.borrow_mut().take()
@@ -9438,6 +9444,10 @@ impl ShellInner {
         self.probe_capture_widget("about", about.upcast_ref()).await;
         about.close();
 
+        probe_step("sidebar updates preserve mapped rows");
+        if !self.chatlist.probe_update_preserves_mapped_rows() {
+            probe_fail("updating one chat rebuilt the sidebar"); return;
+        }
         probe_step("archived list");
         self.chatlist.show_archived();
         if !poll_until(1000, || {
@@ -9632,6 +9642,18 @@ impl ShellInner {
         if history_view.message(1) != Some(edited) || history_view.contains(2) || history_view.history_is_refreshing() {
             probe_fail("fresh history cannot undo live events"); return;
         }
+        probe_step("fast cached refresh restores paging after first layout");
+        let history_window = gtk::Window::builder().default_width(600).default_height(400)
+            .child(&history_view.widget).build();
+        history_window.present();
+        history_view.reset_history(marta, 2);
+        history_view.finish_cached(snapshot.clone());
+        history_view.finish_refreshed(snapshot.clone(), &snapshot);
+        let paging_restored = poll_until(1500, || history_view.pagination_ready()).await;
+        history_window.close();
+        if !paging_restored {
+            probe_fail("fast refresh left initial paging suppressed"); return;
+        }
         probe_step("status file written");
         let expected = self.chatlist.unread_totals();
         let writes_before = crate::status::writes();
@@ -9778,7 +9800,7 @@ impl ShellInner {
             };
             if !self
                 .messages
-                .error_text()
+                .media_error_detail(failed_id)
                 .contains("mock: transient failure")
                 || !self.messages.media_retryable(failed_id)
             {
@@ -10941,6 +10963,8 @@ impl ShellInner {
         })
         .await
         {
+            let (bubble, scroll) = self.messages.bubble_metrics();
+            shell_log!("bubble geometry: bubble={bubble}, scroll={scroll}, pane={}, limit={}", resize.pane_width, probe_bubble_limit(resize.pane_width));
             probe_fail("bubble width clamp");
             return;
         }
@@ -12817,7 +12841,25 @@ impl ShellInner {
         if !poll_until(4000, || self.messages.contains(401) && !self.messages.is_loading()).await {
             probe_fail("sender profile source chat"); return false;
         }
+        probe_step("group pictures load for repeated senders and open their profile");
+        if !self.scroll_into_view(406).await
+            || !poll_until(4000, || self.messages.probe_sender_avatar(406) == Some((4001, true, true))).await
+            || !self.scroll_into_view(401).await
+            || !poll_until(4000, || self.messages.probe_sender_avatar(401) == Some((4001, true, true))).await {
+            probe_fail("group sender photo did not load beside messages"); return false;
+        }
         let count = self.chatlist.ordered().len();
+        self.settings.update(|settings| settings.ui.show_avatars = false);
+        if self.messages.probe_sender_avatar(401) != Some((4001, true, false))
+            || self.messages.probe_click_sender_avatar(401) {
+            probe_fail("group pictures ignore the avatar setting"); return false;
+        }
+        self.settings.update(|settings| settings.ui.show_avatars = true);
+        if !self.messages.probe_click_sender_avatar(401)
+            || !poll_until(4000, || self.profile.info().is_some_and(|info| info.id == 4001)).await {
+            probe_fail("sender picture did not open profile"); return false;
+        }
+        self.close_profile();
         if !self.messages.probe_open_sender(401)
             || !poll_until(4000, || self.profile.info().is_some_and(|info| info.id == 4001)).await
             || self.open_chat.get() != Some(4) || self.chatlist.ordered().len() != count {
@@ -12870,7 +12912,9 @@ impl ShellInner {
 
         probe_step("photo viewer recovers from an unreadable cache file");
         self.clone().open_chat(1);
-        if !poll_until(4000, || self.messages.contains(100) && self.messages.media_path(100).is_some()).await {
+        if !poll_until(4000, || self.messages.contains(100) && !self.messages.is_loading()).await
+            || !self.scroll_into_view(100).await
+            || !poll_until(4000, || self.messages.media_path(100).is_some()).await {
             probe_fail("photo recovery fixture"); return false;
         }
         self.open_viewer(100);
@@ -12930,6 +12974,20 @@ impl ShellInner {
             probe_fail("late voice stole playback or became unplayable"); return false;
         }
         self.messages.reset_players();
+
+        probe_step("switching chats cancels pending view downloads");
+        self.messages.reset_media(800);
+        self.clone().start_media_download(800, false);
+        if !self.media_downloads.borrow().contains_key(&800) {
+            probe_fail("pending view download fixture"); return false;
+        }
+        self.clone().open_chat(3);
+        if self.media_downloads.borrow().contains_key(&800) {
+            probe_fail("old view still owns download capacity"); return false;
+        }
+        if !poll_until(4000, || self.open_chat.get() == Some(3) && !self.messages.is_loading()).await {
+            probe_fail("chat switch after cancelling media"); return false;
+        }
 
         probe_step("notification photos use the private user and group identity");
         for (chat_id, sender_id) in [(1, 1), (4, 4001)] {
@@ -13911,6 +13969,13 @@ impl ShellInner {
         }
 
         probe_step("card location");
+        let visible = self.scroll_into_view(805).await;
+        if !visible
+            || !poll_until(3500, || matches!(self.messages.media_state(805), Some(MediaState::InFlight | MediaState::Done(_)))).await {
+            shell_log!("location download: initially_visible={visible}, now_visible={}, state={:?}, jobs={:?}, {}",
+                self.messages.row_visible(805), self.messages.media_state(805), self.media_downloads.borrow().keys(), self.messages.probe_scroll_state(805));
+            probe_fail("visible location starts its download"); return false;
+        }
         // The asciiload effect is opt-in (off by default in smoke), so the
         // placeholder path is proven by the row having a media state at all;
         // the effect source is only checked when the effect is enabled.
@@ -13939,6 +14004,27 @@ impl ShellInner {
             return false;
         }
 
+        probe_step("map completion releases paging suppression at the bottom");
+        let Some(path) = self.messages.media_path(805) else { probe_fail("map paging fixture"); return false; };
+        let Ok(texture) = gdk::Texture::from_filename(&path) else { probe_fail("map paging texture"); return false; };
+        let Some(generation) = self.messages.media_generation(805) else { probe_fail("map paging generation"); return false; };
+        self.messages.scroll_to_bottom();
+        if !self.messages.finish_image(805, generation, path, &texture)
+            || !poll_until(1500, || !self.messages.probe_paging_suppressed()).await {
+            probe_fail("map completion left paging suppressed"); return false;
+        }
+        if !self.scroll_into_view(805).await { probe_fail("scrolling after map completion"); return false; }
+
+        probe_step("explicit navigation supersedes pending media layout scroll");
+        let Some(path) = self.messages.media_path(805) else { probe_fail("navigation map fixture"); return false; };
+        self.messages.scroll_to_bottom();
+        self.messages.finish_image(805, generation, path, &texture);
+        self.messages.scroll_to_message(805);
+        glib::timeout_future(Duration::from_millis(300)).await;
+        if !self.messages.row_visible(805) || self.messages.probe_paging_suppressed() {
+            probe_fail("pending media layout replaced explicit navigation"); return false;
+        }
+
         probe_step("card venue");
         if !poll_until(
             3_500,
@@ -13956,6 +14042,7 @@ impl ShellInner {
         }
 
         probe_step("card live location");
+        if !self.scroll_into_view(807).await { probe_fail("visible live location"); return false; }
         if !poll_until(
             3_500,
             || {

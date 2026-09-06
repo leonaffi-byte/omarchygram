@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -9,10 +9,13 @@ use gtk4 as gtk;
 
 use crate::tg::Tg;
 
+type DecodeLocks = HashMap<(PathBuf, i32), std::rc::Weak<tokio::sync::Mutex<()>>>;
+
 thread_local! {
     // Account/photo IDs are part of the immutable filename. Eviction releases
     // textures; no encoded file copies are retained here.
     static TEXTURES: RefCell<VecDeque<(PathBuf, i32, gtk::gdk::Texture)>> = const { RefCell::new(VecDeque::new()) };
+    static DECODE_LOCKS: RefCell<DecodeLocks> = RefCell::new(HashMap::new());
 }
 const CACHE_BYTES: usize = 16 * 1024 * 1024;
 static DECODERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
@@ -20,6 +23,18 @@ static DECODERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 pub fn clear_cache() { TEXTURES.with(|cache| cache.borrow_mut().clear()); }
 
 async fn avatar_texture(path: PathBuf, target: i32) -> Option<gtk::gdk::Texture> {
+    // Repeated group messages share one decode/texture, including the first
+    // load when several downloads complete in the same main-loop iteration.
+    let lock = DECODE_LOCKS.with(|locks| {
+        let mut locks = locks.borrow_mut();
+        if locks.len() > 128 { locks.retain(|_, lock| lock.strong_count() > 0); }
+        let weak = locks.entry((path.clone(), target)).or_default();
+        if let Some(lock) = weak.upgrade() { return lock; }
+        let lock = Rc::new(tokio::sync::Mutex::new(()));
+        *weak = Rc::downgrade(&lock);
+        lock
+    });
+    let _guard = lock.lock().await;
     let cached = TEXTURES.with(|cache| {
         let mut cache = cache.borrow_mut();
         let index = cache.iter().position(|(p, size, _)| p == &path && *size == target)?;
@@ -153,6 +168,8 @@ impl Avatar {
     pub fn key(&self) -> i64 {
         self.key.get()
     }
+
+    pub fn photo_loaded(&self) -> bool { self.picture.paintable().is_some() }
 
     pub fn set_story_ring(&self, ring: crate::tg::StoryRing) {
         self.widget.remove_css_class("omg-story-unread");

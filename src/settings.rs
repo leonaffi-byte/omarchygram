@@ -274,6 +274,13 @@ impl SettingsStore {
         self.current.borrow().clone()
     }
 
+    /// Animation callbacks read this on every frame. Do not clone all settings
+    /// (including key bindings, provider strings and actions) for one flag.
+    pub fn animation_enabled(&self, id: &str) -> bool {
+        let settings = self.current.borrow();
+        settings.animation(id) || id == "liveclock" && settings.header_clock
+    }
+
     /// Mutate, persist, and notify listeners. The change is committed to the
     /// live state ONLY if it could be saved, so controls and backend flags
     /// never diverge from disk. Failures are logged; see `try_update`.

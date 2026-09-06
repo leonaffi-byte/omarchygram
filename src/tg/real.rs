@@ -49,6 +49,7 @@ pub(in crate::tg) struct Ctx {
     presence_active: AtomicBool,
     downloads: Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     download_slots: tokio::sync::Semaphore,
+    avatar_slots: tokio::sync::Semaphore,
     dialogs_loaded: tokio::sync::Mutex<bool>,
     peers: Mutex<HashMap<i64, PeerRef>>,
     titles: Mutex<HashMap<i64, String>>,
@@ -102,6 +103,7 @@ impl Ctx {
             presence_active: AtomicBool::new(false),
             downloads: Mutex::new(HashMap::new()),
             download_slots: tokio::sync::Semaphore::new(4),
+            avatar_slots: tokio::sync::Semaphore::new(2),
             dialogs_loaded: tokio::sync::Mutex::new(false),
             peers: Mutex::new(HashMap::new()), titles: Mutex::new(HashMap::new()),
             media: Mutex::new(HashMap::new()), archive, flags: Mutex::new(flags),
@@ -339,8 +341,11 @@ async fn handle_data(client: Client, ctx: Arc<Ctx>, cmd: Command) {
             messages.retain(|m| !m.deleted || ctx.flags.lock().unwrap().anti_delete);
             let _ = respond.send(Ok(messages));
         }
-        Command::DownloadMedia { chat_id, msg_id, redownload, respond } => {
-            let _ = respond.send(download_media(&client, &ctx, chat_id, msg_id, redownload).await);
+        Command::DownloadMedia { chat_id, msg_id, redownload, mut respond } => {
+            tokio::select! {
+                _ = respond.closed() => {},
+                result = download_media(&client, &ctx, chat_id, msg_id, redownload) => { let _ = respond.send(result); }
+            }
         }
         Command::SendText { chat_id, text, reply_to, respond } => {
             reply_message(&ctx, respond, send_text(&client, &ctx, chat_id, &text, reply_to).await);
@@ -1096,6 +1101,7 @@ async fn get_history(
     }
     let mut out = Vec::new();
     while let Some(m) = iter.next().await.map_err(|e| e.to_string())? {
+        remember_from_message(ctx, &m, chat_id).await;
         out.push(convert(ctx, &m, chat_id));
         if out.len() >= 50 {
             break;
@@ -1117,6 +1123,7 @@ async fn get_topic_history(client: &Client, ctx: &Arc<Ctx>, forum_id: i64, topic
         if let Some(before) = before_id { iter = iter.offset_id(before); }
         let mut page = Vec::new();
         while let Some(message) = iter.next().await.map_err(|e| e.to_string())? {
+            remember_from_message(ctx, &message, forum_id).await;
             let message = convert(ctx, &message, forum_id);
             if super::msg_in_chat(&message, synthetic) { page.push(message); }
             if page.len() == 50 { break; }
@@ -1141,7 +1148,12 @@ async fn get_topic_history(client: &Client, ctx: &Arc<Ctx>, forum_id: i64, topic
         .map_err(|e| format!("topic history failed: {e}"))?;
     let ids: Vec<i32> = raw_messages(r).iter().filter_map(raw_message_id).collect();
     let fetched = client.get_messages_by_id(peer, &ids).await.map_err(|e| e.to_string())?;
-    let mut out: Vec<Msg> = fetched.into_iter().flatten().map(|m| convert(ctx, &m, forum_id)).filter(|m| super::msg_in_chat(m, synthetic)).collect();
+    let mut out = Vec::new();
+    for message in fetched.into_iter().flatten() {
+        remember_from_message(ctx, &message, forum_id).await;
+        let message = convert(ctx, &message, forum_id);
+        if super::msg_in_chat(&message, synthetic) { out.push(message); }
+    }
     out.sort_by_key(|m| m.id);
     merge_deleted(ctx, synthetic, before_id, &mut out).await;
     Ok(out)
@@ -1199,6 +1211,7 @@ async fn get_history_at_date(
         .limit(50);
     let mut out = Vec::new();
     while let Some(m) = iter.next().await.map_err(|e| e.to_string())? {
+        remember_from_message(ctx, &m, chat_id).await;
         out.push(convert(ctx, &m, chat_id));
         if out.len() >= 50 {
             break;
@@ -1361,7 +1374,8 @@ async fn download_complete<D: grammers_client::media::Downloadable>(
     // The vendored grammers patch flushes both download paths before returning.
     // Keep its parallel downloader and allow large files on slow links; a
     // total-transfer deadline would restart them indefinitely.
-    client.download_media(media, pending.path()).await.map_err(|e| format!("download failed: {e}"))?;
+    retry_download(|| client.download_media(media, pending.path())).await
+        .map_err(|e| format!("download failed: {e}"))?;
     if !complete_file(pending.path()) { return Err("download returned an empty file; try again".into()); }
     let destination = path.to_owned();
     tokio::task::spawn_blocking(move || {
@@ -1377,6 +1391,34 @@ async fn download_complete<D: grammers_client::media::Downloadable>(
 
 fn complete_file(path: &std::path::Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// Reconnect once for a dropped connection or a temporary Telegram server
+/// error. Disk, permission and reference errors need their specific recovery.
+fn transient_download_error(error: &grammers_client::InvocationError) -> bool {
+    use grammers_client::InvocationError;
+    match error {
+        InvocationError::Rpc(error) => error.code >= 500,
+        InvocationError::Io(error) => {
+            if let Some(inner) = error.get_ref().and_then(|e| e.downcast_ref::<InvocationError>()) {
+                return transient_download_error(inner);
+            }
+            matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::TimedOut | std::io::ErrorKind::UnexpectedEof)
+        }
+        _ => false,
+    }
+}
+
+async fn retry_download<F, R>(mut request: F) -> Result<(), grammers_client::InvocationError>
+where F: FnMut() -> R, R: std::future::Future<Output = Result<(), grammers_client::InvocationError>> {
+    match request().await {
+        Err(error) if transient_download_error(&error) => {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            request().await
+        }
+        result => result,
+    }
 }
 
 async fn send_text(
@@ -2155,6 +2197,16 @@ fn private_dir(dir: &std::path::Path) -> Result<(), TgError> {
 
 async fn download_avatar(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, big: bool, refresh: bool) -> Result<Option<PathBuf>, TgError> {
     if refresh { get_chat_info(client, ctx, chat_id).await?; }
+    let result = download_avatar_file(client, ctx, chat_id, big, refresh).await;
+    if !refresh && result.as_ref().is_err_and(|error| error.contains("PHOTO_ID_INVALID")
+        || error.contains("FILE_REFERENCE_") || error.contains("LOCATION_INVALID")) {
+        get_chat_info(client, ctx, chat_id).await?;
+        return download_avatar_file(client, ctx, chat_id, big, false).await;
+    }
+    result
+}
+
+async fn download_avatar_file(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, big: bool, refresh: bool) -> Result<Option<PathBuf>, TgError> {
     let Some(photo_id) = ctx.photos.lock().unwrap().get(&chat_id).copied() else {
         return Ok(None);
     };
@@ -2180,6 +2232,9 @@ async fn download_avatar(client: &Client, ctx: &Arc<Ctx>, chat_id: i64, big: boo
             photo_id,
         }),
     };
+    // A long sidebar must not queue every avatar ahead of message downloads.
+    // At most two avatars contend for the four shared transfer slots.
+    let _avatar = ctx.avatar_slots.acquire().await.map_err(|_| "Avatar service stopped")?;
     download_complete(client, ctx, &location, &path, false).await?;
     Ok(Some(path))
 }
@@ -2333,6 +2388,7 @@ async fn search_messages(
     }
     let mut out = Vec::new();
     while let Some(m) = iter.next().await.map_err(|e| e.to_string())? {
+        remember_from_message(ctx, &m, chat_id).await;
         out.push(convert(ctx, &m, chat_id));
         if out.len() >= 50 {
             break;
@@ -4164,6 +4220,32 @@ mod media_recovery_tests {
         let result = with_fresh_media(Some(1), || -> std::future::Ready<Result<Option<i32>, TgError>> { panic!("do not refresh a network or disk error") },
             |_| ready(Err("disk full".into()))).await;
         assert_eq!(result.unwrap_err(), "disk full");
+    }
+
+    #[tokio::test]
+    async fn transient_download_reconnects_once_without_retrying_disk_errors() {
+        use grammers_client::InvocationError;
+        use std::io::{Error, ErrorKind};
+        let attempts = Cell::new(0);
+        retry_download(|| {
+            attempts.set(attempts.get() + 1);
+            ready(if attempts.get() == 1 { Err(InvocationError::Io(Error::from(ErrorKind::ConnectionReset))) } else { Ok(()) })
+        }).await.unwrap();
+        assert_eq!(attempts.get(), 2);
+        attempts.set(0);
+        assert!(retry_download(|| {
+            attempts.set(attempts.get() + 1);
+            ready(Err(InvocationError::Io(Error::from(ErrorKind::TimedOut))))
+        }).await.is_err());
+        assert_eq!(attempts.get(), 2, "a broken connection must not retry forever");
+        attempts.set(0);
+        assert!(retry_download(|| {
+            attempts.set(attempts.get() + 1);
+            ready(Err(InvocationError::Io(Error::from(ErrorKind::PermissionDenied))))
+        }).await.is_err());
+        assert_eq!(attempts.get(), 1, "permissions cannot be fixed by reconnecting");
+        let wrapped = InvocationError::Io(Error::other(InvocationError::Io(Error::from(ErrorKind::BrokenPipe))));
+        assert!(transient_download_error(&wrapped), "the sequential SDK wraps network errors in io::Error");
     }
 
     #[test]

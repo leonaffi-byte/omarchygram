@@ -427,10 +427,7 @@ impl EffectsCore {
             return false;
         }
         self.previewing.borrow().contains(id)
-            || self.settings.upgrade().is_some_and(|settings| {
-                let settings = settings.get();
-                settings.animation(id) || id == "liveclock" && settings.header_clock
-            })
+            || self.settings.upgrade().is_some_and(|settings| settings.animation_enabled(id))
     }
 
     fn finish_tick(&self, serial: u64, remove: bool) {
@@ -1141,6 +1138,7 @@ impl Effects {
             return;
         }
         if show {
+            if chip.is_visible() { return; }
             chip.set_visible(true);
             chip.remove_css_class("omg-run-datefloat");
             chip.add_css_class("omg-run-datefloat");

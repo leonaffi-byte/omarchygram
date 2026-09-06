@@ -265,14 +265,16 @@ impl Client {
         // Start workers
         let (tx, mut rx) = unbounded_channel();
         let part_index = Arc::new(tokio::sync::Mutex::<i64>::new(0));
-        let mut tasks = vec![];
+        // Dropping a cancelled download aborts its workers instead of leaving
+        // them fetching chunks for a receiver that no longer exists.
+        let mut tasks = tokio::task::JoinSet::new();
         let home_dc_id = self.0.session.home_dc_id()?;
         for _ in 0..workers {
             let location = location.clone();
             let tx = tx.clone();
             let part_index = part_index.clone();
             let client = self.clone();
-            let task = tokio::task::spawn(async move {
+            tasks.spawn(async move {
                 let mut retry_offset = None;
                 let mut dc = home_dc_id;
                 loop {
@@ -300,7 +302,9 @@ impl Client {
                     };
                     match client.invoke_in_dc(dc, request).await {
                         Ok(tl::enums::upload::File::File(file)) => {
-                            tx.send((offset as u64, file.bytes)).unwrap();
+                            if tx.send((offset as u64, file.bytes)).is_err() {
+                                return Ok(());
+                            }
                         }
                         Ok(tl::enums::upload::File::CdnRedirect(_)) => {
                             panic!(
@@ -329,7 +333,6 @@ impl Client {
                 }
                 Ok::<(), InvocationError>(())
             });
-            tasks.push(task);
         }
         drop(tx);
 
@@ -344,9 +347,8 @@ impl Client {
         }
 
         // Check if all tasks finished succesfully
-        for task in tasks {
-            let res = task.await.map_err(io::Error::other)?;
-            res?;
+        while let Some(result) = tasks.join_next().await {
+            result.map_err(io::Error::other)??;
         }
         file.flush().await?;
         Ok(())

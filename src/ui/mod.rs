@@ -40,6 +40,7 @@ pub mod stories;
 pub mod videonote;
 
 mod video_stream;
+mod media_image;
 
 /// An optional UI callback; owners capture each other weakly where necessary.
 pub type CallbackCell<F> = std::cell::RefCell<Option<std::rc::Rc<F>>>;
