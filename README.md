@@ -125,6 +125,11 @@ messages each, at most 12 MiB of message payload. Cache files are private and
 persist across restarts. A chat without cached history still needs its first
 Telegram response. Failed refreshes keep the cached content and offer Retry.
 
+Off-screen chat badges stop animating, and the vignette reuses its gradient
+pixels. During scrolling and typing, the decorative vignette pulse and flicker
+pause until input has been quiet for 350 ms. Your selected effects then resume.
+Incoming update batches yield to input and drawing during synchronization.
+
 ## Profiles and media
 
 Click a sender's name in a group to view their profile without leaving the

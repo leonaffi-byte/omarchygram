@@ -53,6 +53,7 @@ struct ChatRow {
     avatar_requested: Rc<Cell<bool>>,
     title_text: Rc<RefCell<String>>,
     unread_count: Rc<Cell<i32>>,
+    motion_visible: Rc<Cell<bool>>,
 }
 
 #[derive(Default)]
@@ -298,7 +299,11 @@ impl ChatList {
         };
         this.connect_mode_controls();
         let load = this.avatar_loader.clone();
-        this.scroll.vadjustment().connect_value_changed(move |_| load());
+        let effects = this.effects.clone();
+        this.scroll.vadjustment().connect_value_changed(move |_| {
+            effects.note_input();
+            load();
+        });
         let load = this.avatar_loader.clone();
         this.scroll.vadjustment().connect_changed(move |_| load());
         this
@@ -850,6 +855,13 @@ impl ChatList {
         mapped
     }
 
+    pub fn probe_motion_visible_rows(&self) -> Vec<i64> {
+        let mut ids: Vec<_> = self.rows.borrow().iter()
+            .filter_map(|(id, row)| row.motion_visible.get().then_some(*id)).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     pub fn ordered(&self) -> Vec<(i64, String)> {
         let summaries = self.summaries.borrow();
         self.order
@@ -1305,6 +1317,7 @@ impl ChatList {
                 avatar_requested: Rc::new(Cell::new(false)),
                 title_text: Rc::new(RefCell::new(title.to_string())),
                 unread_count: Rc::new(Cell::new(0)),
+                motion_visible: Rc::new(Cell::new(false)),
             },
         );
         self.order.borrow_mut().push(chat_id);
@@ -1387,7 +1400,7 @@ impl ChatList {
                 icons::CHECK
             });
         self.effects
-            .badge_changed(row.unread.upcast_ref(), old, unread);
+            .badge_changed(row.unread.upcast_ref(), old, unread, row.motion_visible.get());
     }
 
     fn visible_ids(&self) -> Vec<i64> {
@@ -1822,35 +1835,51 @@ fn visible_avatar_loader(
     show: Rc<Cell<bool>>, tg: Tg,
 ) -> Rc<dyn Fn()> {
     let pending = Rc::new(Cell::new(false));
+    let visible = Rc::new(RefCell::new(HashSet::<i64>::new()));
     let rows = Rc::downgrade(&rows);
     let summaries = Rc::downgrade(&summaries);
     let scroll = scroll.downgrade();
     let list = list.downgrade();
     Rc::new(move || {
         if pending.replace(true) { return; }
-        let (pending, scroll, list, rows, summaries, show, tg) =
-            (pending.clone(), scroll.clone(), list.clone(), rows.clone(), summaries.clone(), show.clone(), tg.clone());
+        let (pending, scroll, list, rows, summaries, show, tg, visible) =
+            (pending.clone(), scroll.clone(), list.clone(), rows.clone(), summaries.clone(), show.clone(), tg.clone(), visible.clone());
         glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
             pending.set(false);
-            if !show.get() { return; }
             let (Some(rows), Some(summaries)) = (rows.upgrade(), summaries.upgrade()) else { return };
             let (Some(scroll), Some(list)) = (scroll.upgrade(), list.upgrade()) else { return };
             if !scroll.is_mapped() { return; }
             let adjustment = scroll.vadjustment();
             let top = (adjustment.value() - 100.0).max(0.0);
             let bottom = adjustment.value() + adjustment.page_size() + 100.0;
+            let mut next_visible = HashSet::new();
             let mut current = list.row_at_y(top as i32);
             while let Some(widget) = current {
-                if widget.compute_bounds(&list).is_none_or(|b| f64::from(b.y()) > bottom) { break; }
+                let Some(bounds) = widget.compute_bounds(&list) else { break };
+                if f64::from(bounds.y()) > bottom { break; }
                 current = list.row_at_index(widget.index() + 1);
                 let Some(id) = widget.widget_name().strip_prefix("chat-").and_then(|id| id.parse::<i64>().ok()) else { continue };
                 let row = rows.borrow().get(&id).cloned();
                 let summary = summaries.borrow().get(&id).cloned();
-                if let (Some(row), Some(summary)) = (row, summary)
-                    && summary.has_photo && !row.avatar_requested.replace(true) {
-                    row.avatar.bind(&tg, id, &summary.title, true);
+                if let Some(row) = row {
+                    if f64::from(bounds.y() + bounds.height()) >= adjustment.value()
+                        && f64::from(bounds.y()) <= adjustment.value() + adjustment.page_size() {
+                        next_visible.insert(id);
+                        if !row.motion_visible.replace(true) { row.widget.add_css_class("omg-motion-visible"); }
+                    }
+                    if let Some(summary) = summary
+                        && show.get() && summary.has_photo && !row.avatar_requested.replace(true) {
+                        row.avatar.bind(&tg, id, &summary.title, true);
+                    }
                 }
             }
+            for id in visible.borrow().difference(&next_visible) {
+                if let Some(row) = rows.borrow().get(id) {
+                    row.motion_visible.set(false);
+                    row.widget.remove_css_class("omg-motion-visible");
+                }
+            }
+            *visible.borrow_mut() = next_visible;
         });
     })
 }

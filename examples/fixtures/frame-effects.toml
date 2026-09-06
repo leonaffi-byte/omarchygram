@@ -1,0 +1,46 @@
+[animations]
+asciiload = true
+attachunfold = true
+badgepop = true
+badgepulse = true
+badgeroll = true
+bellshake = true
+bootlog = true
+borderdraw = true
+braille = true
+chargesend = true
+composercursor = true
+cursorcomet = true
+datefloat = true
+deletedissolve = true
+editripple = true
+ellipsis = true
+equalizer = true
+flicker = true
+focusdim = true
+glitch = true
+gridshimmer = true
+hovertrace = true
+invert = true
+jumprocket = true
+liveclock = true
+matrixrain = true
+onlinebreathe = true
+phosphorburn = true
+poweron = true
+reactburst = true
+reactroll = true
+receiptdraw = true
+scanlines = true
+scansweep = true
+selbaron = true
+staticerror = true
+thememorph = true
+tsreveal = true
+unreadcomet = true
+unreaddivider = true
+vignette = true
+wipe = true
+
+[ui]
+compact_list = true

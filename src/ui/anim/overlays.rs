@@ -12,7 +12,7 @@ use super::{Effects, EffectsCore, tick_start};
 pub(super) struct OverlayState {
     launched: bool,
     scanlines: Option<gtk::DrawingArea>,
-    vignette: Option<gtk::DrawingArea>,
+    vignette: Option<super::vignette::Vignette>,
     flicker: Option<gtk::Box>,
     empty_host: Option<glib::WeakRef<gtk::Overlay>>,
     matrix: Option<gtk::DrawingArea>,
@@ -40,6 +40,10 @@ pub(super) fn sync_permanent(core: &EffectsCore) {
         && let Some(grid) = state.grid.take() {
             remove_from_overlay(&grid);
         }
+}
+
+pub(super) fn vignette_rasterizations(core: &EffectsCore) -> Option<u64> {
+    core.overlays.borrow().vignette.as_ref().map(super::vignette::Vignette::rasterizations)
 }
 
 fn remove_from_overlay(widget: &impl IsA<gtk::Widget>) {
@@ -116,46 +120,20 @@ fn ensure_vignette(effects: &Effects, host: &gtk::Overlay) {
         area.set_visible(true);
         return;
     }
-    let area = gtk::DrawingArea::new();
+    let area = super::vignette::Vignette::new();
     area.add_css_class("omg-overlay-ink");
     area.set_hexpand(true);
     area.set_vexpand(true);
     area.set_can_target(false);
-    area.set_draw_func(|area, context, width, height| {
-        let color = area.color();
-        let radius = f64::from(width.max(height)).max(1.0) * 0.72;
-        let gradient = gtk::cairo::RadialGradient::new(
-            f64::from(width) / 2.0,
-            f64::from(height) / 2.0,
-            radius * 0.25,
-            f64::from(width) / 2.0,
-            f64::from(height) / 2.0,
-            radius,
-        );
-        add_gradient_stop(
-            gradient.as_ref(),
-            0.0,
-            color.red() as f64,
-            color.green() as f64,
-            color.blue() as f64,
-            0.0,
-        );
-        add_gradient_stop(
-            gradient.as_ref(),
-            1.0,
-            color.red() as f64,
-            color.green() as f64,
-            color.blue() as f64,
-            0.74,
-        );
-        let _ = context.set_source(&gradient);
-        let _ = context.paint();
-    });
     host.add_overlay(&area);
     effects.core.overlays.borrow_mut().vignette = Some(area.clone());
     let started = Cell::new(None::<i64>);
     let area_for_tick = area.clone();
+    let weak = std::rc::Rc::downgrade(&effects.core);
     effects.tracked_tick(area.upcast_ref(), &["vignette"], move |_, clock| {
+        if weak.upgrade().is_some_and(|core| !core.ambient_active()) {
+            return glib::ControlFlow::Continue;
+        }
         let start = tick_start(&started, clock.frame_time());
         let phase = ((clock.frame_time() - start) as f64 / 5_000_000.0) * TAU;
         area_for_tick.set_opacity(0.78 + phase.sin() * 0.12);
@@ -181,7 +159,12 @@ fn ensure_flicker(effects: &Effects, host: &gtk::Overlay) {
     effects.core.overlays.borrow_mut().flicker = Some(flicker.clone());
     let started = Cell::new(None::<i64>);
     let flicker_for_tick = flicker.clone();
+    let weak = std::rc::Rc::downgrade(&effects.core);
     effects.tracked_tick(flicker.upcast_ref(), &["flicker"], move |_, clock| {
+        if weak.upgrade().is_some_and(|core| !core.ambient_active()) {
+            flicker_for_tick.set_opacity(0.0);
+            return glib::ControlFlow::Continue;
+        }
         let start = tick_start(&started, clock.frame_time());
         let frame = ((clock.frame_time() - start) / 16_667) % 360;
         flicker_for_tick.set_opacity(match frame {
@@ -627,16 +610,4 @@ fn ensure_matrix(effects: &Effects, host: &gtk::Overlay) {
 fn set_source_color(context: &gtk::cairo::Context, red: f64, green: f64, blue: f64, alpha: f64) {
     let apply = gtk::cairo::Context::set_source_rgba;
     apply(context, red, green, blue, alpha);
-}
-
-fn add_gradient_stop(
-    gradient: &gtk::cairo::Gradient,
-    offset: f64,
-    red: f64,
-    green: f64,
-    blue: f64,
-    alpha: f64,
-) {
-    let apply = gtk::cairo::Gradient::add_color_stop_rgba;
-    apply(gradient, offset, red, green, blue, alpha);
 }

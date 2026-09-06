@@ -718,6 +718,11 @@ scrollbar slider:hover {
   animation: omg-badgepulse 2.4s ease-in-out infinite;
 }
 
+/* GtkListBox keeps clipped rows mapped. Do not animate their badge styles. */
+.omg-window .omg-chat-row:not(.omg-motion-visible) .omg-unread {
+  animation: none;
+}
+
 .omg-window.omg-anim-bellshake .omg-run-bellshake {
   animation: omg-bellshake 400ms linear 1;
 }

@@ -5,6 +5,7 @@ pub mod avatar;
 pub mod bots;
 pub mod call;
 pub mod chatlist;
+mod event_loop;
 pub mod contacts;
 pub mod forward;
 pub mod icons;

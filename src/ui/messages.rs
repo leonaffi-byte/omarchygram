@@ -1675,6 +1675,7 @@ impl MessagesView {
                 if inner.suppress_paging.get() {
                     return;
                 }
+                inner.effects.note_input();
                 inner
                     .stick_to_bottom
                     .set(adjustment.value() >= adjustment.upper() - adjustment.page_size() - 4.0);
@@ -2196,6 +2197,7 @@ impl MessagesView {
     }
 
     fn claim_scroll(&self) {
+        self.inner.effects.note_input();
         self.cancel_pending_scroll();
         self.inner.suppress_paging.set(false);
         self.inner.stick_to_bottom.set(false);

@@ -4424,11 +4424,11 @@ impl ShellInner {
         let this = self.clone();
         let events = self.tg.events.clone();
         glib::MainContext::default().spawn_local(async move {
-            while let Ok(event) = events.recv().await {
+            super::event_loop::dispatch(events, move |event| {
                 if this.session_ready.get() {
                     this.handle_event(event);
                 }
-            }
+            }).await;
             shell_log!("event loop: backend event stream closed");
         });
     }
@@ -4969,6 +4969,10 @@ impl ShellInner {
             if matches!(event.event_type(), gtk::gdk::EventType::KeyPress | gtk::gdk::EventType::ButtonPress
                 | gtk::gdk::EventType::TouchBegin | gtk::gdk::EventType::Scroll | gtk::gdk::EventType::MotionNotify)
                 && let Some(this) = weak.upgrade() {
+                if event.event_type() != gtk::gdk::EventType::MotionNotify
+                    || event.modifier_state().contains(gtk::gdk::ModifierType::BUTTON1_MASK) {
+                    this.effects.note_input();
+                }
                 this.presence_last_activity.set(std::time::Instant::now());
                 this.update_online_status();
             }

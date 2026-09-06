@@ -13,6 +13,7 @@ use crate::settings::{Settings, SettingsStore};
 use crate::tg::Msg;
 
 pub mod overlays;
+mod vignette;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RadioGroup {
@@ -415,9 +416,14 @@ struct EffectsCore {
     preview: RefCell<Option<PreviewRun>>,
     next_preview: Cell<u64>,
     overlays: RefCell<overlays::OverlayState>,
+    last_input: Cell<Option<std::time::Instant>>,
 }
 
 impl EffectsCore {
+    fn ambient_active(&self) -> bool {
+        self.last_input.get().is_none_or(|at| at.elapsed() >= Duration::from_millis(350))
+    }
+
     fn animations_enabled() -> bool {
         gtk::Settings::default().is_none_or(|settings| settings.is_gtk_enable_animations())
     }
@@ -586,6 +592,7 @@ impl Effects {
             preview: RefCell::new(None),
             next_preview: Cell::new(0),
             overlays: RefCell::new(overlays::OverlayState::default()),
+            last_input: Cell::new(None),
         });
         let effects = Rc::new(Self { settings, core });
         {
@@ -624,6 +631,15 @@ impl Effects {
 
     pub fn live_tick_count(&self) -> usize {
         self.core.live_ticks.get()
+    }
+
+    /// Keep large decorative layers stable while the user scrolls/types.
+    pub fn note_input(&self) { self.core.last_input.set(Some(std::time::Instant::now())); }
+
+    pub fn ambient_active(&self) -> bool { self.core.ambient_active() }
+
+    pub fn probe_vignette_rasterizations(&self) -> Option<u64> {
+        overlays::vignette_rasterizations(&self.core)
     }
 
     pub fn sync(&self) {
@@ -826,8 +842,12 @@ impl Effects {
         indicator.set_visible(true);
     }
 
-    pub fn badge_changed(&self, badge: &gtk::Widget, old: i32, new: i32) {
-        if old == new {
+    pub fn badge_changed(&self, badge: &gtk::Widget, old: i32, new: i32, animate: bool) {
+        // Keep the count's pulse eligibility even when disabled/offscreen;
+        // root preferences and viewport CSS decide when it actually runs.
+        if new > 0 { badge.add_css_class("omg-run-badgepulse"); }
+        else { badge.remove_css_class("omg-run-badgepulse"); }
+        if old == new || !animate {
             return;
         }
         if self.on("badgepop") {
@@ -847,11 +867,6 @@ impl Effects {
                     }
                 });
             }
-        }
-        if self.on("badgepulse") && new > 0 {
-            badge.add_css_class("omg-run-badgepulse");
-        } else {
-            badge.remove_css_class("omg-run-badgepulse");
         }
     }
 
@@ -1328,6 +1343,7 @@ impl Effects {
             preview: RefCell::new(None),
             next_preview: Cell::new(0),
             overlays: RefCell::new(overlays::OverlayState::default()),
+            last_input: Cell::new(None),
         });
         let preview_effects = Effects {
             settings: self.settings.clone(),
@@ -1408,7 +1424,7 @@ impl Effects {
             "deletedissolve" => {
                 self.message_deleted(&widget);
             }
-            "badgepop" | "badgeroll" | "badgepulse" => self.badge_changed(&widget, 1, 2),
+            "badgepop" | "badgeroll" | "badgepulse" => self.badge_changed(&widget, 1, 2, true),
             "bellshake" => self.mention(&widget),
             "asciiload" => {
                 let _ = self.image_loading(demo);
