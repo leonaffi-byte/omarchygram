@@ -242,6 +242,18 @@ list. They are **local**: nothing you type there goes to Telegram.
 `/catchup [chat]` (what did I miss), `/translate <lang> <text>`,
 `/summarize <text>`, `/search <question>`, or just type.
 
+Click **Start** to open the assistant's introduction and composer. To summarize
+a range in a real chat, right-click the first message → **Summarize from here**,
+then the last → **Summarize to here**. Both endpoints and every message between
+them are included, even across history pages. The private summary panel has
+Copy, Cancel/Close, and Retry controls; it never posts the result to Telegram.
+Voice notes in the selected range are transcribed one at a time, reusing cached
+transcripts. Failed transcripts stop the summary with an error instead of
+silently omitting speech. Long ranges are summarized in parts, up to 2,000
+messages and one million characters. Closing the panel, switching chats,
+clearing/deleting the chat, disabling AI, or logging out cancels the request.
+Automatic transcription continues to apply only to new incoming voice notes.
+
 **Omarchy** — run desktop actions by name: `help`, `list`, `screenshot`,
 `lock`, `notify <text>`, `volume raise`, `theme <name>`, `themes`,
 `terminal`, `status`, plus every Omarchy tool installed on the machine
@@ -285,9 +297,18 @@ braille typing spinners, badge pops and rolls, CRT power-on, boot log,
 scanlines, vignette, matrix rain in the empty state, cursor comet, theme
 morph, and more. Every effect is an individual toggle with a Preview button;
 three presets (Purist = all off, Subtle, Full phosphor) set a whole mood at
-once. Mutually exclusive styles (message entry, send feedback, chat switch)
+once. Screen flicker briefly dims the whole window every six seconds; Error
+static flashes noise across it on errors. Both require an individual opt-in
+and are excluded from every preset. Mutually exclusive
+styles (message entry, send feedback, chat switch)
 are one-of groups. All effects respect GTK's reduced-motion setting
 (`gtk-enable-animations`). Everything is off by default.
+
+Message rendering skips rows outside the viewport while retaining the complete
+layout, selection, and accessibility tree. Scanlines reuse a
+one-pixel-wide texture, replaying the original drawing at the display's pixel
+grid, including fractional scaling. Reproduction and measured frame rates are in
+[the performance report](specs/100-fps-performance.md).
 
 ## Theming
 

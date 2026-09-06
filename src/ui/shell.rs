@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
+mod summary;
+
 use chrono::{DateTime, Local};
 use gtk::gdk;
 use gtk::gio;
@@ -810,6 +812,9 @@ struct ShellInner {
     tombstones: RefCell<HashMap<i64, HashSet<i32>>>,
     virtual_stores: RefCell<HashMap<i64, VirtualStore>>,
     aux: RefCell<AuxState>,
+    summary_range: RefCell<Option<summary::Selection>>,
+    summary_task: RefCell<Option<glib::JoinHandle<()>>>,
+    summary_voice: Cell<Option<(i64, i32)>>,
     transcription_active: RefCell<HashMap<(i64, i32), TranscriptionJob>>,
     transcription_queue: RefCell<VecDeque<(i64, i32)>>,
     media_downloads: RefCell<HashMap<i32, glib::JoinHandle<()>>>,
@@ -1076,6 +1081,9 @@ impl Shell {
             tombstones: RefCell::new(HashMap::new()),
             virtual_stores: RefCell::new(virtual_stores),
             aux: RefCell::new(AuxState::default()),
+            summary_range: RefCell::new(None),
+            summary_task: RefCell::new(None),
+            summary_voice: Cell::new(None),
             transcription_active: RefCell::new(HashMap::new()),
             transcription_queue: RefCell::new(VecDeque::new()),
             media_downloads: RefCell::new(HashMap::new()),
@@ -1541,6 +1549,8 @@ impl ShellInner {
                         this.close_info_panel();
                     } else if this.messages.search_is_open() {
                         this.close_in_chat_search();
+                    } else if this.messages.summary_panel().widget.is_visible() {
+                        this.close_summary();
                     } else if this.switcher.is_open() {
                         this.pending_inline_query.borrow_mut().take();
                         this.clear_window_focus();
@@ -1656,6 +1666,7 @@ impl ShellInner {
             return;
         }
         self.auto_transcribe_since.set(None);
+        self.close_summary();
         self.cancel_transcriptions(false);
         // Story content is account-scoped and sits above the auth stack.
         // Tear it down synchronously before any logout await can yield.
@@ -1780,6 +1791,7 @@ impl ShellInner {
         self.messages.set_ghost(settings.ghost_mode);
         self.messages.set_edit_history(settings.edit_history);
         self.messages.set_ai_enabled(settings.ai.enabled);
+        if !settings.ai.enabled { self.close_summary(); }
         self.call.set_ringtone_enabled(settings.calls.ringtone);
         self.chatlist.set_show_avatars(settings.ui.show_avatars);
         self.messages.set_show_sender_avatars(settings.ui.show_avatars);
@@ -3004,6 +3016,9 @@ impl ShellInner {
             if !self.session_ready.get() {
                 return;
             }
+            // Clearing/deleting the chat invalidates the range and any text
+            // already fetched for its private summary, before the RPC yields.
+            if self.open_chat.get() == Some(chat_id) { self.close_summary(); }
             self.begin_chat_mutation();
             let result = match action {
                 ChatAction::ClearHistory => self.tg.clear_history(chat_id).await,
@@ -5398,6 +5413,7 @@ impl ShellInner {
         if self.open_chat.get() == Some(chat_id) {
             return;
         }
+        self.close_summary();
         self.cancel_recording();
         self.main_menu.dismiss();
         self.chatlist.dismiss_popovers();
@@ -6035,6 +6051,11 @@ impl ShellInner {
             MessageAction::DraftReply(msg_id) => self.draft_reply(msg_id),
             MessageAction::Translate(msg_id) => self.translate_message(msg_id),
             MessageAction::Summarize(msg_id) => self.summarize_message(msg_id),
+            MessageAction::SummaryBegin => self.select_summary_start(None),
+            MessageAction::SummaryFrom(msg_id) => self.select_summary_start(Some(msg_id)),
+            MessageAction::SummaryTo(msg_id) => self.select_summary_end(msg_id),
+            MessageAction::SummaryClose => self.close_summary(),
+            MessageAction::SummaryRetry => self.start_summary(),
             MessageAction::Transcribe(msg_id) => self.request_transcription(msg_id),
         }
     }
@@ -6646,9 +6667,17 @@ impl ShellInner {
 
     /// Bot Start button (wave 6E §6.2): sends `/start`.
     fn send_start(self: Rc<Self>) {
-        let Some(chat_id) = self.open_chat.get().filter(|id| !is_virtual(*id)) else {
+        if !self.session_ready.get() { return; }
+        let Some(chat_id) = self.open_chat.get() else {
             return;
         };
+        if chat_id == ASSISTANT_CHAT && self.settings.get().ai.enabled {
+            self.messages.set_start_mode(false);
+            self.messages.focus_composer();
+            self.dispatch_assistant("/start".into());
+            return;
+        }
+        if is_virtual(chat_id) { return; }
         let epoch = self.epoch.get();
         let title = self.title_for(chat_id);
         glib::MainContext::default().spawn_local(async move {
@@ -7334,10 +7363,10 @@ impl ShellInner {
         }
         self.begin_virtual_request(ASSISTANT_CHAT);
         let trimmed = line.trim();
-        if trimmed == "/help" {
+        if matches!(trimmed, "/help" | "/start") {
             self.finish_virtual(
                 ASSISTANT_CHAT,
-                Ok("Assistant commands\n/help\n/status\n/catchup [chat title]\n/translate <lang> <text>\n/summarize <text>\n/search <question>".into()),
+                Ok("Ask me a question here, or summarize a conversation inside any chat. Right-click the first message → Summarize from here, then the last → Summarize to here. Both messages and everything between them are included, with voice transcripts. Summaries are private and use your configured AI provider.\n\nCommands\n/help\n/status — check available providers\n/catchup [chat title]\n/translate <lang> <text>\n/summarize <text>\n/search <question>\n\nChoose providers in Settings → AI. If none is available, add an API key under [ai] in config.toml or run Ollama locally.".into()),
                 false,
             );
             return;
@@ -11625,6 +11654,17 @@ impl ShellInner {
 
         // Assistant commands use the offline AI provider in smoke mode.
         self.clone().open_chat(ASSISTANT_CHAT);
+        probe_step("Assistant Start opens local help and composer");
+        if !self.messages.start_button_visible() || self.messages.composer_visible() {
+            probe_fail("Assistant initial Start state"); return;
+        }
+        self.messages.click_start();
+        if self.messages.start_button_visible() || !self.messages.composer_visible()
+            || self.messages.empty_history_label_visible()
+            || !self.messages.messages().iter().any(|m| m.text.contains("Summarize from here")) {
+            probe_fail("Assistant Start was inert"); return;
+        }
+        self.probe_capture("assistant-start").await;
         let before_status = virtual_last_id(&self.virtual_stores, ASSISTANT_CHAT);
         self.messages.set_composer_text("/status");
         self.clone().submit_composer();
@@ -11703,6 +11743,7 @@ impl ShellInner {
             probe_fail("open Mom");
             return;
         }
+        if !self.probe_range_summary(mom, marta).await { return; }
         self.clone().request_transcription(301);
         probe_step("voice transcript");
         if !poll_until(2500, || self.messages.aux_contains(301, "transcript:")).await {
@@ -11777,6 +11818,15 @@ impl ShellInner {
             }
         }
         self.settings.update(apply_full_phosphor);
+        probe_step("phosphor preset leaves whole-window flashes opt-in");
+        if ["flicker", "staticerror"].iter().any(|id| self.settings.get().animations.get(*id) != Some(&false)) {
+            probe_fail("phosphor preset enables whole-window flashes");
+            return;
+        }
+        // Still exercise both individual effects and their cleanup below.
+        self.settings.update(|settings| {
+            for id in ["flicker", "staticerror"] { settings.animations.insert(id.into(), true); }
+        });
         glib::timeout_future(Duration::from_millis(200)).await;
 
         self.clone().open_chat(marta);
@@ -13255,6 +13305,11 @@ impl ShellInner {
             let state = self.ui_state.borrow();
             state.sidebar_width + state.info_width.max(280) + 560
         };
+        probe_step("group profile photo stays square beside a long title");
+        if !poll_until(4_000, || self.info.probe_profile_photo_geometry().is_ok()).await {
+            probe_fail(&format!("group profile photo layout: {:?}", self.info.probe_profile_photo_geometry()));
+            return false;
+        }
         probe_step("info boundary preserves 560px conversation");
         self.resize_window_for_probe(&window, dock_at - 1).await;
         if !poll_until(1_000, || self.info.layout() == InfoLayout::Overlay).await {
@@ -13360,6 +13415,50 @@ impl ShellInner {
             probe_fail("stickers open chat");
             return false;
         }
+        probe_step("sidebar profile and shared photos stay square at every pane width");
+        if !poll_until(4_000, || self.info.is_bound(marta)
+            && self.info.probe_picture_geometry().is_ok()).await {
+            probe_fail(&format!("sidebar photo layout: {:?}", self.info.probe_picture_geometry()));
+            return false;
+        }
+        self.probe_capture_widget("sidebar-profile", self.info.widget.upcast_ref()).await;
+        let saved_info_width = self.ui_state.borrow().info_width;
+        for width in [280, 360, 440] {
+            self.ui_state.borrow_mut().info_width = width;
+            self.apply_info_layout(self.current_window_width());
+            wait_for_frame(self.info.widget.upcast_ref()).await;
+            if !poll_until(1_000, || self.info.probe_picture_geometry().is_ok()).await {
+                probe_fail(&format!("sidebar photo layout at {width}: {:?}", self.info.probe_picture_geometry()));
+                return false;
+            }
+            self.info.probe_scroll_shared();
+            self.probe_capture_widget(&format!("sidebar-photos-{width}"), self.info.widget.upcast_ref()).await;
+        }
+        self.ui_state.borrow_mut().info_width = saved_info_width;
+        self.apply_info_layout(self.current_window_width());
+
+        probe_step("avatar refresh retains the current photo without leaking across peers");
+        let avatar = super::avatar::Avatar::new(96);
+        avatar.bind(&self.tg, marta, "Marta", true);
+        if !poll_until(4_000, || avatar.photo_loaded()).await {
+            probe_fail("avatar refresh fixture"); return false;
+        }
+        avatar.bind(&self.tg, marta, "Marta updated", true);
+        if !avatar.photo_loaded() || avatar.widget.visible_child_name().as_deref() != Some("photo") {
+            probe_fail("same-peer refresh flashes initials"); return false;
+        }
+        avatar.bind(&self.tg, group, "Arch Linux ARM", true);
+        if avatar.photo_loaded() { probe_fail("new peer retained previous photo"); return false; }
+        if !poll_until(4_000, || avatar.photo_loaded()).await {
+            probe_fail("replacement avatar fixture"); return false;
+        }
+        avatar.bind(&self.tg, group, "Arch Linux ARM", false);
+        if avatar.photo_loaded() { probe_fail("removed avatar is still visible"); return false; }
+        avatar.bind(&self.tg, marta, "Marta", true);
+        avatar.bind(&self.tg, group, "Arch Linux ARM", false);
+        glib::timeout_future(Duration::from_millis(600)).await;
+        if avatar.photo_loaded() { probe_fail("stale avatar completion replaced current peer"); return false; }
+
         probe_step("sticker popover");
         self.open_stickers();
         if !poll_until(4_000, || {

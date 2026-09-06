@@ -69,8 +69,11 @@ impl Local {
                             Cmd::Detect(prefs, tx) => {
                                 let _ = tx.send(ai::detect(&prefs).await);
                             }
-                            Cmd::Chat { prefs, system, messages, respond } => {
-                                let _ = respond.send(ai::chat(&prefs, &system, &messages).await);
+                            Cmd::Chat { prefs, system, messages, mut respond } => {
+                                tokio::select! {
+                                    _ = respond.closed() => {},
+                                    result = ai::chat(&prefs, &system, &messages) => { let _ = respond.send(result); }
+                                }
                             }
                             Cmd::Transcribe { prefs, path, mut respond } => {
                                 tokio::select! {

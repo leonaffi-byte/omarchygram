@@ -3,6 +3,8 @@
 # smoke runs, probes and screenshots never appear on the user's desktop.
 #   bin/headless ./target/debug/omarchygram --smoke --probe
 #   bin/headless env OMG_SMOKE_SHOT=$PWD/target/shots/x.png OMG_SMOKE_OPEN=Marta ./target/debug/omarchygram --smoke
+# OMG_HEADLESS_REFRESH is in mHz; 144000 enables a private 144 Hz output.
+# OMG_HEADLESS_RENDERER=gl enables compositor GPU buffers for rendering probes.
 # Requires: sudo pacman -S --needed weston
 set -euo pipefail
 if ! command -v weston >/dev/null; then
@@ -14,16 +16,23 @@ log=$(mktemp -t omg-weston.XXXXXX)
 width=${OMG_HEADLESS_WIDTH:-1200}
 height=${OMG_HEADLESS_HEIGHT:-800}
 scale=${OMG_HEADLESS_SCALE:-1}
-weston --backend=headless --socket="$sock" --width="$width" --height="$height" --scale="$scale" --idle-time=0 >"$log" 2>&1 &
+refresh=${OMG_HEADLESS_REFRESH:-60000}
+weston_args=(--backend=headless --socket="$sock" --width="$width" --height="$height" --scale="$scale" --refresh-rate="$refresh" --idle-time=0)
+if [[ -n "${OMG_HEADLESS_RENDERER:-}" ]]; then weston_args+=(--renderer="$OMG_HEADLESS_RENDERER"); fi
+weston "${weston_args[@]}" >"$log" 2>&1 &
 wpid=$!
-cleanup() { kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true; rm -f "$log"; }
+cleanup() {
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  if [[ -n "${OMG_HEADLESS_LOG:-}" ]]; then cp "$log" "$OMG_HEADLESS_LOG"; fi
+  rm -f "$log"
+}
 trap cleanup EXIT INT TERM
 # Under load weston can take a while to bring the socket up; wait up to 20s,
 # retrying once with a fresh instance.
 wait_sock() { for _ in $(seq 1 200); do [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$sock" ] && return 0; sleep 0.1; done; return 1; }
 if ! wait_sock; then
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
-  weston --backend=headless --socket="$sock" --width="$width" --height="$height" --scale="$scale" --idle-time=0 >"$log" 2>&1 &
+  weston "${weston_args[@]}" >"$log" 2>&1 &
   wpid=$!
   wait_sock || true
 fi

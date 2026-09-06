@@ -123,6 +123,7 @@ impl InfoPanel {
         let avatar = Avatar::new(96);
         let photo = gtk::Button::new();
         photo.add_css_class("omg-profile-photo");
+        photo.set_halign(gtk::Align::Center);
         photo.set_child(Some(&avatar.widget));
         photo.set_tooltip_text(Some("Open profile photo"));
         photo.update_property(&[gtk::accessible::Property::Label("Open profile photo")]);
@@ -750,6 +751,45 @@ impl InfoPanel {
 
     pub fn probe_photo(&self) { self.photo.emit_clicked(); }
 
+    pub fn probe_profile_photo_geometry(&self) -> Result<(), String> {
+        if self.show_avatars.get() {
+            for widget in [self.photo.upcast_ref::<gtk::Widget>(), self.avatar.widget.upcast_ref()] {
+                if widget.width() < 96 || (widget.width() - widget.height()).abs() > 1 {
+                    return Err(format!("profile photo is {}x{}", widget.width(), widget.height()));
+                }
+            }
+            if !self.avatar.photo_loaded() { return Err("profile photo not loaded".into()); }
+        }
+        Ok(())
+    }
+
+    pub fn probe_picture_geometry(&self) -> Result<(), String> {
+        self.probe_profile_photo_geometry()?;
+        let pictures = self.thumbnail_pictures.borrow();
+        if pictures.is_empty() { return Err("no thumbnail fixtures".into()); }
+        let grid = self.shared_list.first_child().ok_or("missing photo grid")?;
+        for picture in pictures.values() {
+            if picture.paintable().is_none() || picture.width() < 56
+                || (picture.width() - picture.height()).abs() > 1 {
+                return Err(format!("thumbnail is {}x{}, loaded={}", picture.width(), picture.height(), picture.paintable().is_some()));
+            }
+            let cell = picture.parent().and_then(|p| p.parent()).and_then(|p| p.parent())
+                .ok_or("thumbnail has no cell")?;
+            if cell.width() > (grid.width() - 8) / 3 + 1 {
+                return Err(format!("thumbnail cell {} exceeds a third of grid {}", cell.width(), grid.width()));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn probe_scroll_shared(&self) {
+        if let Some(scroll) = self.shared_list.ancestor(gtk::ScrolledWindow::static_type())
+            .and_downcast::<gtk::ScrolledWindow>() {
+            let adjustment = scroll.vadjustment();
+            adjustment.set_value(adjustment.upper() - adjustment.page_size());
+        }
+    }
+
     pub fn info_retry_visible(&self) -> bool {
         self.info_retry.is_visible()
     }
@@ -862,6 +902,11 @@ impl InfoPanel {
                     grid.set_column_homogeneous(true);
                     grid.set_row_spacing(4);
                     grid.set_column_spacing(4);
+                    // Reserve all three columns even when the first page has
+                    // only one or two photos. Empty anchors have no height.
+                    for column in 0..3 {
+                        grid.attach(&gtk::Box::new(gtk::Orientation::Vertical, 0), column, 0, 1, 1);
+                    }
                     self.shared_list.append(&grid);
                     grid
                 });
@@ -873,14 +918,16 @@ impl InfoPanel {
                 let picture = gtk::Picture::new();
                 picture.set_content_fit(gtk::ContentFit::Cover);
                 picture.set_can_shrink(true);
-                picture.set_size_request(72, 72);
+                picture.set_halign(gtk::Align::Fill);
+                picture.set_valign(gtk::Align::Fill);
                 picture.set_visible(false);
                 overlay.add_overlay(&picture);
-                cell.set_child(Some(&overlay));
+                overlay.set_clip_overlay(&picture, true);
+                cell.set_child(Some(&super::square::Square::new(&overlay)));
                 let action = self.action.clone();
                 cell.connect_clicked(move |_| emit(&action, InfoAction::OpenMedia(message.id)));
                 let index = start_index + index;
-                grid.attach(&cell, (index % 3) as i32, (index / 3) as i32, 1, 1);
+                grid.attach(&cell, (index % 3) as i32, (index / 3 + 1) as i32, 1, 1);
                 self.thumbnail_pictures
                     .borrow_mut()
                     .insert(message.id, picture);

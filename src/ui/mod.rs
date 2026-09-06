@@ -33,6 +33,7 @@ pub mod topics;
 pub mod viewer;
 pub mod profile;
 pub mod virtual_chat;
+mod summary;
 /// Wave 6D rasterizer (orchestrator-owned; see specs/spec-wave6.md §5.1).
 pub mod lottie_backend;
 /// Wave 6F: stories strip and viewer.
@@ -42,6 +43,8 @@ pub mod videonote;
 
 mod video_stream;
 mod media_image;
+mod viewport;
+mod square;
 
 /// An optional UI callback; owners capture each other weakly where necessary.
 pub type CallbackCell<F> = std::cell::RefCell<Option<std::rc::Rc<F>>>;

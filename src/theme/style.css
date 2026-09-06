@@ -2157,3 +2157,8 @@ button.omg-profile-photo:focus-visible { outline: 2px solid var(--accent); }
 .omg-msg-bubble { padding: 6px 10px; border-radius: 4px; }
 button.omg-sender-avatar { padding: 0; margin: 0 0 2px; min-width: 32px; min-height: 32px; border: none; background: transparent; }
 button.omg-sender-avatar:hover { outline: 1px solid var(--accent); outline-offset: 2px; }
+.omg-chat-summary {
+    padding: 8px 16px;
+    background: var(--bg-dark);
+    border-top: 1px solid var(--bg-lighter);
+}

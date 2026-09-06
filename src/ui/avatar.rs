@@ -117,6 +117,10 @@ impl Avatar {
     }
 
     pub fn bind(&self, tg: &Tg, id: i64, name: &str, has_photo: bool) {
+        // Presence/details refreshes often rebind the same peer. Keep its
+        // existing texture until the replacement is ready, including on a
+        // transient download error. A different peer must never inherit it.
+        let keep_photo = self.key.get() == id && has_photo && self.photo_loaded();
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
         self.key.set(id);
@@ -127,8 +131,10 @@ impl Avatar {
         }
         self.initials
             .add_css_class(&format!("omg-avatar-c{}", color_index(id)));
-        self.picture.set_paintable(None::<&gtk::gdk::Paintable>);
-        self.widget.set_visible_child_name("initials");
+        if !keep_photo {
+            self.picture.set_paintable(None::<&gtk::gdk::Paintable>);
+            self.widget.set_visible_child_name("initials");
+        }
         self.widget.set_tooltip_text(Some(name));
         if !has_photo {
             return;

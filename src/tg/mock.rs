@@ -1261,12 +1261,14 @@ async fn handle(cmd: Command, st: Arc<Mutex<MockState>>, events: async_channel::
             let mut result = match before_id {
                 None => msgs,
                 Some(before) => {
-                    // Fabricate one older page so pagination can be exercised, then stop.
-                    if chat_id == 1 && msgs.first().is_some_and(|m| m.id == before) {
-                        older_marta_messages()
-                    } else {
-                        vec![]
-                    }
+                    // Honor arbitrary exclusive offsets, including endpoints
+                    // inside a page used by range summaries.
+                    let mut older = if chat_id == 1 { older_marta_messages() } else { Vec::new() };
+                    older.extend(msgs);
+                    older.retain(|m| m.id < before);
+                    older.sort_by_key(|m| m.id);
+                    older.dedup_by_key(|m| m.id);
+                    older.split_off(older.len().saturating_sub(50))
                 }
             };
             if st.flags.anti_delete {

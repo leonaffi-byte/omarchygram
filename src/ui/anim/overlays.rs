@@ -11,7 +11,7 @@ use super::{Effects, EffectsCore, tick_start};
 #[derive(Default)]
 pub(super) struct OverlayState {
     launched: bool,
-    scanlines: Option<gtk::DrawingArea>,
+    scanlines: Option<super::scanlines::Scanlines>,
     vignette: Option<super::vignette::Vignette>,
     flicker: Option<gtk::Box>,
     empty_host: Option<glib::WeakRef<gtk::Overlay>>,
@@ -44,6 +44,10 @@ pub(super) fn sync_permanent(core: &EffectsCore) {
 
 pub(super) fn vignette_rasterizations(core: &EffectsCore) -> Option<u64> {
     core.overlays.borrow().vignette.as_ref().map(super::vignette::Vignette::rasterizations)
+}
+
+pub(super) fn scanline_comparison(core: &EffectsCore, scale: f64) -> Option<(gtk::gsk::RenderNode, gtk::gsk::RenderNode, gtk::graphene::Rect)> {
+    core.overlays.borrow().scanlines.as_ref()?.comparison(scale)
 }
 
 fn remove_from_overlay(widget: &impl IsA<gtk::Widget>) {
@@ -87,27 +91,11 @@ fn ensure_scanlines(effects: &Effects, host: &gtk::Overlay) {
         area.set_visible(true);
         return;
     }
-    let area = gtk::DrawingArea::new();
+    let area = super::scanlines::Scanlines::new();
     area.add_css_class("omg-overlay-ink");
     area.set_hexpand(true);
     area.set_vexpand(true);
     area.set_can_target(false);
-    area.set_draw_func(|area, context, width, height| {
-        let color = area.color();
-        set_source_color(
-            context,
-            color.red() as f64,
-            color.green() as f64,
-            color.blue() as f64,
-            0.16,
-        );
-        let mut y = 0;
-        while y < height {
-            context.rectangle(0.0, y as f64, width as f64, 1.0);
-            y += 3;
-        }
-        let _ = context.fill();
-    });
     host.add_overlay(&area);
     effects.core.overlays.borrow_mut().scanlines = Some(area);
 }

@@ -325,6 +325,11 @@ pub enum MessageAction {
     DraftReply(i32),
     Translate(i32),
     Summarize(i32),
+    SummaryBegin,
+    SummaryFrom(i32),
+    SummaryTo(i32),
+    SummaryClose,
+    SummaryRetry,
     Transcribe(i32),
 }
 
@@ -497,6 +502,7 @@ struct MessagesInner {
     emoji: gtk::Button,
     drop_target: gtk::DropTarget,
     selection_bar: gtk::Box,
+    summary: super::summary::SummaryPanel,
     selection_count: gtk::Label,
     selection_copy: gtk::Button,
     selection_forward: gtk::Button,
@@ -779,14 +785,14 @@ impl MessagesView {
 
         // Spacing comes from the rows themselves (4px same sender / 12px
         // otherwise), so the list adds none.
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let scroll = gtk::ScrolledWindow::new();
+        let list = super::viewport::message_box(&scroll);
         list.add_css_class("omg-messages");
         list.set_margin_start(16);
         list.set_margin_end(16);
         list.set_margin_top(8);
         list.set_margin_bottom(8);
 
-        let scroll = gtk::ScrolledWindow::new();
         scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         scroll.set_child(Some(&list));
         scroll.set_hexpand(true);
@@ -912,6 +918,9 @@ impl MessagesView {
         selection_cancel.set_tooltip_text(Some("Cancel selection"));
         selection_bar.append(&selection_cancel);
         widget.append(&selection_bar);
+
+        let summary = super::summary::SummaryPanel::new();
+        widget.append(&summary.widget);
 
         let recorder = RecorderBar::new();
         widget.append(&recorder.widget);
@@ -1132,6 +1141,7 @@ impl MessagesView {
             emoji,
             drop_target,
             selection_bar,
+            summary,
             selection_count,
             selection_copy: selection_copy.clone(),
             selection_forward: selection_forward.clone(),
@@ -1235,6 +1245,7 @@ impl MessagesView {
             selection_forward,
             selection_cancel,
         );
+        view.inner.summary.connect(view.inner.action.clone());
         {
             let weak = Rc::downgrade(&view.inner);
             view.inner.history_retry.connect_clicked(move |_| {
@@ -2641,6 +2652,9 @@ impl MessagesView {
             && self.inner.effects.on("unreaddivider")
             && !self.inner.unread_divider_shown.replace(true);
         let inserted = self.merge(vec![message], true, show_unread_divider);
+        if !inserted.is_empty() && self.inner.loading.label() == "No messages yet" {
+            self.inner.loading.set_visible(false);
+        }
         if self.inner.bot_start.get() && !inserted.is_empty() {
             self.set_start_mode(false);
         }
@@ -3718,6 +3732,16 @@ impl MessagesView {
         }
 
         if inner.ai_enabled.get() {
+            if message.id > 0 {
+                let from = menu_button("Summarize from here", false);
+                Self::connect_menu_action(inner, &from, &popover, MessageAction::SummaryFrom(msg_id));
+                menu.append(&from);
+                if inner.summary.first.get().is_some() {
+                    let to = menu_button("Summarize to here", false);
+                    Self::connect_menu_action(inner, &to, &popover, MessageAction::SummaryTo(msg_id));
+                    menu.append(&to);
+                }
+            }
             let draft = menu_button("Draft reply with AI", false);
             Self::connect_menu_action(inner, &draft, &popover, MessageAction::DraftReply(msg_id));
             menu.append(&draft);
@@ -3773,6 +3797,11 @@ impl MessagesView {
             return;
         };
         let (popover, contents) = menus::popover();
+        if inner.ai_enabled.get() {
+            let summary = menus::button("Summarize messages…", false);
+            Self::connect_menu_action(inner, &summary, &popover, MessageAction::SummaryBegin);
+            contents.append(&summary);
+        }
         let actions = [
             ("Search", ChatAction::Search, false),
             (
@@ -4761,6 +4790,10 @@ impl MessagesView {
         self.inner.loading.is_visible() && self.inner.loading.label() == "Loading…"
     }
 
+    pub fn empty_history_label_visible(&self) -> bool {
+        self.inner.loading.is_visible() && self.inner.loading.label() == "No messages yet"
+    }
+
     pub fn is_empty_state(&self) -> bool {
         self.inner.loading.is_visible() && self.inner.store.borrow().chat_id.is_none()
     }
@@ -5195,6 +5228,23 @@ impl MessagesView {
         };
         button.emit_clicked();
         true
+    }
+
+    pub fn probe_message_menu_click(&self, msg_id: i32, label: &str) -> bool {
+        Self::show_context_menu(&self.inner, msg_id, 0.0, 0.0);
+        let popover = self.inner.context_popover.borrow().as_ref().cloned();
+        let Some(contents) = popover.and_then(|p| p.child()) else { return false };
+        let mut child = contents.first_child();
+        while let Some(widget) = child {
+            if let Ok(button) = widget.clone().downcast::<gtk::Button>()
+                && button.label().as_deref() == Some(label) {
+                button.emit_clicked();
+                return true;
+            }
+            child = widget.next_sibling();
+        }
+        self.dismiss_row_popovers();
+        false
     }
 
     pub fn probe_retry_available_reactions(&self, msg_id: i32) -> bool {
@@ -6363,6 +6413,12 @@ impl MessagesView {
 
     pub fn probe_paging_suppressed(&self) -> bool { self.inner.suppress_paging.get() }
 
+    pub fn probe_request_viewport_snapshot(&self) { super::viewport::request_comparison(&self.inner.list); }
+
+    pub fn probe_take_viewport_snapshot(&self) -> Option<(gtk::gsk::RenderNode, gtk::gsk::RenderNode, gtk::graphene::Rect)> {
+        super::viewport::take_comparison(&self.inner.list)
+    }
+
     pub fn probe_scroll_state(&self, id: i32) -> String {
         let adjustment = self.inner.scroll.vadjustment();
         let bounds = self.inner.store.borrow().entries.get(&id)
@@ -6531,6 +6587,8 @@ impl MessagesView {
             self.dismiss_row_popovers();
         }
     }
+
+    pub fn summary_panel(&self) -> super::summary::SummaryPanel { self.inner.summary.clone() }
 
     pub fn set_status(&self, text: Option<&str>) {
         match text {
@@ -7011,7 +7069,7 @@ impl MessagesView {
         self.inner.probe_reaction_chooser.borrow_mut().take();
     }
 
-    fn move_focus_before_removal(&self, subtree: &impl IsA<gtk::Widget>) {
+    pub(super) fn move_focus_before_removal(&self, subtree: &impl IsA<gtk::Widget>) {
         let Some(root) = self.widget.root() else {
             return;
         };

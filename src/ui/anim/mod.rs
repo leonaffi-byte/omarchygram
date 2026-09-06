@@ -14,6 +14,7 @@ use crate::tg::Msg;
 
 pub mod overlays;
 mod vignette;
+mod scanlines;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RadioGroup {
@@ -278,7 +279,7 @@ pub const EFFECTS: &[EffectSpec] = &[
     EffectSpec {
         id: "flicker",
         label: "Screen flicker",
-        description: "Occasionally flicker the window like an old monitor.",
+        description: "Briefly dim the whole window every six seconds. Enable individually if desired.",
         group: None,
     },
     EffectSpec {
@@ -296,7 +297,7 @@ pub const EFFECTS: &[EffectSpec] = &[
     EffectSpec {
         id: "staticerror",
         label: "Error static",
-        description: "Briefly show static when sending fails.",
+        description: "Flash static across the whole window on errors. Enable individually if desired.",
         group: None,
     },
     EffectSpec {
@@ -640,6 +641,10 @@ impl Effects {
 
     pub fn probe_vignette_rasterizations(&self) -> Option<u64> {
         overlays::vignette_rasterizations(&self.core)
+    }
+
+    pub fn probe_scanline_comparison(&self, scale: f64) -> Option<(gtk::gsk::RenderNode, gtk::gsk::RenderNode, gtk::graphene::Rect)> {
+        overlays::scanline_comparison(&self.core, scale)
     }
 
     pub fn sync(&self) {
@@ -1681,6 +1686,8 @@ pub fn apply_subtle(settings: &mut Settings) {
 pub fn apply_full_phosphor(settings: &mut Settings) {
     apply_purist(settings);
     let excluded = [
+        "flicker",
+        "staticerror",
         "typewriter",
         "lineprint",
         "instantcursor",
@@ -1695,7 +1702,7 @@ pub fn apply_full_phosphor(settings: &mut Settings) {
             .insert(effect.id.to_string(), !excluded.contains(&effect.id));
     }
     // The lab preset predates the radio controls. Preserve one valid choice
-    // per group while retaining every non-radio phosphor effect.
+    // per group. Whole-window flashes remain explicit individual opt-ins.
     select_radio(settings, "decode", ENTRY_GROUP);
     select_radio(settings, "invert", SEND_GROUP);
     select_radio(settings, "wipe", SWITCH_GROUP);

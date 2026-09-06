@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 pub mod prompts;
+pub mod summary;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(180);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -285,6 +286,10 @@ pub async fn chat(prefs: &Prefs, system: &str, messages: &[ChatMessage]) -> Resu
         let last = messages.last().map(|m| m.content.as_str()).unwrap_or("");
         let text = if system.contains("summarize what happened") {
             "(mock ai) Marta asked whether Thursday is still on — that needs a reply.".to_string()
+        } else if system.contains("selected message range") {
+            let value = serde_json::from_str::<Value>(last).unwrap_or_default();
+            let selected = value.get("selected_messages").and_then(Value::as_str).unwrap_or(last);
+            format!("(mock summary)\n{}", selected.chars().take(6_000).collect::<String>())
         } else if system.contains("draft a reply") {
             "(mock ai) Thursday works for me, see you at 7.".to_string()
         } else if system.contains("translate") {
@@ -532,7 +537,8 @@ async fn audio_api(name: &str, base: &str, key: &str, model: &str, path: &Path) 
         return Err(http_err(name, status, &text).replace(key, "[redacted]"));
     }
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("{name}: bad json: {e}"))?;
-    v.get("text").and_then(|t| t.as_str()).map(|s| s.trim().to_string()).ok_or_else(|| format!("{name}: no text in response"))
+    v.get("text").and_then(|t| t.as_str()).map(|s| s.trim().to_string())
+        .filter(|text| !text.is_empty()).ok_or_else(|| format!("{name}: no speech text in response"))
 }
 
 /// Cache extensions are not a reliable format indicator: Telegram voice notes
