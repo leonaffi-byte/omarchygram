@@ -304,11 +304,30 @@ styles (message entry, send feedback, chat switch)
 are one-of groups. All effects respect GTK's reduced-motion setting
 (`gtk-enable-animations`). Everything is off by default.
 
-Message rendering skips rows outside the viewport while retaining the complete
-layout, selection, and accessibility tree. Scanlines reuse a
-one-pixel-wide texture, replaying the original drawing at the display's pixel
-grid, including fractional scaling. Reproduction and measured frame rates are in
-[the performance report](specs/100-fps-performance.md).
+Chat and message lists build full controls around the viewport while keeping
+the complete history and accessible text available. Offscreen text controls
+and photo textures can be released; selection, revealed spoilers, translations,
+and keyboard focus survive returning to a message. Two recent jump destinations
+stay ready for back-and-forth navigation. Photo originals remain on disk, with
+an 8 MiB decoded-preview cache and nearby images restored ahead of scrolling.
+Scanlines reuse a one-pixel-wide texture at the display's pixel grid, including
+fractional scaling. Earlier rendering measurements are in
+[the frame performance report](specs/100-fps-performance.md).
+
+The offline benchmark suite measures chat opening, search, scrolling, resource
+usage, cache/database operations and media decoding. It uses mock data and a
+private headless compositor:
+
+```sh
+cargo build --release --bin omarchygram --example performance_audit --example frame_perf_probe
+bin/run-performance-audit --output target/performance-audit-new
+```
+
+Run benchmarks without a simultaneous build or UI gate. Raw results and a run
+manifest are written to the selected directory. The original baseline is in
+[the 0.1.7 audit](specs/performance-audit-0.1.7.md), with the measured changes in
+[the 0.1.8 validation](specs/performance-audit-0.1.8.md). Requirements and acceptance
+results are in [the responsiveness report](specs/responsiveness-targets.md).
 
 ## Theming
 
@@ -362,6 +381,13 @@ not committed to this repository; fetch it once before building:
 ```
 bin/fetch-ntgcalls
 ```
+
+The Linux build uses the system GLib and FFmpeg libraries, avoiding duplicate
+copies in the executable. The pinned engine requires GLib 2.88+ and FFmpeg ABI
+versions avformat/avcodec 63, avutil 61, and swresample 7. The build checks these
+versions; another FFmpeg ABI requires rebuilding the engine against matching
+headers. Release executables on x86-64 Linux also require glibc 2.36+ for compact
+ELF relocations. See [the build integration notes](vendor/ntgcalls-sys/README.omarchy.md).
 
 To build without call support (smaller binary, no ntgcalls):
 

@@ -1076,7 +1076,14 @@ button.omg-search-row:hover {
 }
 
 .omg-search-results {
+  background: transparent;
   padding: 8px;
+}
+
+listview.omg-search-results > row {
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
 .omg-list-state {

@@ -16,3 +16,4 @@ build/
 # Wave 7: vendored ntgcalls static lib (fetched by bin/fetch-ntgcalls, 128 MB)
 /vendor/*
 !/vendor/grammers-client/
+!/vendor/ntgcalls-sys/

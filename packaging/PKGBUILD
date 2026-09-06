@@ -18,6 +18,8 @@ arch=('x86_64')
 url="https://github.com/leonaffi-byte/omarchygram"
 license=('GPL-3.0-or-later')
 depends=(
+  'glibc>=2.36'
+  'glib2>=2.88'
   'gtk4'
   'gstreamer'
   'gst-plugins-base'

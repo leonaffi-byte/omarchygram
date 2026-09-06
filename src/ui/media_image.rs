@@ -7,12 +7,20 @@ thread_local! {
     static PREVIEWS: RefCell<VecDeque<Entry>> = const { RefCell::new(VecDeque::new()) };
 }
 static DECODERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-const CACHE_BYTES: usize = 32 * 1024 * 1024;
+// Originals stay on disk. Keep decoded previews bounded; the message view
+// retains visible textures and restores nearby ones before they enter view.
+const CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn clear_cache() { PREVIEWS.with(|cache| cache.borrow_mut().clear()); }
 
 pub async fn preview(path: PathBuf, edge: i32, refresh: bool) -> Result<gdk::Texture, String> {
-    let edge = edge.clamp(360, 2160);
+    restore_preview(path, edge.clamp(360, 2160), refresh).await
+}
+
+/// Restore the exact preview size already displayed, including small source
+/// images. Evicting an offscreen texture must not change its pixels or layout.
+pub(super) async fn restore_preview(path: PathBuf, edge: i32, refresh: bool) -> Result<gdk::Texture, String> {
+    let edge = edge.clamp(1, 2160);
     let cached = PREVIEWS.with(|cache| {
         let mut cache = cache.borrow_mut();
         if refresh { cache.retain(|(p, _, _)| p != &path); }
@@ -56,6 +64,27 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), original, "zoom and save still use the original file");
         super::clear_cache();
         std::fs::remove_file(path).unwrap();
+        })).unwrap();
+    }
+
+    #[test]
+    fn restored_preview_preserves_small_image_pixels_and_dimensions() {
+        let context = gtk4::glib::MainContext::new();
+        context.with_thread_default(|| context.block_on(async {
+            let path = std::env::temp_dir().join(format!("omg-restore-test-{}.png", std::process::id()));
+            image::RgbaImage::from_fn(64, 32, |x, y|
+                image::Rgba([x as u8 * 3, y as u8 * 7, (x + y) as u8, 255]))
+                .save(&path).unwrap();
+            let original = gtk4::gdk::Texture::from_file(&gtk4::gio::File::for_path(&path)).unwrap();
+            let restored = super::restore_preview(path.clone(), 64, false).await.unwrap();
+            assert_eq!((restored.width(), restored.height()), (64, 32));
+            let mut expected = vec![0; 64 * 32 * 4];
+            let mut actual = expected.clone();
+            original.download(&mut expected, 64 * 4);
+            restored.download(&mut actual, 64 * 4);
+            assert_eq!(actual, expected, "rehydration preserves the original pixels");
+            super::clear_cache();
+            std::fs::remove_file(path).unwrap();
         })).unwrap();
     }
 }

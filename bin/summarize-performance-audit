@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Regenerate the historical 0.1.7 audit, including its captured live observations.
+
+New benchmark runs write independent JSON/manifest files via run-performance-audit.
+This historical report must never relabel a newer build as the 0.1.7 baseline.
+"""
+import csv
+import json
+import math
+from pathlib import Path
+import re
+import statistics
+import tomllib
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "target/performance-audit"
+
+
+def records(name):
+    return [json.loads(line) for line in (OUT / name).read_text().splitlines() if line.startswith("{")]
+
+
+def num(value):
+    if value is None: return "—"
+    return f"{value:.4f}" if abs(value) < .01 else f"{value:.3f}" if abs(value) < 1 else f"{value:.2f}"
+
+
+def pretty(name):
+    return {"archive_version_lookup_10000_rows": "archive prior-version lookup (empty result; growing database)"}.get(name, name.replace("_", " "))
+
+
+def main():
+    baseline = json.loads((OUT / "build-provenance.json").read_text())
+    assert baseline.get("version", baseline.get("source_version")) == "0.1.7", \
+        "this report describes only the archived 0.1.7 baseline"
+    assert next(row["version"] for row in records("native-ui.jsonl") if "version" in row) == "0.1.7"
+    manifest = json.loads((OUT / "manifest.json").read_text())
+    assert len(manifest) == 19 and all(item["exit"] == 0 for item in manifest)
+    env = json.loads((OUT / "environment.json").read_text())
+    services = records("services.jsonl")
+    extra_services = []
+    service_repeat_runs = []
+    for repeat in [2, 3]:
+        metadata_path = OUT / f"services-btrfs-{repeat}-run.json"
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text())
+            assert metadata["exit"] == 0
+            service_repeat_runs.append(metadata)
+            extra_services += records(f"services-btrfs-{repeat}.jsonl")
+    for row in services:
+        if "samples_ms" in row:
+            for extra in extra_services:
+                if extra.get("metric") == row["metric"]:
+                    row["samples_ms"].extend(extra["samples_ms"])
+    local = services + records("native-ui.jsonl")
+    # Pool/normalize summaries from the recorded samples, without retiming them.
+    for row in local:
+        if "samples_ms" in row:
+            values = sorted(row["samples_ms"])
+            row.update(n=len(values), min=min(values), max=max(values), median=statistics.median(values),
+                       p95=values[math.ceil(.95*len(values))-1], mean=statistics.mean(values))
+    rerun_path = OUT / "native-ui-rerun.json"
+    rerun = json.loads(rerun_path.read_text()) if rerun_path.exists() else None
+    assert rerun is None or rerun["exit"] == 0
+    service_rerun_path = OUT / "services-rerun.json"
+    service_rerun = json.loads(service_rerun_path.read_text()) if service_rerun_path.exists() else None
+    assert service_rerun is None or service_rerun["exit"] == 0
+    service_metadata = service_rerun or next(row for row in manifest if row["name"] == "services")
+    filesystem = service_metadata.get("state_filesystem", "tmpfs")
+    cache_storage = {"btrfs": "storage-backed Btrfs", "tmpfs": "RAM-backed tmpfs"}.get(filesystem, filesystem)
+    startup = {}
+    for i in range(1, 6):
+        for row in records(f"startup-{i}.jsonl"):
+            if "samples_ms" in row: startup.setdefault(row["metric"], []).extend(row["samples_ms"])
+    for metric, values in startup.items():
+        values.sort()
+        local.append(dict(metric=metric, n=len(values), unit="ms", min=min(values), max=max(values),
+                          median=statistics.median(values), p95=values[math.ceil(.95*len(values))-1], samples_ms=values))
+    frames = {mode: [row for repeat in range(1,4) for row in records(f"frames-{mode}-{repeat}.jsonl") if "phase" in row]
+              for mode in ["none", "current", "all"]}
+    process = {mode: records(f"process-{mode}.jsonl") for mode in ["none", "current"]}
+    live = json.loads((OUT / "live-process.json").read_text())
+    gpu = json.loads((OUT / "live-gpu.json").read_text())
+    disk = json.loads((OUT / "disk-footprint.json").read_text())
+    provenance = json.loads((OUT / "build-provenance.json").read_text())
+    effects = tomllib.loads((OUT / "current-effects.toml").read_text())["animations"]
+    delayed = records("startup-mock-400ms.jsonl")
+    all_data = dict(environment=env, local=local, delayed_mock=delayed, rendering=frames,
+                    lifecycle=process, live_process=live, live_gpu=gpu, disk=disk, runs=manifest,
+                    final_native_ui_run=rerun, build_provenance=provenance, current_animation_toggles=effects)
+    all_data["final_services_run"] = service_rerun
+    all_data["additional_service_runs"] = service_repeat_runs
+    all_data["additional_service_samples"] = extra_services
+    if (OUT / "services-tmpfs.jsonl").exists():
+        all_data["tmpfs_services_reference"] = records("services-tmpfs.jsonl")
+    (OUT / "measurements.json").write_text(json.dumps(all_data, indent=2))
+    csv_rows = []
+
+    def export_values(category, scenario, metric, unit, values):
+        values = [value for value in values if value is not None]
+        if values:
+            csv_rows.append(dict(category=category, scenario=scenario, metric=metric, unit=unit,
+                                 median=statistics.median(values), p95="", min=min(values), max=max(values), n=len(values)))
+
+    def resource_unit(key):
+        return "KiB" if key.endswith("_kib") else "bytes" if key.endswith("_bytes") else "count"
+
+    for row in local:
+        for stage in ["resources", "before", "after"]:
+            for key, value in row.get(stage, {}).items():
+                export_values("local_resources", f"{row['metric']}/{stage}", key, resource_unit(key), [value])
+        if row.get("metric", "").endswith("encoded_bytes"):
+            export_values("local_fixture", row["metric"], "file_size", "bytes", [row["value"]])
+    timing = [row for row in local if "median" in row]
+    by_name = {row["metric"]: row for row in timing}
+    milliseconds = lambda name: num(by_name[name]["median"])
+    current_fps = lambda phase: num(statistics.median(row["presented_fps"] for row in frames["current"] if row["phase"] == phase))
+    visible_cpu = lambda mode: num(next(row["cpu_percent"] for row in process[mode] if row["metric"] == "release_visible_idle"))
+    deletions = by_name["archive_mark_100_deleted"]
+    lines = ["# Omarchygram 0.1.7 performance measurements", "",
+             "Recorded 2026-09-06 on the installed release from commit `0ddbe71`.", "",
+             "Measurement correction: the original standalone search harness counted matching chats without attaching Shell's result-rendering callback. Its 183.85 ms measures query processing and a frame, not fully rendered search results. The newer harness attaches that callback and checks mapped result content; do not compare the two search numbers as equivalent workloads.", "",
+             "The audit separates scrolling smoothness, interaction latency, backend/local service work, and resource use. High scrolling FPS does not mean that opening a chat is fast.", "",
+             "## Findings", "",
+             f"- Local archive deletion bookkeeping: marking 100 entries deleted took {', '.join(num(value/1000) for value in deletions['samples_ms'])} seconds in the recorded service runs (median {num(deletions['median'])} ms). Source inspection shows batched upserts but individual deletion updates in `src/tg/archive.rs::mark_deleted`. Grouping deletion updates is a profiling/optimization candidate; the precise cause of any storage stalls was not traced.",
+             f"- The local message-view path is the main measured interaction bottleneck: rendering 50 messages took {milliseconds('history_50_initial_to_frame')} ms; the 500-message stress case took {milliseconds('history_500_initial_to_frame')} ms. Reading a 50-message history page from the warm cache fixture on {cache_storage} took {milliseconds('history_cache_50_read_os_warm')} ms. This points to view construction/layout/painting as the next profiling target; it does not exclude network delays in the real account.",
+             f"- Local search across 1,000 chats took {milliseconds('local_chat_search_1000_to_frame')} ms including debounce. Updating the composer after search settled took {milliseconds('composer_update_to_frame')} ms. These are distinct delays.",
+             f"- A first 12 MP image preview took {milliseconds('photo_12mp_to_720px_uncached_decode')} ms; decoded-cache reuse took {milliseconds('photo_720px_memory_cache_hit')} ms. Prioritizing visible previews and retaining bounded decoded textures remains valuable.",
+             f"- Current-effect scrolling medians were {current_fps('sidebar_scroll')} FPS for the chat list, {current_fps('message_scroll')} FPS for messages, and {current_fps('message_scroll_with_info')} FPS with the info sidebar open, on a private 120 Hz output. That is smooth frame delivery in this fixture, with room to reduce rendering CPU work.",
+             f"- Effects increased the small visible mock session's idle CPU from {visible_cpu('none')}% to {visible_cpu('current')}% of one core. Both hidden-background cases consumed less than the counter resolution, approximately 0.04% of one core. The loaded rendering fixture has separate, much higher resource costs; it is not the small idle session.",
+             "- These results support prioritizing archive deletion stalls, chat layout, search response and animated idle work. They do not establish real Telegram delivery speed, Groq response time, or the physical display's FPS.", "",
+             "## Test environment and interpretation", "",
+             f"- CPU: {env['cpu']}; {env['logical_cpus']} logical CPUs; {env['memory_kib']/1024**2:.2f} GiB RAM.",
+             f"- Linux {env['kernel']}; GTK {env['gtk']}; GStreamer {env['gstreamer']}; Mesa 26.2.1; Intel ARL integrated GPU (i915).",
+             "- CPU governor `powersave`, energy preference `performance`, observed from sysfs; neither was changed.",
+             "- Optimized release builds; all application source is unchanged from 0.1.7. Only benchmark tools were added/extended.",
+             "- Timed workloads ran sequentially without concurrent builds or gates. The existing desktop session remained running; other machine activity was not globally controlled.",
+             "- All launched UI runs used `bin/headless`, offline mock Telegram, and private state. No real chat content, outgoing messages, calls, microphone/camera recording, or AI-provider requests were used.",
+             "- UI/startup: 1100×720 requested window, 1× scale, private 60 Hz output, Vulkan. UI latency ends at GTK after-paint, not photons on the user's physical display.",
+             "- Scrolling: 1800×1100 logical window, verified native 1.6× client scale, private 120 Hz output, Vulkan; 1,000 chats, 500 group messages, 50 loaded photos, 50 voice cards and 50 document cards. Video was not playing during scrolling.",
+             "- Three 10-second repetitions per rendering mode/phase. Presentation feedback supplies FPS. The 4 ms diagnostic timer adds overhead: use the separate release-process measurements for idle efficiency.",
+             "- CPU 100% means one fully occupied logical CPU, not the whole 16-CPU machine. RSS includes shared mappings; PSS apportions them. GPU allocations overlap other memory accounting and must not be added to RSS/PSS.",
+             "- Fresh processes/profiles were measured, but the OS disk cache was not dropped. File reads are OS-warm. `uncached decode` means the app's decoded-image cache was cleared.",
+             f"- Service fixtures use {cache_storage}. UI/startup profiles and rendering fixtures use RAM-backed `/tmp`; those mock startup numbers do not include a real account's cold storage load. The service run uses private synthetic files, not the user's cache/archive.",
+             f"- {1 + len(service_repeat_runs)} fresh service process(es) supply the pooled service samples below. Outliers are retained. An earlier tmpfs reference, when present, is preserved separately in the combined JSON and excluded from the final service timing distributions.",
+             "- Local p95 uses the nearest-rank sample percentile. Rendering percentiles use the probe's lower order statistic at floor((n−1)×p). Medians use the middle value or mean of the two middle values. Small sample counts are not stable estimates of long-run tails. No error rate can be inferred from a handful of successful runs.", "",
+             "## Startup, UI, caches, decoding and preparation", "",
+             "`sync` means elapsed wall time around the synchronous function, not exclusive thread CPU time. Widget build excludes the following layout/paint; frame timings include it. Local search waits for matching results, including GtkSearchEntry's debounce. Composer timing starts after search reset settles. The 500-message cached-view measurement directly stresses the view's cached-content path; the actual persistent cache stores only 50 messages per page.", "",
+             "Shell first-open and reopen distributions pool two different small mock chats across five fresh processes. They describe that mixed fixture, not every real chat. Native UI history rows use synthetic text-only group messages; the scrolling fixture below also includes loaded media.", "",
+             "| Measurement | Median (ms) | Sample p95 (ms) | Min–max (ms) | Samples |",
+             "| --- | ---: | ---: | ---: | ---: |"]
+    for row in timing:
+        lines.append(f"| {pretty(row['metric'])} | {num(row['median'])} | {num(row['p95']) if row['n']>1 else '—'} | {num(row['min'])}–{num(row['max'])} | {row['n']} |")
+        csv_rows.append(dict(category="local",scenario=row["metric"],metric="latency",unit="ms",median=row["median"],p95=row["p95"],min=row["min"],max=row["max"],n=row["n"]))
+    lines += ["", "Media decoding uses generated JPEG/Opus/H.264 fixtures and silent fake sinks. First buffer is decoder readiness, not audible sound or display latency. Unpaced full decode runs as fast as possible; it is not realtime playback or A/V synchronization. The image fixture is 4000×3000 and the preview is 720×540. Sticker raster timings use the bundled 60-frame fire animation, not every possible sticker.", "",
+              "Archive batches include an ordered query barrier so completion includes the writes, rather than just enqueuing them. This and cache flush measure completion of the application write path, not an fsync durability guarantee. Cache reads include the actual worker handoff and JSON load. Archive version lookups return no prior edits while the messages table grows from 1,000 to 10,000 rows; retrieving a large edit history was not measured. Summary preparation covers 2,000 synthetic text messages; it excludes network inference and voice transcription.", "",
+              "## Scrolling and frame delivery", "",
+              "Values are median across three runs; parentheses show the FPS range. Tail columns show the worst per-run p99. Idle presentations measure drawing activity, not a smoothness target: an unchanged screen need not draw continuously. `current` uses the captured animation toggles; `all` uses the bundled all-effects fixture.", "",
+              "| Effects / phase | Presentations/s (range) | CPU % | Frame interval p99 (ms) | GTK frame work p99 (ms) | 4 ms timer interval p99 (ms) | Intervals >16.8 ms | Max end RSS / PSS (MiB) |",
+              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    for mode, rows in frames.items():
+        for phase in ["idle", "sidebar_scroll", "message_scroll", "message_scroll_with_info"]:
+            group=[row for row in rows if row["phase"]==phase]
+            assert len(group)==3
+            fps=[row["presented_fps"] for row in group]
+            cpu=statistics.median(row["cpu_percent"] for row in group)
+            tail=lambda key: max(row[key] or 0 for row in group)
+            rss=max(row["resources_end"]["rss_kib"] for row in group)/1024
+            pss=max(row["resources_end"]["pss_kib"] for row in group)/1024
+            late=sum(row["frames_over_16_7ms"] for row in group)
+            count=sum(max(row["presented_frames"]-1,0) for row in group)
+            lines.append(f"| {mode} / {pretty(phase)} | {num(statistics.median(fps))} ({num(min(fps))}–{num(max(fps))}) | {num(cpu)} | {num(tail('present_interval_p99_ms'))} | {num(tail('frame_work_p99_ms'))} | {num(tail('loop_p99_ms'))} | {late}/{count} | {rss:.1f} / {pss:.1f} |")
+            for key,unit in [("presented_fps","frames/s"),("cpu_percent","percent_of_one_cpu"),("present_interval_p95_ms","ms"),("present_interval_p99_ms","ms"),("frame_work_p95_ms","ms"),("frame_work_p99_ms","ms"),("loop_p95_ms","ms"),("loop_p99_ms","ms")]:
+                vals=[r[key] for r in group if r[key] is not None]
+                csv_rows.append(dict(category="rendering",scenario=f"{mode}/{phase}",metric=key,unit=unit,median=statistics.median(vals),p95="",min=min(vals),max=max(vals),n=len(vals)))
+            for key in group[0]["resources_end"]:
+                cumulative = key in {"minor_faults", "major_faults", "voluntary_context_switches", "involuntary_context_switches", "read_bytes", "write_bytes"}
+                values = [row["resources_end"][key] - row["resources_start"][key] if cumulative else row["resources_end"][key] for row in group]
+                export_values("rendering_resources", f"{mode}/{phase}", key + ("_delta" if cumulative else "_end"), resource_unit(key), values)
+    lines += ["", "The raw JSON also contains completed/posted frame counts, counts above 33.4 ms, phase duration, memory high-water marks, minor/major faults, context switches, file descriptors, threads, and block I/O counters. These are available for each individual run; RSS high-water marks can include earlier phases in that process. End resource snapshots follow the 150 ms presentation-feedback wait; the CPU percentage uses the timed workload window itself.", "",
+              "The all-effects first run passed five exact viewport pixel comparisons and four scanline scale comparisons (1×, 1.25×, 1.6×, 2×).", "",
+              "## Whole release process and background behavior", "",
+              "Each idle window is 30 seconds after settling. These are the exact installed executable with the small mock account; the visible case has no chat open. Accessibility was disabled only in the isolated single-instance lifecycle test to avoid desktop service activation. It remains enabled in UI/gate runs.", "",
+              "| Effects / state | CPU % of one core | RSS range (MiB) | PSS range (MiB) | End threads / FDs | Block bytes read / written during sample |",
+              "| --- | ---: | ---: | ---: | ---: | ---: |"]
+    for mode, rows in process.items():
+        for row in rows:
+            if "seconds" not in row: continue
+            cpu="<0.04 (counter resolution)" if row["cpu_percent"]==0 else num(row["cpu_percent"])
+            lines.append(f"| {mode} / {pretty(row['metric'].removeprefix('release_'))} | {cpu} | {'–'.join(f'{x/1024:.1f}' for x in row['rss_kib_range'])} | {'–'.join(f'{x/1024:.1f}' for x in row['pss_kib_range'])} | {row['end']['threads']} / {row['end']['fds']} | {row['end']['read_bytes']-row['start']['read_bytes']} / {row['end']['write_bytes']-row['start']['write_bytes']} |")
+            for key,unit,val in [("cpu_percent","percent_of_one_cpu",row["cpu_percent"]),("rss_end","MiB",row["end"]["rss_kib"]/1024),("pss_end","MiB",row["end"]["pss_kib"]/1024)]:
+                csv_rows.append(dict(category="release_resources",scenario=f"{mode}/{row['metric']}",metric=key,unit=unit,median=val,p95="",min=val,max=val,n=1))
+    lines += ["", "| Lifecycle action | Effects off (ms) | Current effects (ms) |", "| --- | ---: | ---: |"]
+    for name in ["process_to_dbus_registered_ms","single_instance_activation_roundtrip_ms","explicit_quit_complete_ms"]:
+        vals=[next(row["value"] for row in process[mode] if row["metric"]==name) for mode in ["none","current"]]
+        lines.append(f"| {pretty(name.removesuffix('_ms'))} | {num(vals[0])} | {num(vals[1])} |")
+        for mode, value in zip(["none", "current"], vals):
+            export_values("lifecycle", mode, name, "ms", [value])
+    lines += ["", "D-Bus registration is not chat-list readiness. Activation measures the secondary process round trip, not focus-to-pixel latency. Explicit quit includes termination of the primary mock process.", "",
+              "## Injected delay and repeated chat rebuilds", "",
+              "The separate 400 ms mock-delay run tests a deliberate delay, not Telegram RPC latency.", "",
+              "| Action with injected delay | Median (ms) | Min–max (ms) | Samples |", "| --- | ---: | ---: | ---: |"]
+    for row in delayed:
+        if "samples_ms" not in row: continue
+        vals = row["samples_ms"]
+        median = statistics.median(vals)
+        lines.append(f"| {pretty(row['metric'])} | {num(median)} | {num(min(vals))}–{num(max(vals))} | {len(vals)} |")
+        csv_rows.append(dict(category="injected_400ms_mock",scenario=row["metric"],metric="latency",unit="ms",median=median,p95=row["p95"],min=min(vals),max=max(vals),n=len(vals)))
+    rebuild = next(row for row in local if row.get("metric") == "60_chat_rebuilds_resources")
+    a, b = rebuild["before"], rebuild["after"]
+    lines += ["", f"Across 60 additional 50-message chat rebuilds, RSS changed from {a['rss_kib']/1024:.2f} to {b['rss_kib']/1024:.2f} MiB, PSS from {a['pss_kib']/1024:.2f} to {b['pss_kib']/1024:.2f} MiB, and file descriptors from {a['fds']} to {b['fds']}. This short test showed no retained-memory growth; it cannot rule out long-term leaks.", "",
+              "## Existing real session: passive observations", "",
+              f"The already-running process matched the installed 0.1.7 binary SHA-256. Over {live['seconds']:.1f}s it averaged **{live['cpu_percent']:.2f}% of one core**, with **{max(r['rss_kib'] for r in live['samples'])/1024:.1f} MiB RSS**, **{max(r['pss_kib'] for r in live['samples'])/1024:.1f} MiB PSS**, {live['samples'][-1]['threads']} threads and {live['samples'][-1]['fds']} file descriptors. User activity/visibility was not controlled; this is not a live scrolling or cold-start measurement.", "",
+              f"The separate {gpu['seconds']:.1f}s DRM observation recorded {gpu['render_engine_percent']:.3f}% additional render-engine utilization and {gpu['end']['allocated_kib']/1024:.1f} MiB allocated GPU buffers, including {gpu['end']['shared_kib']/1024:.1f} MiB shared buffers. These are integrated-GPU allocation counters, not dedicated VRAM or extra RAM to add to PSS.", "",
+              "## Footprint and limits", "",
+              "- Installed release: **56,782,880 bytes = 54.15 MiB**. ELF size reports 55,577,079 text/readonly bytes, 1,198,216 initialized-data bytes, and 3,700,160 BSS bytes (BSS is runtime virtual storage, not file size). There are 15 direct shared-library dependencies; system libraries are not bundled in this number.",
+              f"- Existing cache, including mock fixtures: {disk['cache']['bytes']/1024**2:.2f} MiB in {disk['cache']['files']} files; existing local app data: {disk['data']['bytes']/1024**2:.2f} MiB in {disk['data']['files']} files. Only sizes/counts were read.",
+              "- Limits read from source, not benchmark outcomes: history cache 24 pages × up to 50 messages, at most 512 KiB/page; avatar texture cache 16 MiB/128 entries with four decode slots; chat-preview cache 32 MiB/96 entries with two decode slots.",
+              "- Media network transfers: four download slots plus two avatar slots. Retained media wrappers: 32. Lottie: six simultaneous animations, 64 first-frame cache entries, minimum 16 ms render interval. Auto-transcription: one active job and up to 64 queued jobs. Summary input: 2,000 messages / one million characters, 12,000-character chunks.", "",
+              "## Measurable categories requiring additional live/instrumented runs", "",
+              "| Category | Metrics | Why no measured value here |", "| --- | --- | --- |",
+              "| Telegram transport | Authorization/reconnection time, RPC p50/p95/p99, download/upload throughput, first media byte, send acknowledgement, incoming-delivery latency | This run was local/offline. Existing mock delays are not network measurements. |",
+              "| Notifications/presence | Incoming update to desktop notification; avatar wait; notification loss; server-visible online/offline delay | Requires controlled sender/observer and desktop delivery measurement; this audit does not send notifications to the desktop. |",
+              "| AI/transcription | Provider response time, tokens/s, rate-limit frequency, voice transcription realtime factor, end-to-end selected-range summary duration | Synthetic preparation was measured; actual provider inference and speech recognition were not invoked. First-token UI latency is not exposed by the current non-streaming response UI. |",
+              "| Calls | Setup time, audio/video latency, jitter, RTT, packet loss, bandwidth, A/V sync, dropped frames | Needs a consenting call peer and call telemetry. No call was initiated. |",
+              "| Live playback/recording | Speaker latency, seek-to-visible latency, sustained dropped video frames, webcam/microphone capture latency | Silent local decoding was measured. Devices and real playback were not driven. |",
+              "| Other local UI flows | Settings/theme switching, profile and image-viewer opening, pin expansion, sticker/reaction pickers, forwarding, avatar decode and cache reuse | The functional gate exercises these paths, but separate timing probes were not added for every action. Photo timings above measure chat previews/full textures, not avatar-specific decoding. |",
+              "| Sustained update bursts | Incoming messages to painted rows, queue depth, backlog recovery, UI latency under simultaneous downloads/transcriptions | Single sidebar updates and steady scrolling were measured; a controlled multi-service burst workload was not run. |",
+              "| Long-running operation | Runtime cache hit ratios, queue depths under bursts, memory growth over hours/days, reconnect/error frequency | Short controlled samples and 60 chat rebuilds cannot establish long-term leak/error rates. |",
+              "| Energy/system load | Per-app watts, battery drain, thermal throttling, GPU busy percentage during every stress phase | Requires suitable energy/GPU telemetry and a longer controlled system baseline. Passive DRM allocation/idle engine statistics are included above. |", "",
+              "## Validation and reproduction", "",
+              "Build with `cargo build --offline --release --example performance_audit --example frame_perf_probe`, then run `python3 bin/run-performance-audit`. The required captured animation fixture is `target/performance-audit/current-effects.toml`; it contains only animation toggles and is also embedded in the combined JSON. The runner requires Weston, D-Bus tools, ffmpeg and the existing fractional-scale proxy dependencies. After any isolated UI remeasurement, run `python3 bin/summarize-performance-audit`.", "",
+              "This report generator uses the environment, build-provenance, disk-footprint, live-process and live-GPU snapshots in the same output directory, captured separately for this audit. Those observations must be refreshed for a new machine/session. The timing runner does not capture real-session observations or query Telegram.", "",
+              f"Installed executable SHA-256: `{provenance['timed_binaries']['target/release/omarchygram']['sha256']}`. The combined JSON preserves the final native-UI and rendering executable hashes, plus the final Btrfs service executable hash. The isolated UI remeasurement supersedes the first native-UI log; its timing code waits for search teardown before measuring typing. {1 + len(service_repeat_runs)} storage-backed service run(s) supply the final service samples. Medians were normalized from raw samples when producing the report.", "",
+              "- Raw combined data: `target/performance-audit/measurements.json`.",
+              "- CSV: `target/performance-audit/measurements.csv`.",
+              "- Individual logs and compositor identity: `target/performance-audit/`.",
+              "- Benchmark validation and full gate results are recorded separately in that directory.", "",
+              "Files added/changed:", "",
+              "- `examples/frame_perf_probe.rs`: additional rendering/resource counters.",
+              "- `examples/perf_support/mod.rs`: shared sampling helpers.",
+              "- `examples/performance_audit.rs`: UI/local-service timing harness.",
+              "- `bin/measure-process`: release lifecycle/resource sampler.",
+              "- `bin/run-performance-audit`: sequential benchmark runner.",
+              "- `bin/summarize-performance-audit`: report and data export.",
+              "- `specs/performance-audit-0.1.7.md`: this measurement report.", "",
+              "No application implementation or user preference was changed.", ""]
+    gate_path = OUT / "gate.log"
+    if gate_path.exists():
+        summary = gate_path.read_text().strip()
+        lines += ["Full headless gate output" + (":" if summary.endswith("gate: PASS") else " (still running or incomplete):"), "", "```text", summary, "```", ""]
+    test_path = OUT / "unit-tests.log"
+    if test_path.exists():
+        results = re.findall(r"test result: (\w+)\. (\d+) passed; (\d+) failed", test_path.read_text())
+        passed = sum(int(row[1]) for row in results)
+        failed = sum(int(row[2]) for row in results)
+        lines += [f"Automated tests: {passed} passed, {failed} failed. The final run used `bin/headless cargo test --offline`; the initial sandbox-only run could not access the local test server/media IPC.", ""]
+    clippy_path = OUT / "clippy.log"
+    if clippy_path.exists() and "Finished" in clippy_path.read_text():
+        lines += ["Clippy passed with `cargo clippy --offline --all-targets -- -D warnings`.", ""]
+    validation_path = OUT / "data-validation.log"
+    if validation_path.exists():
+        lines += [validation_path.read_text().strip(), ""]
+    export_values("real_process", "uncontrolled_30s_sample", "cpu_percent", "percent_of_one_cpu", [live["cpu_percent"]])
+    for key in ["rss_kib", "pss_kib", "threads", "fds"]:
+        export_values("real_process", "uncontrolled_30s_sample", key, resource_unit(key), [row[key] for row in live["samples"]])
+    export_values("real_gpu", "uncontrolled_10s_sample", "render_engine_utilization", "percent", [gpu["render_engine_percent"]])
+    for key in ["allocated_kib", "shared_kib"]:
+        export_values("real_gpu", "uncontrolled_10s_sample", key, "KiB", [gpu["end"][key]])
+    for name, values in disk.items():
+        for key in ["bytes", "files"]:
+            export_values("footprint", name, key, "bytes" if key == "bytes" else "count", [values[key]])
+    export_values("footprint", "installed_release", "file_size", "bytes", [provenance["timed_binaries"]["target/release/omarchygram"]["bytes"]])
+    (ROOT / "specs/performance-audit-0.1.7.md").write_text("\n".join(lines))
+    fields=["category","scenario","metric","unit","median","p95","min","max","n"]
+    with (OUT / "measurements.csv").open("w", newline="") as stream:
+        writer=csv.DictWriter(stream,fieldnames=fields);writer.writeheader();writer.writerows(csv_rows)
+    print(f"Wrote {len(timing)} local timing series, {len(csv_rows)} CSV rows and 36 rendering phase samples.")
+
+
+if __name__ == "__main__":
+    main()

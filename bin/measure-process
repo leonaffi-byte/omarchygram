@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Measure the release app's mock lifecycle/resources, under bin/headless.
+
+Use dbus-run-session with tests/background_instance.py's isolated bus config.
+Only the mock D-Bus identity is used, so the running real app is untouched.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def counters(pid):
+    root = Path(f"/proc/{pid}")
+    fields = dict(line.split(":", 1) for line in (root / "status").read_text().splitlines())
+    stat = (root / "stat").read_text().rsplit(")", 1)[1].split()
+    rollup = dict(line.split(":", 1) for line in (root / "smaps_rollup").read_text().splitlines()[1:])
+    io = dict(line.split(":", 1) for line in (root / "io").read_text().splitlines())
+    return dict(time=time.monotonic(), cpu_s=(int(stat[11]) + int(stat[12])) / os.sysconf("SC_CLK_TCK"),
+                rss_kib=int(fields["VmRSS"].split()[0]), pss_kib=int(rollup["Pss"].split()[0]),
+                peak_rss_kib=int(fields["VmHWM"].split()[0]), threads=int(fields["Threads"]),
+                fds=len(list((root / "fd").iterdir())), read_bytes=int(io["read_bytes"]),
+                write_bytes=int(io["write_bytes"]))
+
+
+def measure(pid, name, seconds=30):
+    samples = [counters(pid)]
+    for _ in range(seconds):
+        time.sleep(1)
+        samples.append(counters(pid))
+    a, b = samples[0], samples[-1]
+    elapsed = b["time"] - a["time"]
+    print(json.dumps(dict(metric=name, seconds=elapsed,
+                         cpu_percent=100 * (b["cpu_s"] - a["cpu_s"]) / elapsed,
+                         rss_kib_range=[min(x["rss_kib"] for x in samples), max(x["rss_kib"] for x in samples)],
+                         pss_kib_range=[min(x["pss_kib"] for x in samples), max(x["pss_kib"] for x in samples)],
+                         start=a, end=b)), flush=True)
+
+
+def main():
+    assert os.environ.get("WAYLAND_DISPLAY", "").startswith("wayland-omg-"), "bin/headless required"
+    binary = str(Path(sys.argv[1]).resolve())
+    assert Path(binary).name == "omarchygram"
+    env = dict(os.environ, OMG_SMOKE_SINGLE_INSTANCE="1")
+    # Counter-only isolation: no desktop notification/accessibility services.
+    assert os.environ.get("OMG_PRIVATE_BUS") == "1", "run with a private D-Bus session"
+    with tempfile.TemporaryFile(mode="w+") as log:
+        started = time.monotonic()
+        process = subprocess.Popen([binary, "--smoke", "--background"], env=env, stdout=log, stderr=log)
+        try:
+            for _ in range(300):
+                owner = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+                                        "--object-path", "/org/freedesktop/DBus", "--method",
+                                        "org.freedesktop.DBus.NameHasOwner", "dev.leoom.Omarchygram.Smoke"],
+                                       capture_output=True, text=True, check=True)
+                if "true" in owner.stdout:
+                    break
+                assert process.poll() is None
+                time.sleep(0.01)
+            else:
+                raise RuntimeError("background startup timed out")
+            print(json.dumps(dict(metric="process_to_dbus_registered_ms", value=1000*(time.monotonic()-started))), flush=True)
+            time.sleep(5)
+            measure(process.pid, "release_background_idle")
+            started = time.monotonic()
+            subprocess.run([binary, "--smoke"], env=env, stdout=log, stderr=log, check=True, timeout=10)
+            print(json.dumps(dict(metric="single_instance_activation_roundtrip_ms", value=1000*(time.monotonic()-started))), flush=True)
+            time.sleep(5)
+            measure(process.pid, "release_visible_idle")
+            started = time.monotonic()
+            subprocess.run([binary, "--smoke", "--quit"], env=env, stdout=log, stderr=log, check=True, timeout=10)
+            assert process.wait(timeout=10) == 0
+            print(json.dumps(dict(metric="explicit_quit_complete_ms", value=1000*(time.monotonic()-started))), flush=True)
+        except BaseException:
+            log.seek(0)
+            print(log.read(), file=sys.stderr)
+            raise
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+
+
+if __name__ == "__main__":
+    main()

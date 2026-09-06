@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Sequential, offline benchmarks. Build release examples before running.
+
+No benchmark overlaps another. All GTK runs use the private compositor.
+Writes raw JSON/text and a manifest; no real session or AI-provider requests.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import tomllib
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def main():
+    os.chdir(ROOT)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / "target/performance-audit")
+    parser.add_argument("--settings", type=Path, default=ROOT / "examples/fixtures/benchmark-current-effects.toml")
+    args = parser.parse_args()
+    out = args.output.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    settings = args.settings.resolve()
+    if not settings.is_file():
+        raise SystemExit(f"Animation settings fixture is missing: {settings}")
+    if settings != out / "current-effects.toml":
+        (out / "current-effects.toml").write_bytes(settings.read_bytes())
+    required = [ROOT / "bin/headless", ROOT / "target/release/omarchygram",
+                ROOT / "target/release/examples/performance_audit",
+                ROOT / "target/release/examples/frame_perf_probe", out / "current-effects.toml"]
+    for path in required:
+        if not path.is_file():
+            raise SystemExit(f"Required benchmark input is missing: {path}")
+    binaries = required[1:4]
+    provenance = {
+        "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "source_version": tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"],
+        "timed_binaries": {str(path.relative_to(ROOT)): {
+            "bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        } for path in binaries},
+        "settings_sha256": hashlib.sha256((out / "current-effects.toml").read_bytes()).hexdigest(),
+    }
+    (out / "build-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    # This runner writes a new primary UI result, replacing any earlier retry.
+    (out / "native-ui-rerun.json").unlink(missing_ok=True)
+    (out / "services-rerun.json").unlink(missing_ok=True)
+    for name in ["services-btrfs-2-run.json", "services-btrfs-3-run.json", "services-tmpfs.jsonl", "services-tmpfs.stderr"]:
+        (out / name).unlink(missing_ok=True)
+    records = []
+    base = dict(os.environ, OMG_HEADLESS_RENDERER="gl", GSK_RENDERER="vulkan", G_DEBUG="fatal-criticals")
+
+    def run(name, command, env=None, timeout=180):
+        print(f"Running {name}", flush=True)
+        started = time.monotonic()
+        with (out / f"{name}.jsonl").open("w") as stdout, (out / f"{name}.stderr").open("w") as stderr:
+            result = subprocess.run(command, env=env or base, stdout=stdout, stderr=stderr, timeout=timeout)
+        record = dict(name=name, command=command, seconds=time.monotonic()-started, exit=result.returncode)
+        if name == "services":
+            record["state_filesystem"] = subprocess.check_output(
+                ["findmnt", "-n", "-o", "FSTYPE", "-T", str(out)], text=True).splitlines()[-1].strip()
+        records.append(record)
+        (out / "manifest.json").write_text(json.dumps(records, indent=2))
+        print(f"{name}: exit {result.returncode}, {record['seconds']:.1f}s", flush=True)
+        if result.returncode:
+            print((out / f"{name}.stderr").read_text()[-3000:], file=sys.stderr)
+            raise SystemExit(result.returncode)
+        time.sleep(1)
+
+    for name, mode in [("services", "services"), ("native-ui", "ui")]+[(f"startup-{i}", "startup") for i in range(1, 6)]:
+        env = dict(base, OMG_PERF_STATE_ROOT=str(out / "private-state")) if mode == "services" else base
+        run(name, ["bin/headless", "target/release/examples/performance_audit", mode], env)
+
+    # Extra latency is deliberate and must not be reported as a real RPC time.
+    run("startup-mock-400ms", ["bin/headless", "target/release/examples/performance_audit", "startup"],
+        dict(base, OMG_MOCK_LATENCY_MS="400"))
+
+    bus = out / "bus.conf"
+    bus.write_text('<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen>'
+                   '<policy context="default"><allow send_destination="*"/>'
+                   '<allow receive_sender="*"/><allow own="*"/></policy></busconfig>')
+    for mode in ["none", "current"]:
+        env = dict(base, OMG_PRIVATE_BUS="1", GTK_A11Y="none", GIO_USE_VFS="local")
+        if mode == "current":
+            env["OMG_SMOKE_SETTINGS_SEED"] = str(out / "current-effects.toml")
+        run(f"process-{mode}", ["bin/headless", "dbus-run-session", f"--config-file={bus}",
+            sys.executable, "bin/measure-process", "target/release/omarchygram"], env, 120)
+
+    # Paired repetitions reduce ordering effects without overlapping workloads.
+    for repeat in range(1, 4):
+        for mode in (["none", "current", "all"] if repeat % 2 else ["all", "current", "none"]):
+            env = dict(base, OMG_HEADLESS_REFRESH="120000", OMG_HEADLESS_SCALE="2",
+                       OMG_HEADLESS_WIDTH="3600", OMG_HEADLESS_HEIGHT="2400", OMG_PROXY_SCALE="192",
+                       OMG_PERF_EXPECT_SCALE="1.6", OMG_PERF_WIDTH="1800", OMG_PERF_HEIGHT="1100",
+                       OMG_PERF_MESSAGES="500", OMG_PERF_MEDIA="1", OMG_PERF_INFO="1", OMG_PERF_SECONDS="10",
+                       OMG_HEADLESS_LOG=str(out / f"frames-{mode}-{repeat}-compositor.log"))
+            command = ["bin/headless", sys.executable, "examples/fractional_scale_proxy.py",
+                       "target/release/examples/frame_perf_probe", "none" if mode == "none" else "all"]
+            if mode == "current": command.append(str(out / "current-effects.toml"))
+            if repeat == 1 and mode == "all": env["OMG_PERF_VERIFY"] = "1"
+            run(f"frames-{mode}-{repeat}", command, env, 120)
+    print(f"PASS: {len(records)} sequential benchmark runs", flush=True)
+
+
+if __name__ == "__main__":
+    main()

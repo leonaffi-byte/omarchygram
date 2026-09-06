@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -342,6 +342,17 @@ pub enum MediaState {
 }
 
 #[derive(Clone)]
+struct RowPhoto {
+    picture: gtk::Picture,
+    path: PathBuf,
+    generation: u64,
+    width: i32,
+    height: i32,
+    resident: Rc<Cell<bool>>,
+    decoding: Rc<Cell<bool>>,
+}
+
+#[derive(Clone)]
 struct MessageRow {
     widget: gtk::Box,
     bubble: BubbleClamp,
@@ -379,11 +390,120 @@ struct MessageRow {
     /// The geo card's map slot, so `finish_image` can drop the downloaded
     /// OpenStreetMap texture into it (6B location/venue).
     geo_map_slot: Rc<RefCell<Option<gtk::Box>>>,
+    photo: Rc<RefCell<Option<RowPhoto>>>,
+}
+
+/// Keep history order and scroll geometry without constructing every message's
+/// labels, controls and media player. An explicit row action can materialize
+/// its content too; GTK objects never leave the UI thread.
+struct DeferredRow {
+    widget: gtk::Box,
+    content: OnceCell<MessageRow>,
+    message: RefCell<Msg>,
+    inner: std::rc::Weak<MessagesInner>,
+    sender_visible: Cell<bool>,
+    quote_text: RefCell<Option<String>>,
+    aux: RefCell<Vec<(String, bool)>>,
+    saved_spoilers: RefCell<HashSet<(usize, usize)>>,
+}
+
+impl DeferredRow {
+    fn new(message: &Msg, inner: &Rc<MessagesInner>) -> Self {
+        let widget = message_row_root(message);
+        // This estimate is replaced by the real height before the row enters
+        // the viewport. Do not impose an estimated width on wrapped content.
+        widget.set_height_request(120);
+        widget.update_property(&[gtk::accessible::Property::Label(&format!(
+            "{}: {}", message.sender, message.text
+        ))]);
+        let weak = Rc::downgrade(inner);
+        let id = message.id;
+        widget.connect_has_focus_notify(move |widget| {
+            if !widget.has_focus() { return; }
+            if let Some(inner) = weak.upgrade()
+                && let Ok(store) = inner.store.try_borrow()
+                && let Some(entry) = store.entries.get(&id) {
+                    entry.row.materialize();
+                }
+        });
+        Self {
+            widget, content: OnceCell::new(), message: RefCell::new(message.clone()),
+            inner: Rc::downgrade(inner), sender_visible: Cell::new(false),
+            quote_text: RefCell::new(None), aux: RefCell::new(Vec::new()),
+            saved_spoilers: RefCell::new(HashSet::new()),
+        }
+    }
+
+    fn loaded(&self) -> Option<&MessageRow> { self.content.get() }
+
+    fn set_sender_visible(&self, visible: bool) {
+        self.sender_visible.set(visible);
+        if let Some(row) = self.loaded() { row.sender.set_visible(visible); }
+    }
+
+    fn set_quote(&self, text: Option<String>) {
+        if let Some(row) = self.loaded() {
+            if let Some(text) = &text && row.quote.label() != *text { row.quote.set_label(text); }
+            row.quote.set_visible(text.is_some());
+        }
+        *self.quote_text.borrow_mut() = text;
+    }
+
+    fn materialize(&self) -> &MessageRow {
+        self.content.get_or_init(|| {
+            let inner = self.inner.upgrade().expect("message view owns deferred rows");
+            let row = MessagesView::of(&inner).build_row_into(
+                &self.message.borrow(), false, false, self.widget.clone(),
+            );
+            row.sender.set_visible(self.sender_visible.get());
+            if let Some(text) = self.quote_text.borrow().as_ref() { row.quote.set_label(text); }
+            row.quote.set_visible(self.quote_text.borrow().is_some());
+            for (text, error) in self.aux.borrow().iter() {
+                row.aux_slot.append(&aux_label(text, *error));
+            }
+            row.aux_slot.set_visible(row.aux_slot.first_child().is_some());
+            if !self.saved_spoilers.borrow().is_empty() {
+                *row.revealed_spoilers.borrow_mut() = self.saved_spoilers.borrow().clone();
+                if let Some(label) = row.text.borrow().as_ref() {
+                    apply_message_markup(label, &self.message.borrow(), &row.revealed_spoilers,
+                        &inner.darker_background.borrow());
+                }
+            }
+            self.widget.set_height_request(-1);
+            self.widget.reset_property(gtk::AccessibleProperty::Label);
+            row
+        })
+    }
+}
+
+impl std::ops::Deref for DeferredRow {
+    type Target = MessageRow;
+    fn deref(&self) -> &MessageRow { self.materialize() }
+}
+
+impl std::ops::DerefMut for DeferredRow {
+    fn deref_mut(&mut self) -> &mut MessageRow {
+        self.materialize();
+        self.content.get_mut().expect("materialized row")
+    }
+}
+
+fn message_row_root(message: &Msg) -> gtk::Box {
+    let widget = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    widget.add_css_class("omg-msg");
+    widget.add_css_class("omg-msg-row");
+    widget.add_css_class(if message.outgoing { "omg-msg-out" } else { "omg-msg-in" });
+    if message.deleted { widget.add_css_class("omg-msg-deleted"); }
+    // Also the focus return target for the media viewer.
+    widget.set_focusable(true);
+    widget.set_hexpand(false);
+    widget.set_halign(if message.outgoing { gtk::Align::End } else { gtk::Align::Start });
+    widget
 }
 
 struct MessageEntry {
     msg: Msg,
-    row: MessageRow,
+    row: DeferredRow,
     media_state: MediaState,
     media_generation: u64,
     media_retryable: bool,
@@ -535,6 +655,10 @@ struct MessagesInner {
     send_spin: RefCell<Option<glib::SourceId>>,
     date_timeout: RefCell<Option<glib::SourceId>>,
     scroll_epoch: Cell<u64>,
+    row_tick: RefCell<Option<gtk::TickCallbackId>>,
+    warming_rows: Cell<bool>,
+    jump_layout_pending: Cell<bool>,
+    recent_jump_screens: RefCell<Vec<(i32, Vec<i32>)>>,
     scroll_callback_generation: Cell<u64>,
     upper_handler: RefCell<Option<glib::SignalHandlerId>>,
     upper_tick: RefCell<Option<gtk::TickCallbackId>>,
@@ -1174,6 +1298,10 @@ impl MessagesView {
             send_spin: RefCell::new(None),
             date_timeout: RefCell::new(None),
             scroll_epoch: Cell::new(0),
+            row_tick: RefCell::new(None),
+            warming_rows: Cell::new(false),
+            jump_layout_pending: Cell::new(false),
+            recent_jump_screens: RefCell::new(Vec::new()),
             scroll_callback_generation: Cell::new(0),
             upper_handler: RefCell::new(None),
             upper_tick: RefCell::new(None),
@@ -1682,7 +1810,9 @@ impl MessagesView {
             let adjustment = self.inner.scroll.vadjustment();
             adjustment.connect_value_changed(move |adjustment| {
                 let Some(inner) = weak.upgrade() else { return };
-                MessagesView::of(&inner).player_visibility_throttled();
+                let view = MessagesView::of(&inner);
+                view.schedule_visible_rows();
+                view.player_visibility_throttled();
                 if inner.suppress_paging.get() {
                     return;
                 }
@@ -1716,7 +1846,11 @@ impl MessagesView {
                 .scroll
                 .vadjustment()
                 .connect_changed(move |_| {
-                    if let Some(inner) = weak.upgrade() { MessagesView::of(&inner).player_visibility_throttled(); }
+                    if let Some(inner) = weak.upgrade() {
+                        let view = MessagesView::of(&inner);
+                        view.schedule_visible_rows();
+                        view.player_visibility_throttled();
+                    }
                 });
         }
         {
@@ -2215,6 +2349,9 @@ impl MessagesView {
     }
 
     fn clear_rows(&self) {
+        self.inner.jump_layout_pending.set(false);
+        self.inner.recent_jump_screens.borrow_mut().clear();
+        if let Some(tick) = self.inner.row_tick.borrow_mut().take() { tick.remove(); }
         self.move_focus_before_removal(&self.inner.list);
         let rows: Vec<MessageRow> = self
             .inner
@@ -2222,7 +2359,7 @@ impl MessagesView {
             .borrow()
             .entries
             .values()
-            .map(|entry| entry.row.clone())
+            .filter_map(|entry| entry.row.loaded().cloned())
             .collect();
         for row in rows {
             for source in row.animation_sources.borrow_mut().drain(..) {
@@ -2558,6 +2695,7 @@ impl MessagesView {
         self.inner
             .effects
             .empty_state(&self.inner.empty_effects, false);
+        self.prepare_last_screen();
         adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
         let inner = self.inner.clone();
         self.after_next_upper_or_tick(move |adjustment| {
@@ -2566,6 +2704,147 @@ impl MessagesView {
             inner.suppress_paging.set(false);
         });
         inserted
+    }
+
+    fn prepare_last_screen(&self) {
+        let allocated = self.inner.list.width().max(self.inner.pane_width.get() - 32);
+        let width = if allocated > 0 { allocated } else { 620 };
+        let target = self.inner.scroll.height().max(600) + 128;
+        let mut height = 0;
+        {
+            let store = self.inner.store.borrow();
+            for id in store.order.iter().rev() {
+                let Some(entry) = store.entries.get(id) else { continue };
+                entry.row.materialize();
+                height += entry.row.widget.measure(gtk::Orientation::Vertical, width).1;
+                if height >= target { break; }
+            }
+        }
+        self.inner.warming_rows.set(true);
+        let total = self.inner.list.measure(gtk::Orientation::Vertical, width).1;
+        self.inner.scroll.vadjustment().set_upper(f64::from(total));
+        self.inner.warming_rows.set(false);
+    }
+
+    fn schedule_visible_rows(&self) {
+        if self.inner.warming_rows.get() || self.inner.row_tick.borrow().is_some() { return; }
+        let weak = Rc::downgrade(&self.inner);
+        let tick = self.inner.scroll.add_tick_callback(move |_, _| {
+            let Some(inner) = weak.upgrade() else { return glib::ControlFlow::Break };
+            inner.row_tick.borrow_mut().take();
+            MessagesView::of(&inner).prepare_visible_rows();
+            glib::ControlFlow::Break
+        });
+        *self.inner.row_tick.borrow_mut() = Some(tick);
+    }
+
+    fn prepare_visible_rows(&self) {
+        // A jump can build new controls between frames. Its destination is
+        // already prepared, but row bounds still describe the old layout.
+        // Let GTK allocate that screen before using bounds to warm more rows.
+        if self.inner.jump_layout_pending.replace(false) {
+            self.schedule_visible_rows();
+            return;
+        }
+        if self.inner.warming_rows.replace(true) { return; }
+        let ids = nearby_message_ids(&self.inner, 128.0);
+        let adjustment = self.inner.scroll.vadjustment();
+        let old_value = adjustment.value();
+        let anchor = nearby_message_ids(&self.inner, 0.0).first().copied().and_then(|id| {
+            let store = self.inner.store.borrow();
+            let entry = store.entries.get(&id)?;
+            let bounds = entry.row.widget.compute_bounds(&self.inner.list)?;
+            Some((entry.row.widget.clone(), old_value - f64::from(bounds.y())))
+        });
+        let mut changed = false;
+        {
+            let store = self.inner.store.borrow();
+            for id in ids {
+                if let Some(entry) = store.entries.get(&id) && entry.row.loaded().is_none() {
+                    entry.row.materialize();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let width = self.inner.list.width().max(1);
+            let total = self.inner.list.measure(gtk::Orientation::Vertical, width).1;
+            let value = if self.inner.stick_to_bottom.get() {
+                (f64::from(total) - adjustment.page_size()).max(0.0)
+            } else if let Some((anchor, offset)) = anchor {
+                let mut before = anchor.margin_top();
+                let mut child = self.inner.list.first_child();
+                while let Some(current) = child {
+                    if current == anchor { break; }
+                    before += current.measure(gtk::Orientation::Vertical, width).1;
+                    child = current.next_sibling();
+                }
+                f64::from(before) + offset
+            } else { old_value };
+            adjustment.set_upper(f64::from(total));
+            adjustment.set_value(value);
+        }
+        self.inner.warming_rows.set(false);
+        self.photo_visibility();
+        // Newly measured rows have not been allocated yet. Their old bounds
+        // cannot safely decide which bodies are outside the viewport.
+        if changed { self.schedule_visible_rows(); }
+        else {
+            self.prune_history_rows();
+            // The coalesced media check may have run before a jump's new
+            // allocation. Recheck the settled viewport even when its final
+            // geometry did not emit another adjustment change.
+            self.player_visibility_throttled();
+        }
+    }
+
+    fn prune_history_rows(&self) {
+        if self.inner.context_popover.borrow().as_ref().is_some_and(|p| p.parent().is_some())
+            || self.inner.history_popover.borrow().as_ref().is_some_and(|p| p.parent().is_some())
+            || self.inner.reaction_popover.is_open() { return; }
+        // EmojiChooser can remain parented after closing. Release that closed
+        // popup before any of its anchor's descendants are reclaimed.
+        self.inner.reaction_popover.dismiss();
+        let page = self.inner.scroll.vadjustment().page_size() as f32;
+        if page <= 0.0 { return; }
+        let mut retain: HashSet<_> = nearby_message_ids(&self.inner, page * 3.0).into_iter().collect();
+        retain.extend(self.inner.recent_jump_screens.borrow().iter()
+            .flat_map(|(_, ids)| ids.iter().copied()));
+        let width = self.inner.list.width().max(1);
+        for entry in self.inner.store.borrow_mut().entries.values_mut() {
+            let can_rebuild = entry.msg.media.is_none()
+                || entry.msg.media == Some(MediaKind::Document)
+                    && matches!(entry.media_state, MediaState::NotStarted | MediaState::Done(_));
+            if retain.contains(&entry.msg.id) || !can_rebuild || entry.msg.keyboard.is_some() { continue; }
+            let Some(row) = entry.row.loaded() else { continue };
+            if row.widget.height() <= 0 { continue; }
+            // Keep keyboard focus, an open row popover, and selected text
+            // intact. Message selection itself lives in SelectionBook.
+            if row.widget.is_focus() || row.widget.focus_child().is_some()
+                || row.widget.state_flags().contains(gtk::StateFlags::ACTIVE)
+                || row.text.borrow().as_ref().is_some_and(|label| label.selection_bounds().is_some()) {
+                continue;
+            }
+            let height = row.widget.measure(gtk::Orientation::Vertical, width).1
+                - row.widget.margin_top() - row.widget.margin_bottom();
+            *entry.row.saved_spoilers.borrow_mut() = row.revealed_spoilers.borrow().clone();
+            let row = entry.row.content.take().expect("loaded text row");
+            for source in row.animation_sources.borrow_mut().drain(..) { remove_source_if_present(source); }
+            if let Some(source) = row.media_loading_source.borrow_mut().take() { remove_source_if_present(source); }
+            if let Some(source) = row.live_location_source.borrow_mut().take() { remove_source_if_present(source); }
+            // These gestures capture the old checkbox; dropping only the
+            // children would retain it and accumulate handlers on each visit.
+            let controllers: Vec<_> = row.widget.observe_controllers().iter::<glib::Object>()
+                .filter_map(Result::ok).filter_map(|object| object.downcast::<gtk::EventController>().ok())
+                .filter(|controller| controller.name().is_some_and(|name|
+                    matches!(name.as_str(), "omg-message-context" | "omg-message-select"))).collect();
+            for controller in controllers { row.widget.remove_controller(&controller); }
+            row.widget.set_height_request(height.max(1));
+            while let Some(child) = row.widget.first_child() { row.widget.remove(&child); }
+            row.widget.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{}: {}", entry.msg.sender, entry.msg.text
+            ))]);
+        }
     }
 
     pub fn begin_history_load(&self) {
@@ -2615,8 +2894,9 @@ impl MessagesView {
         }
         let inserted = self.merge(messages, false, false);
         for entry in self.inner.store.borrow().entries.values() {
-            if entry.row.sender_avatar.as_ref().is_some_and(|(avatar, _)| !avatar.photo_loaded()) {
-                entry.row.avatar_requested.set(false);
+            if let Some(row) = entry.row.loaded()
+                && row.sender_avatar.as_ref().is_some_and(|(avatar, _)| !avatar.photo_loaded()) {
+                row.avatar_requested.set(false);
             }
         }
         self.player_visibility_throttled();
@@ -2767,13 +3047,19 @@ impl MessagesView {
                 self.update_existing(message, is_live);
                 continue;
             }
-            let row = self.build_row(
-                &message,
-                is_live,
-                show_unread_divider && inserted.is_empty(),
-            );
+            let row = DeferredRow::new(&message, &self.inner);
+            if is_live {
+                let content = self.build_row_into(&message, true,
+                    show_unread_divider && inserted.is_empty(), row.widget.clone());
+                row.widget.set_height_request(-1);
+                row.widget.reset_property(gtk::AccessibleProperty::Label);
+                let _ = row.content.set(content);
+            }
             let media_state = MediaState::NotStarted;
             let id = message.id;
+            if let Some(poll) = &message.poll {
+                self.inner.store.borrow_mut().poll_index.insert(poll.id, id);
+            }
             self.inner.store.borrow_mut().entries.insert(
                 id,
                 MessageEntry {
@@ -2794,7 +3080,7 @@ impl MessagesView {
         inserted
     }
 
-    fn build_row(&self, message: &Msg, is_live: bool, show_unread_divider: bool) -> MessageRow {
+    fn build_row_into(&self, message: &Msg, is_live: bool, show_unread_divider: bool, widget: gtk::Box) -> MessageRow {
         let row_layout = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         // Same alignment as the clamp, so the bubble sits at the end even if
         // a parent ever hands the clamp the full row width.
@@ -2803,27 +3089,10 @@ impl MessagesView {
         } else {
             gtk::Align::Start
         });
-        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let bubble = BubbleClamp::new(&row_layout, self.inner.pane_width.clone());
         bubble.add_css_class("omg-msg");
         bubble.add_css_class("omg-msg-bubble");
         bubble.add_css_class(if message.outgoing { "omg-msg-out" } else { "omg-msg-in" });
-        widget.add_css_class("omg-msg");
-        widget.add_css_class("omg-msg-row");
-        // The viewer returns keyboard focus to its originating message.  The
-        // bubble wrapper therefore needs to be an explicit focus target.
-        widget.set_focusable(true);
-        widget.set_hexpand(false);
-        widget.set_halign(if message.outgoing {
-            gtk::Align::End
-        } else {
-            gtk::Align::Start
-        });
-        widget.add_css_class(if message.outgoing {
-            "omg-msg-out"
-        } else {
-            "omg-msg-in"
-        });
 
         let selection = gtk::CheckButton::new();
         selection.add_css_class("omg-message-check");
@@ -3002,13 +3271,6 @@ impl MessagesView {
                 use crate::ui::poll;
                 let card = poll::build(message, self.inner.action.clone());
                 media_slot.append(&card);
-                if let Some(poll) = &message.poll {
-                    self.inner
-                        .store
-                        .borrow_mut()
-                        .poll_index
-                        .insert(poll.id, message.id);
-                }
             }
             Some(
                 MediaKind::Voice | MediaKind::Audio | MediaKind::Video | MediaKind::VideoNote | MediaKind::Gif,
@@ -3154,6 +3416,7 @@ impl MessagesView {
         content.append(&keyboard_slot);
 
         let gesture = gtk::GestureClick::new();
+        gesture.set_name(Some("omg-message-context"));
         gesture.set_button(3);
         {
             let inner = Rc::downgrade(&self.inner);
@@ -3179,6 +3442,7 @@ impl MessagesView {
             let inner = Rc::downgrade(&self.inner);
             let check = selection.clone();
             let click = gtk::GestureClick::new();
+            click.set_name(Some("omg-message-select"));
             click.set_button(1);
             click.set_propagation_phase(gtk::PropagationPhase::Capture);
             click.connect_pressed(move |gesture, _, _, _| {
@@ -3223,6 +3487,7 @@ impl MessagesView {
             live_location_source,
             lottie: Rc::new(RefCell::new(None)),
             geo_map_slot,
+            photo: Rc::new(RefCell::new(None)),
         };
         set_deleted_rendering(&row, message.deleted);
         row.selection.set_sensitive(!message.deleted);
@@ -3247,9 +3512,23 @@ impl MessagesView {
     fn update_existing(&self, message: Msg, is_live: bool) {
         let (row, was_edited, old_text, old_spans, old_webpage, old_point) = {
             let mut store = self.inner.store.borrow_mut();
+            if let Some(poll) = &message.poll { store.poll_index.insert(poll.id, message.id); }
             let Some(entry) = store.entries.get_mut(&message.id) else {
                 return;
             };
+            if entry.msg.text != message.text || entry.msg.spans != message.spans {
+                entry.row.saved_spoilers.borrow_mut().clear();
+            }
+            *entry.row.message.borrow_mut() = message.clone();
+            if entry.row.loaded().is_none() {
+                if message.deleted { entry.row.widget.add_css_class("omg-msg-deleted"); }
+                else { entry.row.widget.remove_css_class("omg-msg-deleted"); }
+                entry.row.widget.update_property(&[gtk::accessible::Property::Label(&format!(
+                    "{}: {}", message.sender, message.text
+                ))]);
+                entry.msg = message;
+                return;
+            }
             let was_edited = entry.msg.edited;
             let old_text = entry.msg.text.clone();
             let old_spans = entry.msg.spans.clone();
@@ -3443,7 +3722,10 @@ impl MessagesView {
                     && !message.outgoing && message.sender != "You" && !message.sender.is_empty() && !same_sender;
                 let margin = if previous.is_none() { 0 } else if same_sender { 4 } else { 12 };
                 previous = Some(message);
-                (date, new_day, show_sender, margin, entry.row.widget.clone(), entry.row.sender.clone())
+                {
+                    entry.row.set_sender_visible(show_sender);
+                    (date, new_day, margin, entry.row.widget.clone())
+                }
             }).collect::<Vec<_>>()
         };
         let used_dates: HashSet<chrono::NaiveDate> = rows.iter().map(|row| row.0).collect();
@@ -3463,7 +3745,7 @@ impl MessagesView {
             self.inner.day_separators.borrow_mut().remove(&date);
         }
         let mut previous: Option<gtk::Widget> = None;
-        for (date, new_day, show_sender, margin, row, sender) in rows {
+        for (date, new_day, margin, row) in rows {
             if new_day {
                 let separator = self
                     .inner
@@ -3488,7 +3770,6 @@ impl MessagesView {
                 }
                 previous = Some(separator.upcast());
             }
-            sender.set_visible(show_sender);
             row.set_margin_top(margin);
             if row.parent().is_none() {
                 self.inner.list.append(&row);
@@ -3501,24 +3782,18 @@ impl MessagesView {
     fn refresh_quotes(&self) {
         // Only copy the preview of actually referenced messages. A new message
         // used to duplicate every loaded message's text and formatting here.
-        let rows = {
+        {
             let store = self.inner.store.borrow();
             let cache = self.inner.quote_cache.borrow();
-            store.entries.values().map(|entry| {
+            for entry in store.entries.values() {
                 let label = entry.msg.reply_to.map(|id| {
                     let source = store.entries.get(&id).map(|entry| (entry.msg.sender.as_str(), entry.msg.text.as_str()))
                         .or_else(|| cache.get(&id).map(|(sender,text)| (sender.as_str(),text.as_str())));
                     source.map(|(sender,text)| format!("{}: {}", if sender.is_empty() { "Unknown" } else { sender }, snippet(text,60)))
                         .unwrap_or_else(|| "replied message".into())
                 });
-                (entry.row.quote.clone(),label)
-            }).collect::<Vec<_>>()
-        };
-        for (quote, label) in rows {
-            if let Some(label) = label {
-                if quote.label() != label { quote.set_label(&label); }
-                quote.set_visible(true);
-            } else { quote.set_visible(false); }
+                entry.row.set_quote(label);
+            }
         }
     }
 
@@ -4012,12 +4287,12 @@ impl MessagesView {
             .borrow()
             .entries
             .values()
-            .map(|entry| {
-                (
+            .filter_map(|entry| {
+                Some((
                     entry.msg.id,
                     entry.msg.deleted,
-                    entry.row.selection.clone(),
-                )
+                    entry.row.loaded()?.selection.clone(),
+                ))
             })
             .collect::<Vec<_>>();
         for (id, deleted, check) in rows {
@@ -4042,7 +4317,7 @@ impl MessagesView {
             .borrow()
             .entries
             .values()
-            .map(|entry| entry.row.selection.clone())
+            .filter_map(|entry| entry.row.loaded().map(|row| row.selection.clone()))
             .collect::<Vec<_>>();
         // D6: remove every checkbox before any caller can tear rows down.
         for check in checks {
@@ -4072,7 +4347,7 @@ impl MessagesView {
                     store
                         .entries
                         .get(id)
-                        .map(|entry| entry.row.selection.clone())
+                        .and_then(|entry| entry.row.loaded().map(|row| row.selection.clone()))
                 })
                 .collect::<Vec<_>>()
         };
@@ -4689,14 +4964,16 @@ impl MessagesView {
         };
         self.move_focus_before_removal(&entry.row.widget);
         player::remove(msg_id);
-        for source in entry.row.animation_sources.borrow_mut().drain(..) {
+        if let Some(row) = entry.row.loaded() {
+        for source in row.animation_sources.borrow_mut().drain(..) {
             remove_source_if_present(source);
         }
-        if let Some(source) = entry.row.media_loading_source.borrow_mut().take() {
+        if let Some(source) = row.media_loading_source.borrow_mut().take() {
             remove_source_if_present(source);
         }
-        if let Some(source) = entry.row.live_location_source.borrow_mut().take() {
+        if let Some(source) = row.live_location_source.borrow_mut().take() {
             remove_source_if_present(source);
+        }
         }
         self.inner.list.remove(&entry.row.widget);
         self.reorder_rows();
@@ -4737,6 +5014,7 @@ impl MessagesView {
                 return false;
             };
             entry.msg.deleted = true;
+            entry.row.message.borrow_mut().deleted = true;
             entry.row.clone()
         };
         set_deleted_rendering(&row, true);
@@ -5430,6 +5708,14 @@ impl MessagesView {
         } else {
             gtk::Align::Start
         });
+        if kind == Some(MediaKind::Photo)
+            && let Some(entry) = self.inner.store.borrow().entries.get(&msg_id) {
+                *entry.row.photo.borrow_mut() = Some(RowPhoto {
+                    picture: picture.clone(), path, generation,
+                    width: texture.width(), height: texture.height(),
+                    resident: Rc::new(Cell::new(true)), decoding: Rc::new(Cell::new(false)),
+                });
+            }
         let picture = PhotoClamp::new(&picture);
         picture.set_halign(if outgoing {
             gtk::Align::End
@@ -5446,6 +5732,10 @@ impl MessagesView {
         });
         picture.add_controller(gesture);
         media_slot.append(&picture);
+        // Downloads may finish after the reader has scrolled away or hidden
+        // the window. Do not retain every completed texture until another
+        // scroll event; existing viewport geometry can release it immediately.
+        if kind == Some(MediaKind::Photo) { self.photo_visibility(); }
         if should_stick {
             let inner = self.inner.clone();
             self.after_upper_change(saved_upper, move |adjustment, changed| {
@@ -5654,6 +5944,7 @@ impl MessagesView {
             }
             entry.media_state = MediaState::Failed;
             entry.media_retryable = retryable;
+            if let Some(row) = entry.row.loaded() { row.photo.borrow_mut().take(); }
             let kind = entry.msg.media;
             let base = kind.map(|_| media_title(&entry.msg));
             (
@@ -5779,6 +6070,7 @@ impl MessagesView {
         self.move_focus_before_removal(&widget);
         if let Some(entry) = self.inner.store.borrow_mut().entries.get_mut(&msg_id) {
             entry.msg.poll = Some(poll.clone());
+            entry.row.message.borrow_mut().poll = Some(poll.clone());
         }
         self.inner.history_changed.borrow_mut().insert(msg_id);
         crate::ui::poll::update(&widget, &poll, msg_id, &self.inner.action.clone());
@@ -6084,11 +6376,13 @@ impl MessagesView {
 
     /// Hand a downloaded file to the row's inline player and start it.
     pub fn play_media(&self, msg_id: i32, path: PathBuf, intent: player::OpenIntent) {
+        self.ensure_player_row(msg_id);
         player::open_path(msg_id, &path, intent);
         self.schedule_player_visibility_after_open();
     }
 
     pub fn toggle_media(&self, msg_id: i32) {
+        self.ensure_player_row(msg_id);
         player::toggle(msg_id);
     }
 
@@ -6154,7 +6448,17 @@ impl MessagesView {
     }
 
     pub fn player_exists(&self, msg_id: i32) -> bool {
+        self.ensure_player_row(msg_id);
         player::exists(msg_id)
+    }
+
+    fn ensure_player_row(&self, msg_id: i32) {
+        let store = self.inner.store.borrow();
+        if let Some(entry) = store.entries.get(&msg_id)
+            && matches!(entry.msg.media, Some(MediaKind::Voice | MediaKind::Audio
+                | MediaKind::Video | MediaKind::VideoNote | MediaKind::Gif)) {
+                entry.row.materialize();
+            }
     }
 
     pub fn player_registry_empty(&self) -> bool {
@@ -6275,6 +6579,7 @@ impl MessagesView {
     }
 
     pub fn scroll_to_bottom(&self) {
+        self.prepare_last_screen();
         let adjustment = self.inner.scroll.vadjustment();
         adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
     }
@@ -6366,6 +6671,7 @@ impl MessagesView {
             inner.player_throttle.borrow_mut().take();
             sync_lottie_visibility(&inner);
             let view = MessagesView::of(&inner);
+            view.photo_visibility();
             view.bind_visible_sender_avatars();
             view.player_visibility();
             if inner.effects.on("datefloat") && !inner.suppress_paging.get()
@@ -6388,10 +6694,61 @@ impl MessagesView {
         *self.inner.player_throttle.borrow_mut() = Some(source);
     }
 
+    fn photo_visibility(&self) {
+        let page = self.inner.scroll.vadjustment().page_size() as f32;
+        if page <= 0.0 || self.inner.list.height() <= 0 { return; }
+        let nearby: HashSet<_> = nearby_message_ids(&self.inner, page * 2.0).into_iter().collect();
+        let retain: HashSet<_> = nearby_message_ids(&self.inner, page * 4.0).into_iter().collect();
+        let photos: Vec<_> = self.inner.store.borrow().entries.values().filter_map(|entry| {
+            let photo = entry.row.loaded()?.photo.borrow().clone()?;
+            (entry.media_generation == photo.generation
+                && matches!(&entry.media_state, MediaState::Done(path) if *path == photo.path))
+                .then_some((entry.msg.id, photo))
+        }).collect();
+        for (id, photo) in photos {
+            if !retain.contains(&id) && !self.row_visible(id) && photo.resident.replace(false) {
+                // Preserve GtkPicture's exact intrinsic size/aspect ratio, its
+                // input controller and its parent. Only decoded pixels leave.
+                photo.picture.set_paintable(Some(&gdk::Paintable::new_empty(photo.width, photo.height)));
+            }
+            if !nearby.contains(&id) || photo.resident.get() || photo.decoding.replace(true) { continue; }
+            let weak = Rc::downgrade(&self.inner);
+            let epoch = self.inner.scroll_epoch.get();
+            glib::MainContext::default().spawn_local(async move {
+                let decoded = super::media_image::restore_preview(
+                    photo.path.clone(), photo.width.max(photo.height), false,
+                ).await;
+                photo.decoding.set(false);
+                let Some(inner) = weak.upgrade().filter(|inner| inner.scroll_epoch.get() == epoch) else { return };
+                let current = inner.store.borrow().entries.get(&id).is_some_and(|entry| {
+                    entry.media_generation == photo.generation
+                        && entry.row.loaded().and_then(|row| row.photo.borrow().clone())
+                            .is_some_and(|current| current.picture == photo.picture
+                                && current.path == photo.path && current.generation == photo.generation)
+                });
+                if !current { return; }
+                let view = MessagesView::of(&inner);
+                match decoded {
+                    Ok(texture) => {
+                        photo.picture.set_paintable(Some(&texture));
+                        photo.resident.set(true);
+                    }
+                    Err(error) => {
+                        if let Some(entry) = inner.store.borrow().entries.get(&id)
+                            && let Some(row) = entry.row.loaded() { row.photo.borrow_mut().take(); }
+                        if view.fail_media(id, photo.generation, true) {
+                            view.set_media_error_detail(id, &error);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     pub fn set_show_sender_avatars(&self, show: bool) {
         if self.inner.show_sender_avatars.replace(show) == show { return; }
         for entry in self.inner.store.borrow().entries.values() {
-            if let Some((_, button)) = &entry.row.sender_avatar { button.set_visible(show); }
+            if let Some((_, button)) = entry.row.loaded().and_then(|row| row.sender_avatar.as_ref()) { button.set_visible(show); }
         }
         self.player_visibility_throttled();
     }
@@ -6510,7 +6867,7 @@ impl MessagesView {
                     store
                         .entries
                         .get(id)
-                        .map(|entry| (entry.row.time.clone(), entry.msg.clone()))
+                        .and_then(|entry| Some((entry.row.loaded()?.time.clone(), entry.msg.clone())))
                 })
                 .collect()
         };
@@ -6534,11 +6891,12 @@ impl MessagesView {
                 .entries
                 .values()
                 .filter_map(|entry| {
-                    entry.row.text.borrow().as_ref().cloned().map(|label| {
+                    let row = entry.row.loaded()?;
+                    row.text.borrow().as_ref().cloned().map(|label| {
                         (
                             entry.msg.clone(),
                             label,
-                            entry.row.revealed_spoilers.clone(),
+                            row.revealed_spoilers.clone(),
                         )
                     })
                 })
@@ -6578,7 +6936,7 @@ impl MessagesView {
             .borrow()
             .entries
             .values()
-            .filter_map(|entry| entry.row.transcribe_button.clone())
+            .filter_map(|entry| entry.row.loaded()?.transcribe_button.clone())
             .collect();
         for button in buttons {
             button.set_visible(on);
@@ -6700,13 +7058,13 @@ impl MessagesView {
             store
                 .entries
                 .values()
-                .map(|entry| {
-                    (
+                .filter_map(|entry| {
+                    Some((
                         entry.msg.id,
                         entry.msg.outgoing,
                         self.inner.pending_messages.borrow().contains(&entry.msg.id),
-                        entry.row.receipt.clone(),
-                    )
+                        entry.row.loaded()?.receipt.clone(),
+                    ))
                 })
                 .collect::<Vec<_>>()
         };
@@ -6809,7 +7167,7 @@ impl MessagesView {
                     store
                         .entries
                         .get(id)
-                        .map(|entry| entry.row.widget.clone().upcast())
+                        .and_then(|entry| entry.row.loaded().map(|row| row.widget.clone().upcast()))
                 })
                 .collect()
         };
@@ -6937,58 +7295,48 @@ impl MessagesView {
         translation: Option<&str>,
         summary: Option<&str>,
     ) -> bool {
-        let slot = self
-            .inner
-            .store
-            .borrow()
-            .entries
-            .get(&msg_id)
-            .map(|entry| entry.row.aux_slot.clone());
-        let Some(slot) = slot else { return false };
-        self.move_focus_before_removal(&slot);
-        while let Some(child) = slot.first_child() {
-            slot.remove(&child);
+        let values: Vec<_> = [("transcript: ", transcript), ("translation: ", translation),
+            ("summary: ", summary)].into_iter().filter_map(|(prefix, value)|
+                value.map(|value| (format!("{prefix}{value}"), false))).collect();
+        let slot = {
+            let store = self.inner.store.borrow();
+            let Some(entry) = store.entries.get(&msg_id) else { return false };
+            *entry.row.aux.borrow_mut() = values.clone();
+            entry.row.loaded().map(|row| row.aux_slot.clone())
+        };
+        if let Some(slot) = slot {
+            self.move_focus_before_removal(&slot);
+            while let Some(child) = slot.first_child() { slot.remove(&child); }
+            for (text, error) in values { slot.append(&aux_label(&text, error)); }
+            slot.set_visible(slot.first_child().is_some());
         }
-        for (prefix, value) in [
-            ("transcript: ", transcript),
-            ("translation: ", translation),
-            ("summary: ", summary),
-        ] {
-            if let Some(value) = value {
-                slot.append(&aux_label(&format!("{prefix}{value}"), false));
-            }
-        }
-        slot.set_visible(slot.first_child().is_some());
         true
     }
 
     pub fn show_aux_error(&self, msg_id: i32, message: &str) -> bool {
-        let slot = self
-            .inner
-            .store
-            .borrow()
-            .entries
-            .get(&msg_id)
-            .map(|entry| entry.row.aux_slot.clone());
-        let Some(slot) = slot else { return false };
-        slot.append(&aux_label(message, true));
-        slot.set_visible(slot.first_child().is_some());
+        let slot = {
+            let store = self.inner.store.borrow();
+            let Some(entry) = store.entries.get(&msg_id) else { return false };
+            entry.row.aux.borrow_mut().push((message.to_owned(), true));
+            entry.row.loaded().map(|row| row.aux_slot.clone())
+        };
+        if let Some(slot) = slot {
+            slot.append(&aux_label(message, true));
+            slot.set_visible(true);
+        }
         true
     }
 
     pub fn clear_aux(&self, msg_id: i32) {
-        let slot = self
-            .inner
-            .store
-            .borrow()
-            .entries
-            .get(&msg_id)
-            .map(|entry| entry.row.aux_slot.clone());
+        let slot = {
+            let store = self.inner.store.borrow();
+            let Some(entry) = store.entries.get(&msg_id) else { return };
+            entry.row.aux.borrow_mut().clear();
+            entry.row.loaded().map(|row| row.aux_slot.clone())
+        };
         if let Some(slot) = slot {
             self.move_focus_before_removal(&slot);
-            while let Some(child) = slot.first_child() {
-                slot.remove(&child);
-            }
+            while let Some(child) = slot.first_child() { slot.remove(&child); }
             slot.set_visible(false);
         }
     }
@@ -7113,6 +7461,35 @@ impl MessagesView {
             .count()
     }
 
+    /// Does not materialize content: a benchmark must not mistake the stable
+    /// scroll slot for a painted message, or change the work it measures.
+    #[doc(hidden)]
+    pub fn probe_visible_content_ready(&self) -> bool {
+        let store = self.inner.store.borrow();
+        let mut visible = 0;
+        for entry in store.entries.values() {
+            let Some(bounds) = entry.row.widget.compute_bounds(&self.inner.scroll) else { continue };
+            if bounds.height() <= 0.0 || bounds.y() >= self.inner.scroll.height() as f32
+                || bounds.y() + bounds.height() <= 0.0 { continue; }
+            visible += 1;
+            let Some(row) = entry.row.loaded() else { return false };
+            if !entry.msg.text.is_empty() && !row.text.borrow().as_ref().is_some_and(|label|
+                label.is_mapped() && label.width() > 0 && label.height() > 0) { return false; }
+            if row.photo.borrow().as_ref().is_some_and(|photo| !photo.resident.get()) { return false; }
+        }
+        visible > 0 || store.order.is_empty()
+    }
+
+    #[doc(hidden)]
+    pub fn probe_materialized_row_count(&self) -> usize {
+        self.inner.store.borrow().entries.values().filter(|entry| entry.row.loaded().is_some()).count()
+    }
+
+    #[doc(hidden)]
+    pub fn probe_row_materialized(&self, id: i32) -> bool {
+        self.inner.store.borrow().entries.get(&id).is_some_and(|entry| entry.row.loaded().is_some())
+    }
+
     /// Detached = viewing a jumped-to historical page; the ▼ button stays
     /// visible and reloads the latest page.
     pub fn set_detached(&self, detached: bool) {
@@ -7142,29 +7519,58 @@ impl MessagesView {
     }
 
     fn scroll_to_message_impl(&self, msg_id: i32, focus: bool) -> bool {
-        let row = self
-            .inner
-            .store
-            .borrow()
-            .entries
-            .get(&msg_id)
-            .map(|entry| entry.row.widget.clone());
-        let Some(row) = row else { return false };
-        let Some(bounds) = row.compute_bounds(&self.inner.list) else {
-            return false;
-        };
-        if bounds.height() <= 0.0 { return false; }
-        // Search/pinned-message navigation must supersede an earlier request
-        // to keep the old bottom visible after a pending layout.
-        self.claim_scroll();
         let adjustment = self.inner.scroll.vadjustment();
-        adjustment.set_value(
-            (f64::from(bounds.y()) - adjustment.page_size() / 3.0)
-                .clamp(0.0, (adjustment.upper() - adjustment.page_size()).max(0.0)),
-        );
-        if focus {
-            row.grab_focus();
+        let width = self.inner.list.width();
+        if width <= 0 || adjustment.page_size() <= 0.0 { return false; }
+        let mut changed = false;
+        let row = {
+            let store = self.inner.store.borrow();
+            let Ok(index) = store.order.binary_search(&msg_id) else { return false };
+            let mut screen = Vec::new();
+            // Resolve the destination screen before changing the adjustment;
+            // a jump should not paint an estimated slot and then fill it.
+            for (above, target) in [
+                (true, adjustment.page_size() / 3.0 + 128.0),
+                (false, adjustment.page_size() * 2.0 / 3.0 + 128.0),
+            ] {
+                let mut height = 0;
+                for distance in 0..store.order.len() {
+                    let index = if above { index.checked_sub(distance + 1) }
+                        else { index.checked_add(distance).filter(|index| *index < store.order.len()) };
+                    let Some(index) = index else { break };
+                    let Some(entry) = store.entries.get(&store.order[index]) else { continue };
+                    changed |= entry.row.loaded().is_none();
+                    entry.row.materialize();
+                    screen.push(store.order[index]);
+                    height += entry.row.widget.measure(gtk::Orientation::Vertical, width).1;
+                    if f64::from(height) >= target { break; }
+                }
+            }
+            // Keep two recent destinations warm for back-and-forth search
+            // navigation, without retaining the whole visited history.
+            let mut recent = self.inner.recent_jump_screens.borrow_mut();
+            recent.retain(|(id, _)| *id != msg_id);
+            recent.push((msg_id, screen));
+            if recent.len() > 2 { recent.remove(0); }
+            store.entries.get(&msg_id).unwrap().row.widget.clone()
+        };
+        self.claim_scroll();
+        self.inner.warming_rows.set(true);
+        let total = self.inner.list.measure(gtk::Orientation::Vertical, width).1;
+        let mut before = row.margin_top();
+        let mut child = self.inner.list.first_child();
+        while let Some(current) = child {
+            if current == row { break; }
+            before += current.measure(gtk::Orientation::Vertical, width).1;
+            child = current.next_sibling();
         }
+        adjustment.set_upper(f64::from(total));
+        adjustment.set_value((f64::from(before) - adjustment.page_size() / 3.0)
+            .clamp(0.0, (adjustment.upper() - adjustment.page_size()).max(0.0)));
+        self.inner.warming_rows.set(false);
+        if focus { row.grab_focus(); }
+        if changed { self.inner.jump_layout_pending.set(true); }
+        self.schedule_visible_rows();
         true
     }
 
@@ -7183,7 +7589,7 @@ fn apply_pane_width(inner: &MessagesInner, width: i32) {
     if width > 0 && inner.pane_width.replace(width) != width {
         inner.search_older.set_label(if width < 600 { icons::DOWN } else { "Load older" });
         for entry in inner.store.borrow().entries.values() {
-            entry.row.bubble.queue_resize();
+            if let Some(row) = entry.row.loaded() { row.bubble.queue_resize(); }
         }
     }
 }
@@ -7234,6 +7640,7 @@ fn sync_lottie_visibility(inner: &Rc<MessagesInner>) {
         .filter_map(|(msg_id, entry)| {
             entry
                 .row
+                .loaded()?
                 .lottie
                 .borrow()
                 .clone()

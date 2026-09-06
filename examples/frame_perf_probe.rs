@@ -2,6 +2,8 @@
 //! Modes: none, badge, overlays, all. An optional second argument supplies an
 //! animation-only settings fixture; otherwise use the bundled reproduction.
 use gtk4::{self as gtk, glib, prelude::*};
+#[allow(dead_code)]
+mod perf_support;
 use omarchygram::{
     settings::{Settings, SettingsStore},
     tg::{ChatInfo, ChatKind, ChatSummary, MediaKind, Member, Msg, Reaction, Tg},
@@ -110,6 +112,8 @@ async fn verify_viewport_pixels(window: &gtk::Window, messages: &MessagesView) {
             }
         }
         let (full, culled, bounds) = pair.expect("same-frame viewport snapshots");
+        assert!(messages.probe_visible_content_ready(),
+            "viewport fraction={fraction}: every visible slot must contain actual message content");
         compare_pixels(
             &renderer,
             full,
@@ -119,6 +123,39 @@ async fn verify_viewport_pixels(window: &gtk::Window, messages: &MessagesView) {
             &format!("viewport fraction={fraction}"),
         );
         println!("viewport pixels identical at fraction={fraction} scale={scale}");
+    }
+}
+
+async fn verify_continuous_content(window: &gtk::Window, messages: &MessagesView, chats: &Rc<ChatList>) {
+    // Separate from timed phases: inspecting every visible row adds work.
+    for sidebar in [false, true] {
+        let scroll = scroller(if sidebar { chats.widget.upcast_ref() }
+            else { messages.widget.upcast_ref() }).unwrap();
+        let adjustment = scroll.vadjustment();
+        adjustment.set_value((adjustment.upper() - adjustment.page_size()) * 0.31);
+        glib::timeout_future(Duration::from_millis(300)).await;
+        let frames = Rc::new(Cell::new(0));
+        let blanks = Rc::new(Cell::new(0));
+        let (checked, failed, view, chats) = (frames.clone(), blanks.clone(), messages.clone(), chats.clone());
+        let clock = window.frame_clock().unwrap();
+        let signal = clock.connect_after_paint(move |_| {
+            checked.set(checked.get() + 1);
+            if !(if sidebar { chats.probe_visible_content_ready() }
+                else { view.probe_visible_content_ready() }) { failed.set(failed.get() + 1); }
+        });
+        let last = Cell::new(None);
+        let tick = window.add_tick_callback(move |_, clock| {
+            let now = clock.frame_time();
+            let elapsed = last.replace(Some(now)).map_or(0.0, |old| (now - old) as f64 / 1e6);
+            adjustment.set_value(adjustment.value() + elapsed * 2000.0);
+            glib::ControlFlow::Continue
+        });
+        glib::timeout_future(Duration::from_secs(3)).await;
+        tick.remove();
+        clock.disconnect(signal);
+        assert!(frames.get() > 50, "continuous content check must traverse frames");
+        assert_eq!(blanks.get(), 0, "sidebar={sidebar}: visible content missing in a painted frame");
+        println!("continuous content sidebar={sidebar}: PASS ({} frames)", frames.get());
     }
 }
 
@@ -192,6 +229,7 @@ async fn phase(
         profiler_command(path, b"enable\n");
     }
     let cpu = cpu_seconds();
+    let resources_start = perf_support::resources();
     let started = Instant::now();
     glib::timeout_future(Duration::from_secs(seconds)).await;
     let elapsed = started.elapsed().as_secs_f64();
@@ -232,7 +270,12 @@ async fn phase(
         "refresh_interval_us": timings.iter().map(|t| t.refresh_interval()).find(|t| *t > 0),
         "present_interval_p95_ms": intervals_p95, "present_interval_p99_ms": intervals_p99,
         "frame_work_p95_ms": percentile(&mut work.borrow_mut(), 95),
-        "loop_p95_ms": percentile(&mut delays.borrow_mut(), 95)})
+        "frame_work_p99_ms": percentile(&mut work.borrow_mut(), 99),
+        "loop_p95_ms": percentile(&mut delays.borrow_mut(), 95),
+        "loop_p99_ms": percentile(&mut delays.borrow_mut(), 99),
+        "frames_over_16_7ms": intervals.iter().filter(|v| **v > 16.8).count(),
+        "frames_over_33_3ms": intervals.iter().filter(|v| **v > 33.4).count(),
+        "resources_start":resources_start,"resources_end":perf_support::resources()})
     );
 }
 
@@ -270,7 +313,7 @@ fn main() {
     let settings = SettingsStore::new();
     let effects = Effects::new(settings.clone());
     let tg = Tg::spawn_mock();
-    let chats = ChatList::new(effects.clone(), tg.clone());
+    let chats = Rc::new(ChatList::new(effects.clone(), tg.clone()));
     let messages = MessagesView::new(effects.clone());
     messages.set_player_settings(settings);
     messages.set_probe(true);
@@ -280,6 +323,7 @@ fn main() {
         .unwrap_or(0);
     let media = std::env::var_os("OMG_PERF_MEDIA").is_some();
     let mut image_paths = Vec::new();
+    println!("{}", serde_json::json!({"checkpoint": "empty_views", "resources": perf_support::resources()}));
     if message_count > 0 {
         messages.reset_chat(1, "Group conversation 1", 1);
         messages.set_chat_summary(
@@ -332,6 +376,7 @@ fn main() {
                 })
                 .collect(),
         );
+        println!("{}", serde_json::json!({"checkpoint": "history_prepared", "resources": perf_support::resources()}));
         if media {
             for id in (10..=message_count).step_by(10) {
                 let pixels: Vec<u8> = (0..640 * 480)
@@ -361,6 +406,7 @@ fn main() {
             }
         }
     }
+    println!("{}", serde_json::json!({"checkpoint": "photo_completions", "resources": perf_support::resources()}));
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.append(&chats.widget);
     row.append(&messages.widget);
@@ -387,10 +433,22 @@ fn main() {
     effects.bind(&window, &overlay);
     chats.set_chats((1..=1000).map(|id| ChatSummary { id, title: format!("Group conversation {id}"), unread: (id % 9 + 1) as i32,
         last_message: "A realistic preview with enough text to fill the row and be ellipsized at the edge of the sidebar.".into(), ..Default::default() }).collect());
+    println!("{}", serde_json::json!({"checkpoint": "before_present", "resources": perf_support::resources()}));
     window.present();
+    println!("{}", serde_json::json!({"checkpoint": "after_present", "resources": perf_support::resources()}));
+    let first_paint = Cell::new(true);
+    let first_view = messages.clone();
+    let initial_frame = window.frame_clock().unwrap().connect_after_paint(move |_| {
+        if first_paint.replace(false) {
+            println!("{}", serde_json::json!({"checkpoint": "first_paint",
+                "visible_content_ready": first_view.probe_visible_content_ready(),
+                "resources": perf_support::resources()}));
+        }
+    });
     effects.launched(&overlay);
     glib::MainContext::default().block_on(async {
         glib::timeout_future(Duration::from_secs(2)).await;
+        window.frame_clock().unwrap().disconnect(initial_frame);
         println!(
             "mode={mode} scale={} renderer={} refresh_interval_us={}",
             window.scale_factor(),
@@ -515,6 +573,7 @@ fn main() {
             }
             if std::env::var_os("OMG_PERF_VERIFY").is_some() {
                 verify_viewport_pixels(&window, &messages).await;
+                verify_continuous_content(&window, &messages, &chats).await;
                 for scale in [1.0, 1.25, 1.6, 2.0] {
                     if let Some((full, optimized, bounds)) =
                         effects.probe_scanline_comparison(scale)

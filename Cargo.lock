@@ -1892,9 +1892,8 @@ dependencies = [
 [[package]]
 name = "ntgcalls-sys"
 version = "3.0.0-rc01"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a716760196dcb6af71fb0b2d63dc2bbd7e44a694dfe093b4701a403569945713"
 dependencies = [
+ "pkg-config",
  "ureq",
  "zip",
 ]
@@ -2098,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "omarchygram"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-channel",
  "chrono",

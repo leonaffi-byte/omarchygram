@@ -14741,7 +14741,11 @@ impl ShellInner {
         })
         .await
         {
-            probe_fail("lottie sticker resume on screen");
+            probe_fail(&format!(
+                "lottie sticker resume on screen (visible {}, animating {}, frames {} -> {}, {})",
+                self.messages.row_visible(813), sticker.is_animating(),
+                paused, sticker.frames_shown(), self.messages.probe_scroll_state(813)
+            ));
             return false;
         }
 

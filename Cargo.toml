@@ -1,6 +1,6 @@
 [package]
 name = "omarchygram"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 repository = "https://github.com/leonaffi-byte/omarchygram"
 
@@ -10,10 +10,17 @@ repository = "https://github.com/leonaffi-byte/omarchygram"
 default = ["calls"]
 calls = ["dep:ntgcalls"]
 
+[[example]]
+name = "native_call_probe"
+required-features = ["calls"]
+
 # 0.10.0 returns before its final asynchronous file write completes. Keep the
 # upstream downloader (including parallel large transfers) with two flushes.
 [patch.crates-io]
 grammers-client = { path = "vendor/grammers-client" }
+# Reuse the desktop's ABI-compatible GLib and FFmpeg libraries. Keep the
+# pinned call engine/WebRTC archive, without bundling duplicate system code.
+ntgcalls-sys = { path = "vendor/ntgcalls-sys" }
 
 # Wave 8A optimization (specs/spec-wave8.md): smaller + faster release binary.
 # codegen-units = 1 + opt-level = 3 optimize the whole crate as a unit; strip
